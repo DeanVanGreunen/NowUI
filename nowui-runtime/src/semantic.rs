@@ -25,7 +25,7 @@ use nowui_core::{
     tailwind, Align, Color, Direction, Display, Easing, Edges, GridTrack, Node as ArenaNode,
     NodeId, NodeKind, NowUiState, Position, Sizing, Style, TextAlign, Transition, Ui, EVENT_BINDING_KEYS,
 };
-use nowui_syntax::ast::{BindValue, NamedArg, Node as AstNode, Param, StylePair, Template, TplPart};
+use nowui_syntax::ast::{BindValue, Expr, NamedArg, Node as AstNode, Param, StylePair, Template, TplPart};
 
 use crate::dynamic::{self, RegionAst, RegionSignature};
 
@@ -196,13 +196,22 @@ impl Semantic {
                 let items = dynamic::eval_expr(iter, &mut resolve)
                     .and_then(|v| v.as_list().map(<[_]>::to_vec))
                     .unwrap_or_default();
+                // Only a simple dotted path (`state.rows`) gives a real slot
+                // to rewrite an `{onClick: x.handleMe}` binding onto — see
+                // `dynamic::substitute_loop_var`.
+                let iter_path: Vec<String> = match iter {
+                    Expr::Path(p) => p.clone(),
+                    _ => Vec::new(),
+                };
 
                 let mut ids = Vec::new();
                 let mut signature_items = Vec::with_capacity(items.len());
-                for item in &items {
+                for (index, item) in items.iter().enumerate() {
                     signature_items.push(dynamic::signature_string(item));
-                    let substituted: Vec<AstNode> =
-                        body.iter().map(|c| dynamic::substitute_loop_var(c, var, item)).collect();
+                    let substituted: Vec<AstNode> = body
+                        .iter()
+                        .map(|c| dynamic::substitute_loop_var(c, var, item, &iter_path, index))
+                        .collect();
                     let iter_ids = self.expand_children(ui, parent, &substituted, scope, state, depth + 1, false);
                     ids.extend(iter_ids);
                 }

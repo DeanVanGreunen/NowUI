@@ -26,7 +26,7 @@
 //!     needs an arena-wide GC, out of scope here.
 
 use nowui_core::{NowUiState, StateValue};
-use nowui_syntax::ast::{CmpOp, Expr, Node as AstNode, Template, TplPart};
+use nowui_syntax::ast::{BindValue, Binding, CmpOp, Expr, Node as AstNode, Template, TplPart};
 
 /// What a registered dynamic region actually is — the still-unexpanded AST,
 /// captured once and re-evaluated against live state on every refresh.
@@ -184,22 +184,36 @@ pub fn make_resolver<'a>(
 /// `if`/`for` bodies so an outer loop variable stays visible to them) with a
 /// literal rendering of `value`/the resolved field. An inner `for` that
 /// re-binds the same name shadows it — its own body is left untouched.
-pub fn substitute_loop_var(node: &AstNode, var: &str, value: &StateValue) -> AstNode {
+///
+/// Also rewrites any `{key: var}`/`{key: var.field}` *binding* path (e.g.
+/// `{onClick: x.handleMe}`) so it points at this concrete iteration's own
+/// state slot instead of the loop-local name — `x` isn't a real field on
+/// `state`, so left as-is it would never resolve through `NowUiState::call`/
+/// `get`/`set`. `iter_path` is the `for`'s own iterable path (e.g. `["state",
+/// "rows"]`, from `Expr::Path`) and `index` this item's position in it, so
+/// `x.handleMe` becomes `state.rows.<index>.handleMe` — dispatched by
+/// `nowui-macros`' generated `call`/`set` as an indexed step into the
+/// `Vec<T>` field, then delegated into `T`'s own `NowUiState` impl. Left
+/// untouched when `iter_path` is empty (the iterable wasn't a simple dotted
+/// path — nothing to rewrite onto).
+pub fn substitute_loop_var(node: &AstNode, var: &str, value: &StateValue, iter_path: &[String], index: usize) -> AstNode {
     match node {
         AstNode::Widget { kind, args, string_args, styles, bindings, children } => AstNode::Widget {
             kind: kind.clone(),
             args: args.clone(),
             string_args: string_args.iter().map(|t| substitute_template(t, var, value)).collect(),
             styles: styles.clone(),
-            bindings: bindings.clone(),
-            children: children.iter().map(|c| substitute_loop_var(c, var, value)).collect(),
+            bindings: bindings.iter().map(|b| substitute_binding(b, var, iter_path, index)).collect(),
+            children: children.iter().map(|c| substitute_loop_var(c, var, value, iter_path, index)).collect(),
         },
         AstNode::If { branches, else_branch } => AstNode::If {
             branches: branches
                 .iter()
-                .map(|(cond, body)| (cond.clone(), body.iter().map(|c| substitute_loop_var(c, var, value)).collect()))
+                .map(|(cond, body)| {
+                    (cond.clone(), body.iter().map(|c| substitute_loop_var(c, var, value, iter_path, index)).collect())
+                })
                 .collect(),
-            else_branch: else_branch.iter().map(|c| substitute_loop_var(c, var, value)).collect(),
+            else_branch: else_branch.iter().map(|c| substitute_loop_var(c, var, value, iter_path, index)).collect(),
         },
         AstNode::For { var: inner_var, iter, body } => AstNode::For {
             var: inner_var.clone(),
@@ -207,10 +221,30 @@ pub fn substitute_loop_var(node: &AstNode, var: &str, value: &StateValue) -> Ast
             body: if inner_var == var {
                 body.clone()
             } else {
-                body.iter().map(|c| substitute_loop_var(c, var, value)).collect()
+                body.iter().map(|c| substitute_loop_var(c, var, value, iter_path, index)).collect()
             },
         },
         AstNode::LayoutDef { .. } | AstNode::Import { .. } => node.clone(),
+    }
+}
+
+/// Rewrite a single binding's path if it's rooted at the loop variable
+/// (`{onClick: x.handleMe}` -> `{onClick: state.rows.<index>.handleMe}`).
+/// Anything else (a different root, a non-path value) passes through
+/// unchanged.
+fn substitute_binding(b: &Binding, var: &str, iter_path: &[String], index: usize) -> Binding {
+    let BindValue::Path(path) = &b.value else { return b.clone() };
+    if iter_path.is_empty() {
+        return b.clone();
+    }
+    match path.split_first() {
+        Some((head, rest)) if head == var => {
+            let mut new_path = iter_path.to_vec();
+            new_path.push(index.to_string());
+            new_path.extend(rest.iter().cloned());
+            Binding { key: b.key.clone(), value: BindValue::Path(new_path) }
+        }
+        _ => b.clone(),
     }
 }
 
@@ -323,7 +357,7 @@ mod tests {
         let src = "layout: T { Container { Text `Row: ${x}` } }";
         let ast = nowui_syntax::parse(src).unwrap();
         let nowui_syntax::ast::Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
-        let substituted = substitute_loop_var(&children[0], "x", &StateValue::Int(7));
+        let substituted = substitute_loop_var(&children[0], "x", &StateValue::Int(7), &[], 0);
         let AstNode::Widget { children, .. } = &substituted else { panic!() };
         let AstNode::Widget { string_args, .. } = &children[0] else { panic!() };
         // Adjacent `Lit`s aren't merged (no behavioral difference — every
@@ -337,7 +371,7 @@ mod tests {
         let src = "layout: T { for x in state.inner { Text `${x}` } }";
         let ast = nowui_syntax::parse(src).unwrap();
         let nowui_syntax::ast::Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
-        let substituted = substitute_loop_var(&children[0], "x", &StateValue::Int(7));
+        let substituted = substitute_loop_var(&children[0], "x", &StateValue::Int(7), &[], 0);
         let AstNode::For { body, .. } = &substituted else { panic!() };
         let AstNode::Widget { string_args, .. } = &body[0] else { panic!() };
         // Untouched — the inner `for x in ...` shadows the outer `x`.
@@ -353,7 +387,7 @@ mod tests {
             ("id".to_string(), StateValue::Str("1".to_string())),
             ("label".to_string(), StateValue::Str("First row".to_string())),
         ]);
-        let substituted = substitute_loop_var(&children[0], "x", &item);
+        let substituted = substitute_loop_var(&children[0], "x", &item, &[], 0);
         let AstNode::Widget { string_args, .. } = &substituted else { panic!() };
         assert_eq!(string_args[0].parts, vec![TplPart::Lit("First row".to_string())]);
     }
@@ -364,9 +398,37 @@ mod tests {
         let ast = nowui_syntax::parse(src).unwrap();
         let nowui_syntax::ast::Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
         let item = StateValue::Object(vec![("id".to_string(), StateValue::Str("1".to_string()))]);
-        let substituted = substitute_loop_var(&children[0], "x", &item);
+        let substituted = substitute_loop_var(&children[0], "x", &item, &[], 0);
         let AstNode::Widget { string_args, .. } = &substituted else { panic!() };
         assert_eq!(string_args[0].parts, vec![TplPart::Var("x.nope".to_string())]);
+    }
+
+    #[test]
+    fn substitute_loop_var_rewrites_a_binding_path_rooted_at_the_loop_variable() {
+        let src = "layout: T { Text `${x.label}` {onClick: x.handleMe} }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let nowui_syntax::ast::Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
+        let item = StateValue::Object(vec![("label".to_string(), StateValue::Str("First row".to_string()))]);
+        let iter_path = vec!["state".to_string(), "rows".to_string()];
+        let substituted = substitute_loop_var(&children[0], "x", &item, &iter_path, 2);
+        let AstNode::Widget { bindings, .. } = &substituted else { panic!() };
+        assert_eq!(
+            bindings[0].value,
+            BindValue::Path(vec!["state".to_string(), "rows".to_string(), "2".to_string(), "handleMe".to_string()])
+        );
+    }
+
+    #[test]
+    fn substitute_loop_var_leaves_a_binding_untouched_when_iter_path_is_unavailable() {
+        // A non-path iterable (a literal list, or one behind a computed
+        // expression) has no `state.*` slot to rewrite onto — leave the
+        // binding as the loop-local name rather than fabricating a bogus path.
+        let src = "layout: T { Text `${x}` {onClick: x.handleMe} }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let nowui_syntax::ast::Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
+        let substituted = substitute_loop_var(&children[0], "x", &StateValue::Int(1), &[], 0);
+        let AstNode::Widget { bindings, .. } = &substituted else { panic!() };
+        assert_eq!(bindings[0].value, BindValue::Path(vec!["x".to_string(), "handleMe".to_string()]));
     }
 
     #[test]

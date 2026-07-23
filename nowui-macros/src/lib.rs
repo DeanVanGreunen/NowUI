@@ -15,7 +15,15 @@
 //!     otherwise `T` is assumed to itself derive `NowUiState`, and each
 //!     element is `T::to_state_value()` (a `StateValue::Object` snapshot of
 //!     its fields), so `${item.field}` can resolve per-iteration. Read-only
-//!     either way — no `.nowui` syntax writes back into a whole list yet.
+//!     as a *whole list* either way — no `.nowui` syntax writes back the
+//!     entire `Vec` at once. But when `T` is non-scalar, `call` also gets an
+//!     *indexed* arm: a path like `rows.2.handleMe` (produced by
+//!     `nowui-runtime`'s `dynamic::substitute_loop_var` rewriting a `for`
+//!     body's `{onClick: x.handleMe}` binding onto the concrete item at
+//!     index 2) parses the segment after the field name as a `usize` and
+//!     delegates the rest of the path into that one element's own
+//!     `NowUiState::call` — so a loop-item's own method is reachable from a
+//!     `.nowui` binding inside the loop body.
 //!   * Any other (non-`Vec`) field type is assumed to itself implement
 //!     `NowUiState` and gets a *delegating* get/set/call/to_state_value arm
 //!     (e.g. `counter: Counter` where `Counter` also derives `NowUiState`)
@@ -108,6 +116,25 @@ pub fn derive_nowui_state(input: TokenStream) -> TokenStream {
             object_fields.push(quote! {
                 (#name_str.to_string(), ::nowui_core::StateValue::List(self.#ident.iter().map(|v| #elem_expr).collect()))
             });
+            // Indexed `call` into one element, only when that element is
+            // itself a `NowUiState` (a scalar `Vec<String>`/`Vec<bool>`/...
+            // element has no method to call).
+            if scalar_kind(inner_ty).is_none() {
+                call_arms.push(quote! {
+                    Some((&#name_str, rest)) => {
+                        match rest.split_first() {
+                            Some((idx, rest)) => match idx.parse::<usize>() {
+                                Ok(idx) => match self.#ident.get_mut(idx) {
+                                    Some(item) => ::nowui_core::NowUiState::call(item, rest, event),
+                                    None => false,
+                                },
+                                Err(_) => false,
+                            },
+                            None => false,
+                        }
+                    }
+                });
+            }
             continue;
         }
 

@@ -56,6 +56,42 @@ fn call_returns_false_for_an_unknown_path() {
     assert!(!state.call(&["nope"], &mut click(&mut node)));
 }
 
+#[derive(Default, Clone, NowUiState)]
+#[nowui(methods(handle_me))]
+struct Row {
+    label: String,
+}
+
+impl Row {
+    fn handle_me(&mut self, event: &mut Event) {
+        event.node.style.opacity = 0.0;
+    }
+}
+
+#[derive(Default, Clone, NowUiState)]
+struct RowsState {
+    rows: Vec<Row>,
+}
+
+#[test]
+fn call_dispatches_into_a_vec_item_by_index() {
+    // The path shape `nowui-runtime`'s `dynamic::substitute_loop_var`
+    // rewrites a `for row in state.rows { ... {onClick: row.handle_me} }`
+    // binding onto: the field name, then the item's numeric index, then the
+    // rest of the path delegated into that one `Row`'s own `call`.
+    let mut state = RowsState { rows: vec![Row::default(), Row::default()] };
+    let mut node = Node::new(NodeKind::Container, Style::default());
+
+    assert!(state.call(&["rows", "1", "handle_me"], &mut click(&mut node)));
+    assert_eq!(node.style.opacity, 0.0);
+
+    // Out of range, or a scalar-index segment that isn't even a number —
+    // both fail closed rather than panicking.
+    let mut node2 = Node::new(NodeKind::Container, Style::default());
+    assert!(!state.call(&["rows", "5", "handle_me"], &mut click(&mut node2)));
+    assert!(!state.call(&["rows", "nope", "handle_me"], &mut click(&mut node2)));
+}
+
 #[test]
 fn handler_can_mutate_the_originating_node() {
     // The event carries a live handle to the node it fired on — a handler

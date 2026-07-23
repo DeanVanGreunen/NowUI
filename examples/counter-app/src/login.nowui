@@ -59,11 +59,11 @@ layout: Login(state) w-[fill] h-[fill] {
       Grid grid grid-cols-2 gap-4 pt-3 w-full {
         for x in state.rows {
           Checkbox `Remember me` text-gray-500 text-sm
-          Text `Forgot password? ${x.label}` text-gray-500 text-sm text-right
+          Text `Forgot password? ${x.label}` text-gray-500 text-sm text-right {onClick:x.handleMe}
         }
       }
 
-      Button `SIGN IN` w-full text-center text-white font-semibold bg-blue-600 hover:bg-blue-700 active:scale-95 py-3.5 rounded transition duration-150 ease-out m-[20px 0 0 0]
+      Button `SIGN IN` w-full text-center text-white font-semibold bg-blue-600 hover:bg-blue-700 active:scale-95 py-3.5 rounded transition duration-150 ease-out m-[20px 0 0 0] {onClick:state.sign_in}
     }
   }
 }

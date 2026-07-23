@@ -410,6 +410,12 @@ Grid grid grid-cols-2 gap-4 w-full {
 - `for x in state.rows` makes `${x}` (or `${x.field}` for a list of struct-typed items) usable
   inside backtick templates in the loop body — not inside a style bracket, and not inside a
   nested `if`/`for` condition in the same body.
+- A `{key: x.field}` **binding** rooted at the loop variable (e.g. `{onClick: x.handleMe}`) is
+  also rewritten per iteration — `dynamic::substitute_loop_var` replaces `x` with `state.rows.<N>`
+  (the `for`'s own iterable path plus this item's index), so it dispatches through
+  `nowui-macros`'s generated `call`/`get`/`set` as an indexed step into the `Vec<T>` field,
+  landing on that one element's own method. Only works when the iterable is a plain dotted
+  `state.*` path (not an expression) and `T` is itself a `NowUiState`, not a leaf scalar.
 - A `for`'s generated children splice in as **flat siblings**, not wrapped in an extra container
   — critical for e.g. a `for` inside `Grid grid-cols-2`, where each iteration's nodes must become
   the grid's own cells.
@@ -546,31 +552,45 @@ resolved **relative to that crate's own `src/` directory** and embedded at compi
 `include_str!` — the string literally becomes part of the binary, so nothing needs to exist on
 disk at runtime. Then call `nowui_runtime::run(entry, state)` with no path argument at all:
 
+add `#[nowui(view("/login.nowui"))]` to specify the root entry UI point
+add `#[nowui(methods(sign_in))]` to specify the each method that will be used by the view
+
 ```rust
 use std::process::ExitCode;
-use nowui_core::NowUiState;
+use nowui_core::{Event, NowUiState};
 
-// "/login.nowui" resolves to this crate's `src/login.nowui` — embedded via
-// `include_str!` at compile time by the derive macro.
 #[derive(Default, Clone, NowUiState)]
 #[nowui(view("/login.nowui"))]
+#[nowui(methods(sign_in))]
 pub struct App {
     username: String,
     password: String,
     rows: Vec<Row>,
 }
 
+impl App {
+  pub fn sign_in(&self, _event: &Event) {
+        println!("username: {}, password: {}", self.username, self.password);
+    }
+}
+
 #[derive(Default, Clone, NowUiState)]
+#[nowui(methods(handle_me))]
 pub struct Row {
-    id: String,
-    label: String,
+    id:String,
+    label:String,
+}
+
+impl Row {
+    pub fn handle_me(&mut self, _event:&Event){
+    }
 }
 
 fn main() -> ExitCode {
-    nowui_runtime::run("App", App {
-        username: String::new(),
-        password: String::new(),
-        rows: vec![Row { id: "x".to_string(), label: "x".to_string() }],
+    nowui_runtime::run( "App", App {
+        username: "".to_string(),
+        password: "".to_string(),
+        rows: vec![Row { id: "x".to_string(), label:"x".to_string()}],
     })
 }
 ```
