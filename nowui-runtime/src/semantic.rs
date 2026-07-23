@@ -23,7 +23,7 @@ use std::collections::HashMap;
 
 use nowui_core::{
     tailwind, Align, Color, Direction, Display, Easing, Edges, GridTrack, Node as ArenaNode,
-    NodeId, NodeKind, NowUiState, Position, Sizing, Style, TextAlign, Transition, Ui, EVENT_BINDING_KEYS,
+    NodeId, NodeKind, NowUiState, Position, Sizing, StateValue, Style, TextAlign, Transition, Ui, EVENT_BINDING_KEYS,
 };
 use nowui_syntax::ast::{BindValue, Expr, NamedArg, Node as AstNode, Param, StylePair, Template, TplPart};
 
@@ -115,7 +115,7 @@ impl Semantic {
         let scope = Scope::new();
 
         // The entry layout becomes the root container of a single layer.
-        let root_style = self.resolve_styles(&def.styles, &Style::default());
+        let root_style = self.resolve_styles(&def.styles, &Style::default(), &scope);
         let root = ui.push(ArenaNode::new(NodeKind::Container, root_style));
         let kids = self.expand_children(&mut ui, root, &def.children, &scope, state, 0, true);
         ui.get_mut(root).children = kids;
@@ -197,7 +197,7 @@ impl Semantic {
         }
         match ast {
             RegionAst::If { branches, else_branch } => {
-                let mut resolve = dynamic::make_resolver(state, None);
+                let mut resolve = scoped_resolver(state, scope);
                 let chosen = branches.iter().position(|(cond, _)| dynamic::eval_bool(cond, &mut resolve));
                 let body = match chosen {
                     Some(i) => &branches[i].1,
@@ -207,7 +207,7 @@ impl Semantic {
                 (ids, RegionSignature::Branch(chosen.unwrap_or(branches.len())))
             }
             RegionAst::For { var, iter, body } => {
-                let mut resolve = dynamic::make_resolver(state, None);
+                let mut resolve = scoped_resolver(state, scope);
                 let items = dynamic::eval_expr(iter, &mut resolve)
                     .and_then(|v| v.as_list().map(<[_]>::to_vec))
                     .unwrap_or_default();
@@ -289,11 +289,15 @@ impl Semantic {
         // Is this a use of a custom layout/widget?
         if let Some(def) = self.defs.get(kind).cloned() {
             let inner = bind_scope(&def.params, args, scope);
-            // Merge use-site styles over the definition's own styles.
-            let base = self.resolve_styles(&def.styles, &Style::default());
-            let merged = self.resolve_styles(styles, &base);
+            // Merge use-site styles over the definition's own styles — the
+            // def's own `key-[${...}]` brackets (if any) are authored against
+            // its own params, so resolve those against `inner`; the use
+            // site's styles are authored in the caller's scope, so those
+            // resolve against `scope`.
+            let base = self.resolve_styles(&def.styles, &Style::default(), &inner);
+            let merged = self.resolve_styles(styles, &base, scope);
             let container = ui.push(ArenaNode::new(NodeKind::Container, merged));
-            apply_generic_bindings(ui, container, bindings);
+            apply_generic_bindings(ui, container, bindings, scope);
             self.pending_on_load.push(container);
             let kids = self.expand_children(ui, container, &def.children, &inner, state, depth + 1, true);
             ui.get_mut(container).children = kids;
@@ -301,17 +305,17 @@ impl Semantic {
         }
 
         // Otherwise a primitive.
-        let style = self.resolve_styles(styles, &Style::default());
+        let style = self.resolve_styles(styles, &Style::default(), scope);
         let arena_kind = self.primitive(kind, string_args, bindings, scope)?;
         let id = ui.push(ArenaNode::new(arena_kind, style));
-        apply_generic_bindings(ui, id, bindings);
+        apply_generic_bindings(ui, id, bindings, scope);
         self.pending_on_load.push(id);
 
         // Only worth storing (and re-rendering each frame) if at least one
         // backtick actually has a `${...}` in it — the common all-literal
         // case leaves `templates` empty, same cost as before this existed.
         if string_args.iter().any(|t| t.parts.iter().any(|p| matches!(p, TplPart::Var(_)))) {
-            ui.get_mut(id).templates = string_args.iter().map(to_core_template).collect();
+            ui.get_mut(id).templates = string_args.iter().map(|t| to_core_template(t, scope)).collect();
         }
 
         let kids = self.expand_children(ui, id, children, scope, state, depth + 1, true);
@@ -386,7 +390,7 @@ impl Semantic {
 
     /// Fold a list of raw style pairs onto a base style, splitting out
     /// `variant:key` prefixes into `Style::variants` along the way.
-    fn resolve_styles(&mut self, pairs: &[StylePair], base: &Style) -> Style {
+    fn resolve_styles(&mut self, pairs: &[StylePair], base: &Style, scope: &Scope) -> Style {
         let mut own_pairs = Vec::new();
         let mut hover_pairs = Vec::new();
         let mut focus_pairs = Vec::new();
@@ -423,27 +427,27 @@ impl Semantic {
 
         let mut resolved = base.clone();
         for p in &own_pairs {
-            self.apply_style(&mut resolved, p);
+            self.apply_style(&mut resolved, p, scope);
         }
 
         if !hover_pairs.is_empty() {
             let mut s = resolved.clone();
             for p in &hover_pairs {
-                self.apply_style(&mut s, p);
+                self.apply_style(&mut s, p, scope);
             }
             resolved.variants.hover = Some(Box::new(s));
         }
         if !focus_pairs.is_empty() {
             let mut s = resolved.clone();
             for p in &focus_pairs {
-                self.apply_style(&mut s, p);
+                self.apply_style(&mut s, p, scope);
             }
             resolved.variants.focus = Some(Box::new(s));
         }
         if !active_pairs.is_empty() {
             let mut s = resolved.clone();
             for p in &active_pairs {
-                self.apply_style(&mut s, p);
+                self.apply_style(&mut s, p, scope);
             }
             resolved.variants.active = Some(Box::new(s));
         }
@@ -453,7 +457,7 @@ impl Semantic {
         let mut out = Vec::with_capacity(responsive.len());
         for (min_w, list) in &responsive {
             for p in list {
-                self.apply_style(&mut cascade, p);
+                self.apply_style(&mut cascade, p, scope);
             }
             out.push((*min_w, cascade.clone()));
         }
@@ -462,14 +466,14 @@ impl Semantic {
         resolved
     }
 
-    fn apply_style(&mut self, s: &mut Style, p: &StylePair) {
+    fn apply_style(&mut self, s: &mut Style, p: &StylePair, scope: &Scope) {
         // `key-[${state.path}]`: the whole bracket is one interpolation, so
         // record the path generically instead of trying to parse it as a
         // literal (which would fail and warn as an unknown/malformed value).
         // The field it would have set is left untouched until reactivity
         // (roadmap step 6) can resolve `s.dynamic` against live state.
         if let Some(path) = dynamic_var_path(&p.value) {
-            s.dynamic.insert(p.key.clone(), path);
+            s.dynamic.insert(p.key.clone(), resolve_scoped_path(&path, scope));
             return;
         }
 
@@ -488,12 +492,15 @@ impl Semantic {
 /// already split into path segments) — nowui-core can't depend on
 /// nowui-syntax (the hard rule: no chumsky in core), so this conversion is
 /// the boundary between the two.
-fn to_core_template(t: &Template) -> nowui_core::Template {
+fn to_core_template(t: &Template, scope: &Scope) -> nowui_core::Template {
     t.parts
         .iter()
         .map(|p| match p {
             TplPart::Lit(s) => nowui_core::TemplatePart::Lit(s.clone()),
-            TplPart::Var(v) => nowui_core::TemplatePart::Var(v.split('.').map(str::to_string).collect()),
+            TplPart::Var(v) => {
+                let path: Vec<String> = v.split('.').map(str::to_string).collect();
+                nowui_core::TemplatePart::Var(resolve_scoped_path(&path, scope))
+            }
         })
         .collect()
 }
@@ -975,7 +982,7 @@ fn compact_sizing(token: &str) -> Sizing {
 /// `EVENT_BINDING_KEYS` (stored on `Node::events`, keyed by the binding
 /// name), and `{onLoadDelay: 1.0}` (a literal number of seconds, stored on
 /// `Node::on_load_delay_secs` — see that field's doc comment).
-fn apply_generic_bindings(ui: &mut Ui, id: NodeId, bindings: &[nowui_syntax::ast::Binding]) {
+fn apply_generic_bindings(ui: &mut Ui, id: NodeId, bindings: &[nowui_syntax::ast::Binding], scope: &Scope) {
     for b in bindings {
         if b.key == "onLoadDelay" {
             if let BindValue::Number(n) = b.value {
@@ -984,10 +991,11 @@ fn apply_generic_bindings(ui: &mut Ui, id: NodeId, bindings: &[nowui_syntax::ast
             continue;
         }
         let BindValue::Path(path) = &b.value else { continue };
+        let path = resolve_scoped_path(path, scope);
         if b.key == "value" {
-            ui.get_mut(id).value_path = path.clone();
+            ui.get_mut(id).value_path = path;
         } else if EVENT_BINDING_KEYS.contains(&b.key.as_str()) {
-            ui.get_mut(id).events.insert(b.key.clone(), path.clone());
+            ui.get_mut(id).events.insert(b.key.clone(), path);
         }
     }
 }
@@ -1003,16 +1011,64 @@ fn literal_percent(bindings: &[nowui_syntax::ast::Binding]) -> Option<f32> {
 }
 
 /// Bind a definition's params to the args at a use site (named; falls back to
-/// param defaults; captures nothing from the outer scope by default).
-fn bind_scope(params: &[Param], args: &[NamedArg], _outer: &Scope) -> Scope {
+/// param defaults). A `Path`-valued arg (e.g. `PageWhatToDo app=state`, or
+/// `Middle y=x` where `x` is itself the outer layout's own param) is resolved
+/// against `outer` right here, via `resolve_scoped_path` — so every entry
+/// this scope ends up holding is already a fully-rooted concrete path (one
+/// whose first segment is `"state"`, or that doesn't resolve at all), and
+/// nothing downstream ever needs to chase through more than one scope to
+/// find out what a param "really" points at.
+fn bind_scope(params: &[Param], args: &[NamedArg], outer: &Scope) -> Scope {
     let mut scope = Scope::new();
     for p in params {
         let supplied = args.iter().find(|a| a.name == p.name).map(|a| a.value.clone());
         if let Some(val) = supplied.or_else(|| p.default.clone()) {
-            scope.insert(p.name.clone(), val);
+            let resolved = match &val {
+                BindValue::Path(path) => BindValue::Path(resolve_scoped_path(path, outer)),
+                other => other.clone(),
+            };
+            scope.insert(p.name.clone(), resolved);
         }
     }
     scope
+}
+
+/// Rewrite `path`'s root segment through `scope` — a custom layout's own
+/// body is authored against its declared param names (`app.foo`), not
+/// against `state` directly, so every path stored into a live binding
+/// (event, `value`, template interpolation, style `dynamic` bracket) or
+/// evaluated in an `if`/`for` condition has to have its root swapped for
+/// whatever concrete path that param was bound to at its use site before
+/// it means anything to `nowui-core`'s `state.get`/`set`/`call`. Left
+/// unchanged when the root isn't a scope entry at all (already `state.*`,
+/// or a `for`-loop variable — those are substituted separately, by
+/// `dynamic::substitute_loop_var`, before this ever sees them).
+/// A path resolver for `if`/`for` condition evaluation (see
+/// `dynamic::eval_bool`/`eval_expr`) that rewrites a condition's `Expr::Path`
+/// through `scope` (a custom layout's own param name -> the concrete path
+/// bound at its use site) before falling back to `nowui-core`'s ordinary
+/// `state.*` lookup — the same substitution `resolve_scoped_path` does for
+/// bindings/templates/style brackets, just wired into `dynamic`'s resolver
+/// contract instead.
+fn scoped_resolver<'a>(state: &'a dyn NowUiState, scope: &'a Scope) -> impl FnMut(&[String]) -> Option<StateValue> + 'a {
+    move |segs: &[String]| {
+        let resolved = resolve_scoped_path(segs, scope);
+        if resolved.first().map(String::as_str) == Some("state") {
+            let sub: Vec<&str> = resolved.iter().skip(1).map(String::as_str).collect();
+            return state.get(&sub);
+        }
+        None
+    }
+}
+
+fn resolve_scoped_path(path: &[String], scope: &Scope) -> Vec<String> {
+    match path.split_first() {
+        Some((head, rest)) => match scope.get(head) {
+            Some(BindValue::Path(root)) => root.iter().cloned().chain(rest.iter().cloned()).collect(),
+            _ => path.to_vec(),
+        },
+        None => path.to_vec(),
+    }
 }
 
 fn parse_px(v: &str) -> f32 {
@@ -1263,6 +1319,67 @@ mod tests {
     }
 
     #[test]
+    fn custom_widget_param_substitutes_to_the_concrete_path_bound_at_its_use_site() {
+        // `Page(app)` is used as `Page app=state`: every `app.*` path inside
+        // `Page`'s own body — an event binding, a `value` binding, and an
+        // `if` condition — must resolve as if it had been written
+        // `state.*` directly. This is the exact shape of the bug where
+        // `{onClick: app.foo.bar}` and `if app.foo.bar { ... }` silently
+        // never fired/matched because the param name was never substituted.
+        let ast = nowui_syntax::parse(
+            "layout: Page(app) { \
+                Button `Go` {onClick: app.save, value: app.count} \
+                if app.flag { Text `yes` } else { Text `no` } \
+             } \
+             layout: App { Page app=state }",
+        )
+        .unwrap();
+
+        #[derive(Default, Clone)]
+        struct S {
+            count: i64,
+            flag: bool,
+        }
+        impl nowui_core::NowUiState for S {
+            fn get(&self, path: &[&str]) -> Option<nowui_core::StateValue> {
+                match path {
+                    ["count"] => Some(nowui_core::StateValue::Int(self.count)),
+                    ["flag"] => Some(nowui_core::StateValue::Bool(self.flag)),
+                    _ => None,
+                }
+            }
+            fn set(&mut self, _path: &[&str], _value: nowui_core::StateValue) -> bool {
+                false
+            }
+            fn call(&mut self, _path: &[&str], _event: &mut nowui_core::Event<'_>) -> bool {
+                false
+            }
+            fn to_state_value(&self) -> nowui_core::StateValue {
+                nowui_core::StateValue::Object(vec![])
+            }
+        }
+
+        let mut sem = Semantic::new(&ast);
+        let state = S { count: 7, flag: true };
+        let ui = sem.build("App", &state).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        // `App`'s body is `Page app=state`, a custom-widget use, whose own
+        // container is `root.children[0]`; `Page`'s own children sit under
+        // that.
+        let page = ui.get(root.children[0]);
+        let button = ui.get(page.children[0]);
+        assert_eq!(button.events.get("onClick"), Some(&vec!["state".to_string(), "save".to_string()]));
+        assert_eq!(button.value_path, vec!["state".to_string(), "count".to_string()]);
+
+        // The `if app.flag { ... }` region: `flag` is `true`, so the "yes"
+        // branch (not "no") should have been the one actually expanded.
+        let nowui_core::NodeKind::Text { content } = &ui.get(page.children[1]).kind else {
+            panic!("expected a Text node");
+        };
+        assert_eq!(content, "yes");
+    }
+
+    #[test]
     fn resolves_on_load_delay_and_defaults_to_zero_when_absent() {
         let ast = nowui_syntax::parse(
             "layout: T { Text `a` {onLoad: state.loaded, onLoadDelay: 1.5} Text `b` {onLoad: state.loaded} }",
@@ -1289,7 +1406,7 @@ mod tests {
         let mut ui = Ui::new();
         let id = ui.push(ArenaNode::new(NodeKind::Container, Style::default()));
         let bindings = vec![nowui_syntax::ast::Binding { key: "onLoadDelay".to_string(), value: BindValue::Number(-2.0) }];
-        apply_generic_bindings(&mut ui, id, &bindings);
+        apply_generic_bindings(&mut ui, id, &bindings, &Scope::new());
         assert_eq!(ui.get(id).on_load_delay_secs, 0.0);
     }
 

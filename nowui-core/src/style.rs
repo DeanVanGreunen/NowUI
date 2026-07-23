@@ -434,17 +434,24 @@ pub fn compute_effective(
     }
 
     // State variants layer on top, diffed against the plain base so they only
-    // touch what they explicitly declared.
-    if pressed {
-        if let Some(v) = &base.variants.active {
+    // touch what they explicitly declared. Applied in increasing priority
+    // (hover, then focus, then pressed) rather than as mutually exclusive
+    // branches: each overlay only overwrites the fields it explicitly
+    // declares, so a state with no matching variant (e.g. a button with no
+    // `focus:` styles) doesn't mask a lower-priority state that does have
+    // one — a stuck `focused` node still shows its `hover:` styles.
+    if hovered {
+        if let Some(v) = &base.variants.hover {
             overlay_touched_fields(&mut working, base, v);
         }
-    } else if focused {
+    }
+    if focused {
         if let Some(v) = &base.variants.focus {
             overlay_touched_fields(&mut working, base, v);
         }
-    } else if hovered {
-        if let Some(v) = &base.variants.hover {
+    }
+    if pressed {
+        if let Some(v) = &base.variants.active {
             overlay_touched_fields(&mut working, base, v);
         }
     }
