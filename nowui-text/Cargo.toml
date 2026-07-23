@@ -1,13 +1,11 @@
 [package]
-name = "nowui-render"
+name = "nowui-text"
 version = "0.1.0"
 edition = "2021"
-description = "tiny-skia Painter implementation and softbuffer presentation bridge for the NowUI UI toolkit."
+description = "Shared cosmic-text shaping/measurement for every NowUI Painter backend."
 license = "MIT"
 repository = "https://github.com/DeanVanGreunen/NowUI"
 
 [dependencies]
 nowui-core = { path = "../nowui-core", version = "0.1.0" }
-nowui-text = { path = "../nowui-text", version = "0.1.0" }
-tiny-skia = { workspace = true }
 cosmic-text = { workspace = true }

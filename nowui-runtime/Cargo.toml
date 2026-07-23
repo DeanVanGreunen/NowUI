@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 nowui-syntax = { path = "../nowui-syntax", version = "0.1.0" }
 nowui-core = { path = "../nowui-core", version = "0.1.0" }
+nowui-text = { path = "../nowui-text", version = "0.1.0" }
 nowui-render = { path = "../nowui-render", version = "0.1.0" }
 winit = { workspace = true }
 softbuffer = { workspace = true }

@@ -1,42 +1,16 @@
 //! tiny-skia implementation of `nowui_core::Painter`, plus the bridge that
 //! packs a rasterized `Pixmap` into a softbuffer `0RGB` u32 buffer.
 //!
-//! Text: tiny-skia has NO font support, so glyphs are shaped and rasterized by
-//! cosmic-text/swash and blitted onto the pixmap pixel-by-pixel here.
+//! Text: tiny-skia has NO font support, so glyphs are shaped (via
+//! `nowui-text`, shared with any other `Painter` backend) and rasterized by
+//! cosmic-text/swash, then blitted onto the pixmap pixel-by-pixel here.
 
-use cosmic_text::{Attrs, Buffer, Metrics, Shaping};
+use cosmic_text::Buffer;
 use nowui_core::{Color, Edges, Painter, Point, Rect, TextAlign, TextStyle, Transform2D};
+pub use nowui_text::TextContext;
 use tiny_skia::{
     FillRule, Mask, Paint, PathBuilder, Pixmap, Rect as SkRect, Stroke, Transform,
 };
-
-/// The font database and glyph rasterization cache. Expensive to build
-/// (loading system fonts can take up to ~1s), so create one and keep it alive
-/// for the life of the app rather than per-frame.
-pub struct TextContext {
-    pub font_system: cosmic_text::FontSystem,
-    pub swash_cache: cosmic_text::SwashCache,
-}
-
-impl TextContext {
-    /// Discovers and loads installed fonts from the OS's own font store —
-    /// `fontdb`'s `load_system_fonts()` covers the platform's default paths:
-    /// the Fonts registry/directory on Windows, `/System/Library/Fonts` +
-    /// `/Library/Fonts` + `~/Library/Fonts` on macOS, and fontconfig/XDG font
-    /// directories on Linux. No fonts are bundled with NowUI.
-    pub fn new() -> Self {
-        TextContext {
-            font_system: cosmic_text::FontSystem::new(),
-            swash_cache: cosmic_text::SwashCache::new(),
-        }
-    }
-}
-
-impl Default for TextContext {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 pub struct SkiaPainter<'a> {
     pixmap: &'a mut Pixmap,
@@ -101,22 +75,10 @@ impl<'a> SkiaPainter<'a> {
     }
 
     /// Shape `text` at `size`, wrapping to `width` if given (`None` measures
-    /// the text's natural, unwrapped extent), aligned per `align`.
+    /// the text's natural, unwrapped extent), aligned per `align`. Delegates
+    /// to `nowui-text` — the shared shaping logic every `Painter` backend uses.
     fn shape(&mut self, text: &str, size: f32, width: Option<f32>, align: TextAlign) -> Buffer {
-        let metrics = Metrics::new(size, size * 1.3);
-        let mut buffer = Buffer::new(self.font_system, metrics);
-        buffer.set_size(self.font_system, width, None);
-        buffer.set_text(self.font_system, text, Attrs::new(), Shaping::Advanced);
-        let align = match align {
-            TextAlign::Left => cosmic_text::Align::Left,
-            TextAlign::Center => cosmic_text::Align::Center,
-            TextAlign::Right => cosmic_text::Align::Right,
-        };
-        for line in buffer.lines.iter_mut() {
-            line.set_align(Some(align));
-        }
-        buffer.shape_until_scroll(self.font_system, false);
-        buffer
+        nowui_text::shape_text(self.font_system, text, size, width, align)
     }
 
     fn active_clip(&self) -> Option<&Mask> {
@@ -275,17 +237,7 @@ impl<'a> Painter for SkiaPainter<'a> {
     }
 
     fn measure_text(&mut self, text: &str, size: f32) -> Point {
-        if text.is_empty() {
-            return Point::new(0.0, size * 1.3);
-        }
-        let buffer = self.shape(text, size, None, TextAlign::Left);
-        let mut width = 0.0f32;
-        let mut lines = 0.0f32;
-        for run in buffer.layout_runs() {
-            width = width.max(run.line_w);
-            lines += 1.0;
-        }
-        Point::new(width, lines * buffer.metrics().line_height)
+        nowui_text::measure(self.font_system, text, size)
     }
 
     fn push_transform(&mut self, transform: Transform2D, origin: Point) {

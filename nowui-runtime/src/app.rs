@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use nowui_core::{
     compute_effective, display_string, dropdown_metrics, AnimatableStyle, Color, Event, EventKind,
-    NodeId, NodeKind, NowUiState, Painter, Point, Rect, Size, StateValue, TemplatePart, Ui,
+    NodeId, NodeKind, NowUiState, Point, Rect, Size, StateValue, TemplatePart, Ui,
 };
 use nowui_render::{present_to_softbuffer, SkiaPainter, TextContext};
 use tiny_skia::Pixmap;
@@ -585,13 +585,12 @@ impl<S: NowUiState> App<S> {
 
     /// Measure `text`'s pixel width at `size` outside of an actual redraw —
     /// used for click-to-caret hit-testing, which happens on a mouse event,
-    /// not inside the paint pass. `measure_text` never touches the pixmap
-    /// itself (just shapes glyphs via `font_system`), so a throwaway 1x1
-    /// one is a cheap, safe way to get a real `Painter` to call it on.
+    /// not inside the paint pass. Pure cosmic-text shaping (`nowui-text`) —
+    /// no `Painter`/pixmap/GPU surface needed at all, unlike before this was
+    /// extracted (a throwaway 1x1 `SkiaPainter` used to be the only way to
+    /// reach `measure_text`).
     fn measure_text_width(&mut self, text: &str, size: f32) -> f32 {
-        let mut pixmap = Pixmap::new(1, 1).expect("1x1 pixmap for text measurement");
-        let mut painter = SkiaPainter::new(&mut pixmap, &mut self.text);
-        painter.measure_text(text, size).x
+        nowui_text::measure(&mut self.text.font_system, text, size).x
     }
 
     /// Keep every `TextInput`'s caret in view by adjusting its scroll offset

@@ -4,7 +4,9 @@ members = [
     "nowui-syntax",
     "nowui-core",
     "nowui-macros",
+    "nowui-text",
     "nowui-render",
+    "nowui-render-gpu",
     "nowui-runtime",
     "nowui-lsp",
     "examples/counter-app",
@@ -20,6 +22,12 @@ tiny-skia = "0.11"
 winit = "0.30"
 softbuffer = "0.4"
 cosmic-text = "0.12"
+# `vello` re-exports `wgpu`/`peniko`/`kurbo` as `vello::wgpu`/`vello::peniko`/
+# `vello::kurbo` — use those re-exports everywhere instead of adding separate
+# `wgpu`/`peniko`/`kurbo` workspace deps, so the versions can never drift out
+# of sync with what `vello` itself was built against.
+vello = "0.9"
+pollster = "0.3"
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
