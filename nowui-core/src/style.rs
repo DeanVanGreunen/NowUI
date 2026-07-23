@@ -1,6 +1,8 @@
 //! The resolved style struct. Produced by the semantic pass from the raw
 //! `(key, value)` pairs the parser emits.
 
+use std::collections::HashMap;
+
 use crate::geometry::{Color, Edges};
 use crate::tailwind::Easing;
 
@@ -220,6 +222,17 @@ pub struct Style {
     pub grid_column_span: u32,
     pub grid_row_span: u32,
     pub variants: StyleVariants,
+    /// `key-[${state.path}]`: a style value that's *entirely* one `${...}`
+    /// interpolation (e.g. `w-[${state.myWidth}]`) resolves its dotted path
+    /// here — keyed by the style key it would otherwise have set (`"w"`,
+    /// `"bg-color"`, ...) — instead of being parsed as a literal. The
+    /// corresponding field is left at whatever it already was (its default,
+    /// or an earlier class's value) since there's no live state object yet
+    /// to resolve it against (roadmap step 6, reactivity — same status as
+    /// `${var}` in backtick text and `Node::value_path`/`events`). Mixed
+    /// literal+variable values (`"10${state.x}px"`) are NOT supported — the
+    /// whole bracket must be the interpolation.
+    pub dynamic: HashMap<String, Vec<String>>,
 }
 
 impl Default for Style {
@@ -262,6 +275,7 @@ impl Default for Style {
             grid_column_span: 1,
             grid_row_span: 1,
             variants: StyleVariants::default(),
+            dynamic: HashMap::new(),
         }
     }
 }
@@ -386,6 +400,7 @@ fn overlay_touched_fields(working: &mut Style, unvaried: &Style, variant: &Style
         grid_template_rows,
         grid_column_span,
         grid_row_span,
+        dynamic,
     );
 }
 
@@ -435,4 +450,18 @@ pub fn compute_effective(
 /// point falls in). Keeping this in one place keeps the two in sync.
 pub fn dropdown_metrics(font_size: f32) -> (f32, f32) {
     (font_size * 1.3 + 16.0, font_size * 1.3 + 12.0)
+}
+
+/// `Slider`/`ProgressBar` have no text content to hug-size against, so they
+/// fall back to a fixed default length when `Sizing::Hug` — same convention
+/// as a bare HTML `<input type="range">`/`<progress>`, which also have an
+/// intrinsic default width. Override with `w-*`/`w-[…]` as usual.
+pub const DEFAULT_CONTROL_WIDTH: f32 = 160.0;
+
+/// Shared `Slider`/`ProgressBar` geometry: `(track_height, thumb_diameter)`.
+/// `ProgressBar` only ever uses the track height (no thumb). Used by
+/// `layout::measure` (sizing), `paint` (drawing), and the runtime's drag hit
+/// math — keep all three sharing it; don't duplicate the formula.
+pub fn slider_metrics(font_size: f32) -> (f32, f32) {
+    (6.0, (font_size * 0.9).max(14.0))
 }

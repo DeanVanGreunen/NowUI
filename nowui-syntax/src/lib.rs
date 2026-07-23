@@ -51,6 +51,25 @@ mod tests {
     }
 
     #[test]
+    fn parses_dotted_interpolation_in_backtick_template() {
+        // `${state.counter.count}` must parse as one Var("state.counter.count")
+        // part, not stop at the first `.` (interp() used to only accept a bare
+        // ident, which would fail on anything but a single-segment path).
+        let src = "layout: T { Text `Count: ${state.counter.count}!` }";
+        let ast = parse(src).expect("should parse");
+        let Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
+        let Node::Widget { string_args, .. } = &children[0] else { panic!() };
+        assert_eq!(
+            string_args[0].parts,
+            vec![
+                TplPart::Lit("Count: ".into()),
+                TplPart::Var("state.counter.count".into()),
+                TplPart::Lit("!".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn sibling_nodes_dont_swallow_next_kind_as_bare_style() {
         // A node with no bracketed trailing style must not let `style()` greedily
         // consume the next sibling's Capitalized `kind` ident as a bare flag.

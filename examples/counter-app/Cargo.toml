@@ -1,0 +1,12 @@
+[package]
+name = "nowui-counter-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "counter-app"
+path = "src/main.rs"
+
+[dependencies]
+nowui-core = { path = "../../nowui-core" }
+nowui-runtime = { path = "../../nowui-runtime" }

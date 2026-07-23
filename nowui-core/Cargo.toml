@@ -4,5 +4,8 @@ version = "0.1.0"
 edition = "2021"
 
 # Deliberately depends on NEITHER chumsky NOR tiny-skia. The model stays
-# testable in isolation and the renderer can be swapped.
+# testable in isolation and the renderer can be swapped. nowui-macros is fine
+# — it's the sibling proc-macro crate, re-exported below so callers only ever
+# need to depend on nowui-core (`#[derive(nowui_core::NowUiState)]`).
 [dependencies]
+nowui-macros = { path = "../nowui-macros" }

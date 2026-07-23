@@ -23,9 +23,9 @@ use std::collections::HashMap;
 
 use nowui_core::{
     tailwind, Align, Color, Direction, Display, Easing, Edges, GridTrack, Node as ArenaNode,
-    NodeId, NodeKind, Position, Sizing, Style, TextAlign, Transition, Ui,
+    NodeId, NodeKind, Position, Sizing, Style, TextAlign, Transition, Ui, EVENT_BINDING_KEYS,
 };
-use nowui_syntax::ast::{BindValue, NamedArg, Node as AstNode, Param, StylePair, Template};
+use nowui_syntax::ast::{BindValue, NamedArg, Node as AstNode, Param, StylePair, Template, TplPart};
 
 const MAX_EXPANSION_DEPTH: usize = 64;
 
@@ -103,6 +103,7 @@ impl Semantic {
             let base = self.resolve_styles(&def.styles, &Style::default());
             let merged = self.resolve_styles(styles, &base);
             let container = ui.push(ArenaNode::new(NodeKind::Container, merged));
+            apply_generic_bindings(ui, container, bindings);
             let mut kids = Vec::new();
             for c in &def.children {
                 if let Some(id) = self.expand(ui, c, &inner, depth + 1) {
@@ -117,6 +118,14 @@ impl Semantic {
         let style = self.resolve_styles(styles, &Style::default());
         let arena_kind = self.primitive(kind, string_args, bindings, scope)?;
         let id = ui.push(ArenaNode::new(arena_kind, style));
+        apply_generic_bindings(ui, id, bindings);
+
+        // Only worth storing (and re-rendering each frame) if at least one
+        // backtick actually has a `${...}` in it — the common all-literal
+        // case leaves `templates` empty, same cost as before this existed.
+        if string_args.iter().any(|t| t.parts.iter().any(|p| matches!(p, TplPart::Var(_)))) {
+            ui.get_mut(id).templates = string_args.iter().map(to_core_template).collect();
+        }
 
         let mut kids = Vec::new();
         for c in children {
@@ -142,42 +151,30 @@ impl Semantic {
             "Button" => Some(NodeKind::Button { label: arg(0) }),
             "Checkbox" => Some(NodeKind::Checkbox { label: arg(0), checked: false }),
             "TextInput" => {
-                let value_path = bindings
-                    .iter()
-                    .find(|b| b.key == "value")
-                    .and_then(|b| match &b.value {
-                        BindValue::Path(p) => Some(p.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
                 let masked = bindings
                     .iter()
                     .find(|b| b.key == "mask")
                     .map(|b| matches!(b.value, BindValue::Bool(true)))
                     .unwrap_or(false);
-                Some(NodeKind::TextInput {
-                    label: arg(0),
-                    placeholder: arg(1),
-                    value_path,
-                    masked,
-                })
+                Some(NodeKind::TextInput { label: arg(0), placeholder: arg(1), masked })
             }
-            "Dropdown" => {
-                let value_path = bindings
-                    .iter()
-                    .find(|b| b.key == "value")
-                    .and_then(|b| match &b.value {
-                        BindValue::Path(p) => Some(p.clone()),
-                        _ => None,
-                    })
-                    .unwrap_or_default();
-                Some(NodeKind::Dropdown {
-                    placeholder: arg(0),
-                    options: string_args.iter().skip(1).map(|t| t.render_flat()).collect(),
-                    selected: None,
-                    open: false,
-                    value_path,
-                })
+            "Dropdown" => Some(NodeKind::Dropdown {
+                placeholder: arg(0),
+                options: string_args.iter().skip(1).map(|t| t.render_flat()).collect(),
+                selected: None,
+                open: false,
+            }),
+            // `value` (0..=100) is a `value:` binding like everywhere else (see
+            // `apply_generic_bindings`) when it's a live state path; a literal
+            // starting position is also accepted as a plain number so the
+            // widget isn't stuck at the default until state binding lands.
+            "Slider" => {
+                let initial = literal_percent(bindings).unwrap_or(0.5);
+                Some(NodeKind::Slider { value: initial })
+            }
+            "ProgressBar" => {
+                let initial = literal_percent(bindings).unwrap_or(0.0);
+                Some(NodeKind::ProgressBar { value: initial })
             }
             // Bare containers used directly in a body (e.g. `Card`, `Row`).
             "Card" | "Container" | "Row" | "Column" | "Bar" | "Grid" | "List" => Some(NodeKind::Container),
@@ -267,6 +264,16 @@ impl Semantic {
     }
 
     fn apply_style(&mut self, s: &mut Style, p: &StylePair) {
+        // `key-[${state.path}]`: the whole bracket is one interpolation, so
+        // record the path generically instead of trying to parse it as a
+        // literal (which would fail and warn as an unknown/malformed value).
+        // The field it would have set is left untouched until reactivity
+        // (roadmap step 6) can resolve `s.dynamic` against live state.
+        if let Some(path) = dynamic_var_path(&p.value) {
+            s.dynamic.insert(p.key.clone(), path);
+            return;
+        }
+
         let v = p.value.as_str();
         let key = p.key.as_str();
 
@@ -275,6 +282,32 @@ impl Semantic {
         }
         self.warnings.push(format!("unknown style key `{key}`"));
     }
+}
+
+/// `nowui_syntax::ast::Template` (parser-side, `TplPart::Var` is a raw dotted
+/// string) -> `nowui_core::Template` (runtime-side, `TemplatePart::Var` is
+/// already split into path segments) — nowui-core can't depend on
+/// nowui-syntax (the hard rule: no chumsky in core), so this conversion is
+/// the boundary between the two.
+fn to_core_template(t: &Template) -> nowui_core::Template {
+    t.parts
+        .iter()
+        .map(|p| match p {
+            TplPart::Lit(s) => nowui_core::TemplatePart::Lit(s.clone()),
+            TplPart::Var(v) => nowui_core::TemplatePart::Var(v.split('.').map(str::to_string).collect()),
+        })
+        .collect()
+}
+
+/// `${a.b.c}` -> `Some(["a", "b", "c"])`, only when the *entire* trimmed
+/// value is one interpolation — `"10${x}px"` or plain `"10px"` both return
+/// `None` (the former isn't supported; the latter isn't dynamic at all).
+fn dynamic_var_path(v: &str) -> Option<Vec<String>> {
+    let inner = v.trim().strip_prefix("${")?.strip_suffix('}')?;
+    if inner.is_empty() {
+        return None;
+    }
+    Some(inner.split('.').map(str::to_string).collect())
 }
 
 /// Exact-key matches: bare flags and the legacy `key-[value]` bracket forms
@@ -732,6 +765,34 @@ fn compact_sizing(token: &str) -> Sizing {
     }
 }
 
+/// Extract the cross-cutting bindings every widget (primitive or custom
+/// layout use) can carry, generically: `{value: state.path}` (stored on
+/// `Node::value_path` — read by `Text`/`TextInput`/`Checkbox`/`Dropdown`/
+/// `Slider`/`ProgressBar`, ignored by anything else) and any of
+/// `EVENT_BINDING_KEYS` (stored on `Node::events`, keyed by the binding
+/// name). Both are parsed and stored only — see CLAUDE.md for why nothing
+/// dispatches them yet (no callback/state system exists until roadmap step 6).
+fn apply_generic_bindings(ui: &mut Ui, id: NodeId, bindings: &[nowui_syntax::ast::Binding]) {
+    for b in bindings {
+        let BindValue::Path(path) = &b.value else { continue };
+        if b.key == "value" {
+            ui.get_mut(id).value_path = path.clone();
+        } else if EVENT_BINDING_KEYS.contains(&b.key.as_str()) {
+            ui.get_mut(id).events.insert(b.key.clone(), path.clone());
+        }
+    }
+}
+
+/// A literal starting position for `Slider`/`ProgressBar` — `{value: 50}`
+/// (0..=100) rather than a state path. Only meaningful before state binding
+/// exists; once `value_path` resolves against live state, that should win.
+fn literal_percent(bindings: &[nowui_syntax::ast::Binding]) -> Option<f32> {
+    bindings.iter().find(|b| b.key == "value").and_then(|b| match b.value {
+        BindValue::Number(n) => Some((n as f32 / 100.0).clamp(0.0, 1.0)),
+        _ => None,
+    })
+}
+
 /// Bind a definition's params to the args at a use site (named; falls back to
 /// param defaults; captures nothing from the outer scope by default).
 fn bind_scope(params: &[Param], args: &[NamedArg], _outer: &Scope) -> Scope {
@@ -906,15 +967,94 @@ mod tests {
         let mut sem = Semantic::new(&ast);
         let ui = sem.build("T").unwrap();
         let root = ui.get(ui.layers[0].root);
-        let nowui_core::NodeKind::Dropdown { placeholder, options, value_path, selected, open } =
-            &ui.get(root.children[0]).kind
-        else {
+        let node = ui.get(root.children[0]);
+        let nowui_core::NodeKind::Dropdown { placeholder, options, selected, open } = &node.kind else {
             panic!("expected a Dropdown node");
         };
         assert_eq!(placeholder, "Choose a role");
         assert_eq!(options, &vec!["Admin".to_string(), "Editor".to_string(), "Viewer".to_string()]);
-        assert_eq!(value_path, &vec!["state".to_string(), "role".to_string()]);
+        assert_eq!(node.value_path, vec!["state".to_string(), "role".to_string()]);
         assert_eq!(*selected, None);
         assert!(!*open);
+    }
+
+    #[test]
+    fn resolves_slider_and_progress_bar_initial_values() {
+        let ast = nowui_syntax::parse(
+            "layout: T { Slider {value: 75} ProgressBar {value: 30} }",
+        )
+        .unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T").unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let nowui_core::NodeKind::Slider { value } = &ui.get(root.children[0]).kind else {
+            panic!("expected a Slider node");
+        };
+        assert!((*value - 0.75).abs() < 1e-6);
+        let nowui_core::NodeKind::ProgressBar { value } = &ui.get(root.children[1]).kind else {
+            panic!("expected a ProgressBar node");
+        };
+        assert!((*value - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn resolves_generic_value_and_event_bindings() {
+        let ast = nowui_syntax::parse(
+            "layout: T { Button `Go` {onClick: state.save, onMouseMove: state.track, value: state.count} }",
+        )
+        .unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T").unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let node = ui.get(root.children[0]);
+        assert_eq!(node.value_path, vec!["state".to_string(), "count".to_string()]);
+        assert_eq!(node.events.get("onClick"), Some(&vec!["state".to_string(), "save".to_string()]));
+        assert_eq!(node.events.get("onMouseMove"), Some(&vec!["state".to_string(), "track".to_string()]));
+        assert_eq!(node.events.get("onKeyDown"), None);
+    }
+
+    #[test]
+    fn dynamic_backtick_interpolation_is_recorded_as_a_template() {
+        let ast = nowui_syntax::parse("layout: T { Text `Count: ${state.counter.count}` } ").unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T").unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let node = ui.get(root.children[0]);
+        assert_eq!(
+            node.templates,
+            vec![vec![
+                nowui_core::TemplatePart::Lit("Count: ".to_string()),
+                nowui_core::TemplatePart::Var(vec!["state".to_string(), "counter".to_string(), "count".to_string()]),
+            ]]
+        );
+        // The initial (pre-resolution) content is still the raw `${...}` form —
+        // `App::resolve_templates` is what substitutes it each frame.
+        assert_eq!(node.kind, NodeKind::Text { content: "Count: ${state.counter.count}".to_string() });
+    }
+
+    #[test]
+    fn purely_literal_backtick_leaves_templates_empty() {
+        let ast = nowui_syntax::parse("layout: T { Text `Static label` }").unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T").unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let node = ui.get(root.children[0]);
+        assert!(node.templates.is_empty());
+    }
+
+    #[test]
+    fn dynamic_style_var_is_recorded_and_leaves_the_field_at_its_default() {
+        let s = first_child_style("layout: T { Card w-[${state.myWidth}] { Text `hi` } }");
+        assert_eq!(s.dynamic.get("w"), Some(&vec!["state".to_string(), "myWidth".to_string()]));
+        // Left untouched (Hug, the default) rather than parsed as a bogus literal.
+        assert_eq!(s.width, Sizing::Hug);
+    }
+
+    #[test]
+    fn dynamic_style_var_does_not_warn_as_an_unknown_or_malformed_value() {
+        let ast = nowui_syntax::parse("layout: T { Card w-[${state.myWidth}] { Text `hi` } }").unwrap();
+        let mut sem = Semantic::new(&ast);
+        sem.build("T").unwrap();
+        assert!(sem.warnings.is_empty(), "unexpected warnings: {:?}", sem.warnings);
     }
 }

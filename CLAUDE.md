@@ -27,13 +27,24 @@ Keep `winit = "0.30"` in `[workspace.dependencies]`. If a build fails with
 
 ```
 nowui-syntax/    chumsky parser -> AST        (no core, no render deps)
-nowui-core/      arena, Style, tailwind tokens, geometry, solver, paint walk, Painter trait
+nowui-core/      arena, Style, tailwind tokens, geometry, solver, paint walk, Painter trait,
+                 NowUiState trait / StateValue / Event (reactivity interface)
+nowui-macros/    #[derive(NowUiState)] proc-macro (reflection glue), re-exported by nowui-core
 nowui-render/    tiny-skia SkiaPainter + softbuffer bridge
-nowui-runtime/   loader (# imports), semantic pass, transitions driver, winit app (binary `nowui`)
+nowui-runtime/   loader (# imports), semantic pass, transitions driver, winit app (lib + binary
+                 `nowui`); generic App<S: NowUiState> resolves values and dispatches events
 examples/login.nowui
 examples/components_demo.nowui   Dropdown, scroll-v, position-absolute/relative, # import
-examples/demo.nowui   full showcase: z-index layering, floating Dropdown popup, transitions, transforms
+examples/demo.nowui   full showcase: z-index layering, floating Dropdown popup, transitions,
+                       transforms, draggable Slider, ProgressBar
+examples/counter.nowui + nowui-runtime/examples/counter.rs   reactivity end-to-end: a real
+                       #[derive(NowUiState)] struct backing {value: ...} and {onClick: ...}
 examples/widgets/BillingCard.nowui, StatCard.nowui   imported by components_demo.nowui / demo.nowui
+examples/counter-app/   standalone workspace member (its own Cargo.toml, binary `counter-app`) —
+                       same reactivity demo as examples/counter.rs, but as an independent crate
+                       shaped after the original App/Counter design sketch (see its main.rs for
+                       the two deliberate deviations from that sketch: Clone not Copy, &mut self
+                       not by-value self). `cargo run -p nowui-counter-app`.
 ```
 
 **Hard rule: `nowui-core` must never import `chumsky` or `tiny-skia`.** The model stays
@@ -49,9 +60,33 @@ Fixed widget line order — enforce this order in the grammar:
 Kind  arg=value...  `string`...  style-[value]...  { bindings }  { children }
 ```
 
-- Backtick string literals carry `${var}` interpolation, resolved at RUNTIME (not parse time),
-  so the retained tree can re-resolve without re-parsing. An empty `` `` `` is significant —
-  preserve it; it holds a positional slot (e.g. TextInput label vs placeholder).
+- Backtick string literals carry `${var}` interpolation — `${name}` or a dotted state path like
+  `${state.counter.count}` (`nowui-syntax`'s `interp()` parses `.`-separated idents, not just a
+  single one), mixed freely with literal text in the same backtick (`` `Count: ${state.counter.count}!` ``,
+  unlike the style-bracket case below). Resolved at RUNTIME, not parse time, so the retained tree
+  can re-resolve without re-parsing: the semantic pass converts each backtick's `Template` (parser
+  AST type) into `nowui_core::Template`/`TemplatePart` (`Lit`/`Var`, the runtime-side type — kept
+  separate because `nowui-core` can't depend on `nowui-syntax`, the hard rule below) and stores it
+  on `Node::templates`, index-aligned with the widget's original backticks, but only when at least
+  one of them actually contains a `${...}` — an all-literal node leaves `templates` empty and pays
+  no extra cost. `nowui-runtime`'s `App::resolve_templates` (called every redraw, alongside
+  `resolve_values`) re-renders each template against the live `NowUiState` and writes the result
+  back into whichever field that backtick built (`Text.content`, `Button`/`Checkbox.label`,
+  `TextInput.label`/`placeholder`, `Dropdown.placeholder`/`options`) via `apply_resolved_templates`
+  — keep its index mapping in sync with `semantic.rs`'s `primitive()` if either changes. An empty
+  `` `` `` is still significant — preserve it; it holds a positional slot (e.g. TextInput label
+  vs placeholder).
+- A style bracket value can *also* be a `${var}` interpolation (`w-[${state.myWidth}]`) — but
+  only when the whole bracket is the interpolation; `"10${x}px"` (mixed literal+var) is not
+  supported. The parser doesn't need to know about this at all — `${...}` is just more raw
+  bracket-value text, already captured verbatim by the existing "anything but `]`" value grammar
+  (no grammar change was needed for this). The semantic pass's `dynamic_var_path` detects it
+  before attempting to parse the value as a literal, and records the dotted path on
+  `Style::dynamic` (keyed by the style key, e.g. `"w"`) *instead of* setting the actual field —
+  which is therefore left at whatever it already was (its default, or an earlier class's value).
+  Unlike `Node::value_path`/`events` (see "Reactivity" below, now wired to a live `NowUiState`),
+  `Style::dynamic` is still unresolved — a separate, still-inert mechanism, not yet connected to
+  the state system, out of scope unless asked for.
 - Styles are generic `key-[value]` tokens or bare flags (`grid`), PLUS compact Tailwind-scale
   classes (`p-4`, `bg-blue-500`, `grid-cols-3`) where the whole thing is one bare key with an
   empty value (see the Tailwind vocabulary section below — the parser doesn't distinguish these
@@ -134,9 +169,9 @@ underlying state/rendering model they need, or leave them as unknown-key warning
   `Ui::hit_test` for everything else. Clicking the closed box toggles it open (`handle_click`);
   clicking inside an open popup selects that option and closes it (`select_dropdown_option`);
   clicking anywhere else closes every *other* open dropdown (`close_other_dropdowns`) since there's
-  no independent outside-click-detection mechanism. `value_path` is parsed and stored (like
-  `TextInput`'s) but not yet written back to app state — state binding is roadmap step 6, not
-  built. Box-height formula lives in one place, `nowui_core::dropdown_metrics(font_size)`, shared
+  no independent outside-click-detection mechanism. Selecting an option writes the option string
+  back to `value_path` via `App::write_back_value` (two-way binding, like `Slider`/`Checkbox`).
+  Box-height formula lives in one place, `nowui_core::dropdown_metrics(font_size)`, shared
   by `layout::measure` (sizing), `paint::paint_dropdown_popup` (placement), and `app.rs`'s hit
   math — keep all three sharing it; don't duplicate the formula.
 - **`scroll-h`/`scroll-v`** — clips overflow along that axis and lets the mouse wheel pan it, in
@@ -157,6 +192,14 @@ underlying state/rendering model they need, or leave them as unknown-key warning
   `arrange_absolute` in `nowui-core/src/layout.rs`). `position-relative` only nudges the element
   itself via `left`/`top`/`right`/`bottom`; it doesn't (yet) get walked for `Absolute` containing
   blocks beyond one level.
+  **`Absolute` children also escape their direct parent's own clip when painting** (a badge
+  pinned outside its box via a negative offset, e.g. `top-[-10px]`, must not get its overflow cut
+  off by the very box it's escaping). `paint_node` splits `node.children` into in-flow and
+  `Absolute` groups; only the in-flow group is painted between that node's own
+  `push_clip`/`pop_clip`; `Absolute` children paint afterward, still subject to whatever *further*
+  ancestor clip is active on the painter's stack, just not this one level. Regression test:
+  `paint::tests::absolute_child_paints_outside_parents_own_clip`. If you touch child painting
+  again, keep this split — don't go back to one `push_clip` wrapping every child unconditionally.
 - **`z-index-[N]`/`z-index-N`** reorders *paint* order only, among sibling nodes — it never
   changes layout/hit-testing/measured position, just which sibling's pixels end up on top.
   `paint_node` stable-sorts a *copy* of `node.children` by `style.z_index` before painting them
@@ -164,6 +207,82 @@ underlying state/rendering model they need, or leave them as unknown-key warning
   `node.children` in its original, unsorted order everywhere else. There is no cross-subtree
   stacking-context concept: a z-index only competes with its own siblings, the same as real CSS
   `z-index` without `position` establishing a new stacking context at every level.
+- **`Slider`** (`Slider styles... {value: N}`) — a draggable `0.0..=1.0` value. `{value: N}` as a
+  literal number (0..=100) sets the starting position; a `state.*` path there is stored on
+  `Node::value_path` (see below) for once reactivity lands. Dragging is real, intrinsic
+  interaction — `App` in `nowui-runtime/src/app.rs` tracks `dragging_slider: Option<NodeId>`
+  across `MouseInput`/`CursorMoved`, computing the value from cursor-x against the track rect
+  (`set_slider_value_from_cursor`) — clicking the track jumps the thumb there, then drags from
+  it. Styleable: `text-color` is the track-fill/thumb color, `border-color` is the empty-track
+  color (and strokes the thumb, if set); no dedicated `slider-*` classes. Geometry
+  (`nowui_core::slider_metrics`) is shared by `layout::measure`, `paint`, and the drag math — keep
+  them in sync. `Sizing::Hug` falls back to `DEFAULT_CONTROL_WIDTH` (160px, like a bare
+  `<input type="range">`) since there's no text content to hug against.
+- **`ProgressBar`** (`ProgressBar styles... {value: N}`) — same styling convention and geometry
+  helper as `Slider`, but read-only: no drag, no `App` interaction state at all.
+- **Generic `value`/event bindings** (`Node::value_path: Vec<String>`, `Node::events:
+  HashMap<String, Vec<String>>`) — every widget, primitive or custom-layout-use, can carry a
+  `{value: state.path}` binding (read by `Text`/`Checkbox`/`Dropdown`/`Slider`/`ProgressBar`;
+  harmlessly unused by anything else — deliberately excludes `TextInput`, which has no cursor/
+  IME system yet to drive from state) and any of `onClick`/`onMouseMove`/`onMouseDown`/
+  `onMouseUp`/`onKeyPress`/`onKeyDown`/`onKeyUp`/`onResize` (`nowui_core::EVENT_BINDING_KEYS` —
+  add a new event there, not as a one-off special case). Extracted generically by `semantic.rs`'s
+  `apply_generic_bindings`, called once per expanded node. Dispatched every frame by
+  `nowui-runtime`'s `App<S: NowUiState>` — see "Reactivity" below. `Slider`'s dragging is a
+  completely separate, already-real mechanism — don't confuse the two when extending either.
+
+## Reactivity (`state.*` bindings bound to a live Rust struct)
+
+- **The boundary is `nowui_core::NowUiState`** (`nowui-core/src/state.rs`): `get(&self, path:
+  &[&str]) -> Option<StateValue>`, `set(&mut self, path, value) -> bool`, `call(&mut self, path,
+  event: &Event) -> bool`. `nowui-core` only defines this interface (plus `StateValue`,
+  `Event`/`EventKind`, and the no-op `NoState`) — no reflection, no macros, keeping the hard rule
+  (no chumsky/tiny-skia) intact.
+- **`#[derive(nowui_core::NowUiState)]`** (`nowui-macros/src/lib.rs`, re-exported through
+  `nowui-core` so consumers only ever depend on one crate) generates the `get`/`set`/`call`
+  string-path dispatch for a named-field struct. Leaf fields (`String`, `bool`, any integer/float,
+  normalized to `f64`) get direct get/set arms; any other field type is assumed to itself derive
+  `NowUiState` and gets a delegating arm (`counter: Counter` → `Counter` also derives it) — this is
+  a syntactic guess, so a wrongly-typed field just fails with a normal trait-not-implemented error.
+  **Callable methods are never auto-discovered** — a derive macro can't see the struct's separate
+  `impl` block — so list them explicitly: `#[nowui(methods(increment, decrement))]`, each existing
+  as `fn NAME(&mut self, event: &nowui_core::Event)` in a plain `impl` block written as usual.
+- **Every `.nowui` binding path is rooted at the literal `state` segment**
+  (`["state", "counter", "count"]`), but a `NowUiState` impl is rooted at its own struct's fields —
+  `nowui-runtime/src/app.rs`'s `state_subpath` strips that leading segment before crossing the
+  reflection boundary. Don't skip this when adding new call sites; every `state.get`/`set`/`call`
+  invocation from `app.rs` goes through it.
+- **Read path**: `App::resolve_values`, called once per redraw before `layout::solve`, walks every
+  node with a non-empty `value_path`, resolves it against `self.state`, and writes the result into
+  the specific widget field: `Text.content` (via `display_string`, which renders any `StateValue`
+  variant), `Checkbox.checked`, `Dropdown.selected` (matched by string against `options`),
+  `Slider.value` and `ProgressBar.value` (both scaled from a `0..=100` `StateValue::Number`). A
+  `Slider` mid-drag (`self.dragging_slider == Some(id)`) is skipped so a stale read can't fight the
+  live gesture. `App::resolve_templates` is the same idea for inline `${state.path}` interpolation
+  inside a backtick (`` `Count: ${state.counter.count}` ``) rather than a `{value: ...}` binding —
+  see the backtick-template bullet above; a node can carry both a `value_path` and `templates`.
+- **Write path**: `App::write_back_value(id, value)` calls `self.state.set(...)` — wired into
+  `handle_click` (Checkbox toggle), `select_dropdown_option` (Dropdown pick), and
+  `set_slider_value_from_cursor` (Slider drag), so all three are genuinely two-way bound.
+  `App::dispatch_event(id, name, kind, key)` calls `self.state.call(...)` for the node's bound
+  path, if any, and marks `self.ui.dirty` when the handler ran (a callback mutating state almost
+  always needs a redraw). Wired into every `EVENT_BINDING_KEYS` entry: `onClick` (in
+  `handle_click`), `onMouseDown`/`onMouseUp` (`MouseInput`), `onMouseMove` (`CursorMoved`),
+  `onKeyDown`/`onKeyPress`/`onKeyUp` (a new `WindowEvent::KeyboardInput` arm, targeting
+  `self.ui.focus`, extracting the key via `logical_key.to_text()` falling back to
+  `format!("{:?}", ...)`), `onResize` (broadcast to every node in the tree, since it's a
+  window-level event with no single target — see `dispatch_event_broadcast`).
+- **`App<S: NowUiState>` is now generic** — `nowui-runtime` is a lib (`src/lib.rs`) exposing
+  `run<S: NowUiState + 'static>(path, entry, state)`, plus a thin CLI binary (`main.rs`) that calls
+  it with `nowui_core::NoState` (a no-op impl — every `get`/`set`/`call` returns `None`/`false`, so
+  existing `.nowui` files with no Rust state keep working exactly as before). Your own binary
+  depends on `nowui-runtime` as a library and calls `nowui_runtime::run` with a real
+  `#[derive(NowUiState)]` struct — see `nowui-runtime/examples/counter.rs` +
+  `examples/counter.nowui` for the full pattern (`cargo run -p nowui-runtime --example counter`).
+- **Control flow is unchanged and deliberately so**: winit's `ApplicationHandler` + `run_app` +
+  `ControlFlow::Wait` still owns the loop. State mutations from callbacks just mark `self.ui.dirty`
+  and flow through the existing event-driven redraw path — there is no user-facing poll loop
+  (`inputs()`/`events()`/`cleanup()`), and none should be added without discussing it first.
 
 ## Architecture decisions (keep consistent with these)
 
@@ -256,6 +375,8 @@ underlying state/rendering model they need, or leave them as unknown-key warning
   window. This is the primary regression net; add a test for every grammar change.
 - `cargo test -p nowui-core` — solver on hand-built arenas. No display needed.
 - `cargo run -p nowui-runtime -- examples/login.nowui App` — opens the window.
+- `cargo run -p nowui-runtime --example counter` — reactivity end-to-end: a real
+  `#[derive(NowUiState)]` struct driving `{value: ...}`/`{onClick: ...}`.
 
 When you change the grammar, add or update a `nowui-syntax` test in the same commit. When you
 change the solver, add a hand-built-arena assertion in `nowui-core`.
@@ -285,12 +406,14 @@ change the solver, add a hand-built-arena assertion in `nowui-core`.
 4. ✅ Real text (cosmic-text) — `draw_text`/`measure_text` shape and rasterize actual glyphs
    (see above); verified visually against `examples/login.nowui` (Login/Login Form/Username/
    Password/placeholders/SIGN IN all render with real anti-aliased text, not placeholder bars).
-5. Input + focus (current milestone) — `Checkbox` toggles and `Dropdown` open/select are wired
-   (`App::handle_click`); `onClick` bindings are still parsed and stored but not invoked (no
-   callback/state-binding system exists yet — that's step 6). `TextInput` cursor/selection/IME
-   is the remaining piece of this step.
-6. Bind `${var}` / `state.*` to a live state object (reactivity) — also what would make
-   `Dropdown`'s `value_path` and `onClick` bindings actually do something.
+5. Input + focus — `Checkbox` toggles and `Dropdown` open/select are wired (`App::handle_click`);
+   `onClick` and the other `EVENT_BINDING_KEYS` now dispatch for real (see step 6). `TextInput`
+   cursor/selection/IME is still the remaining piece of this step.
+6. ✅ Bind `state.*` to a live state object (reactivity) — `nowui_core::NowUiState` +
+   `#[derive(NowUiState)]` (`nowui-macros`) + generic `App<S: NowUiState>` in `nowui-runtime`; see
+   the "Reactivity" section above and `examples/counter.nowui` /
+   `nowui-runtime/examples/counter.rs`. `${var}` style-bracket interpolation (`Style::dynamic`) is
+   still unwired to this system — a separate, still-inert mechanism, out of scope until asked for.
 7. Per-layer pixmap caching: re-rasterize only dirty layers, then composite.
 
 ## Style conventions

@@ -2,8 +2,25 @@
 //! by index — this sidesteps the borrow-checker pain of a recursive owned tree
 //! and makes parent pointers / focus tracking cheap.
 
+use std::collections::HashMap;
+
 use crate::geometry::Rect;
 use crate::style::Style;
+
+/// The event/binding names the semantic pass recognizes generically on *any*
+/// widget: `{onClick: ..., onMouseMove: ..., value: ...}` etc. Stored as
+/// plain strings (matching the "keep the parser dumb, semantic resolves"
+/// rule) so adding a new one is a one-line addition here, not a schema change.
+pub const EVENT_BINDING_KEYS: &[&str] = &[
+    "onMouseMove",
+    "onMouseDown",
+    "onMouseUp",
+    "onKeyPress",
+    "onKeyDown",
+    "onKeyUp",
+    "onClick",
+    "onResize",
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(pub u32);
@@ -20,8 +37,6 @@ pub enum NodeKind {
     TextInput {
         label: String,
         placeholder: String,
-        /// Path into app state that holds this input's value, e.g. state.username.
-        value_path: Vec<String>,
         masked: bool,
     },
     Button {
@@ -42,8 +57,18 @@ pub enum NodeKind {
         options: Vec<String>,
         selected: Option<usize>,
         open: bool,
-        /// Path into app state that holds the selected value, e.g. state.role.
-        value_path: Vec<String>,
+    },
+    /// A draggable value picker, `0.0..=1.0` normalized. Dragging is real,
+    /// intrinsic interaction (`App` in `nowui-runtime` tracks mouse
+    /// down/move/up on it directly) — independent of the generic
+    /// `onMouseDown`/`onMouseMove`/`onMouseUp` bindings below, which are a
+    /// separate, still-inert hook mechanism (see `Node::events`).
+    Slider {
+        value: f32,
+    },
+    /// A read-only fill indicator, `0.0..=1.0` normalized. No interaction.
+    ProgressBar {
+        value: f32,
     },
 }
 
@@ -71,8 +96,43 @@ pub struct Node {
     /// `scroll_y` enable. Persists across frames; never touched by the
     /// solver itself — only by the wheel handler in `nowui-runtime`.
     pub scroll_offset: crate::geometry::Point,
+    /// Path into app state that holds this widget's value, from a `{value:
+    /// state.path}` binding — generic across `Text`, `TextInput`,
+    /// `Checkbox`, `Dropdown`, `Slider`, and `ProgressBar` (any widget kind
+    /// can carry one; it's simply unused if the kind doesn't read it).
+    /// Parsed and stored by the semantic pass; each redraw, `nowui-runtime`'s
+    /// `App::resolve_values` reads it against the live `NowUiState` and
+    /// writes the result into the widget (and, on interaction, writes back
+    /// the other direction — see `App::write_back_value`).
+    pub value_path: Vec<String>,
+    /// `{onClick: ..., onMouseMove: ..., ...}` — see `EVENT_BINDING_KEYS`.
+    /// Parsed and stored generically on every widget by the semantic pass;
+    /// dispatched each frame by `nowui-runtime`'s `App::dispatch_event` to
+    /// the bound `NowUiState::call` path.
+    pub events: HashMap<String, Vec<String>>,
+    /// Per-positional-backtick-argument templates, index-aligned with the
+    /// widget's original `string_args` (so `templates[0]` is the arg that
+    /// became e.g. `Text.content`/`Button.label`/`TextInput.label`,
+    /// `templates[1]` the next, and so on) — populated by the semantic pass
+    /// only when at least one of those backticks contains a `${state.path}`
+    /// interpolation; empty otherwise (the common case), so a node with no
+    /// dynamic text costs nothing extra to redraw. Resolved each frame by
+    /// `nowui-runtime`'s `App::resolve_templates` against the live
+    /// `NowUiState`, same as `value_path` — a widget can carry both.
+    pub templates: Vec<Template>,
     pub dirty: bool,
 }
+
+/// One backtick string's literal/variable parts. `Var` holds the dotted path
+/// split on `.` (leading `state` segment included, stripped the same way as
+/// `value_path` by `nowui-runtime`'s `state_subpath`).
+#[derive(Debug, Clone, PartialEq)]
+pub enum TemplatePart {
+    Lit(String),
+    Var(Vec<String>),
+}
+
+pub type Template = Vec<TemplatePart>;
 
 impl Node {
     pub fn new(kind: NodeKind, style: Style) -> Self {
@@ -84,6 +144,9 @@ impl Node {
             computed: Rect::default(),
             content_size: crate::geometry::Size::default(),
             scroll_offset: crate::geometry::Point::default(),
+            value_path: Vec::new(),
+            events: HashMap::new(),
+            templates: Vec::new(),
             dirty: true,
         }
     }

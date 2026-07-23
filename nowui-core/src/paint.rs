@@ -5,7 +5,7 @@
 use crate::arena::{NodeId, NodeKind, Ui};
 use crate::geometry::{Color, Edges, Point, Rect, Size};
 use crate::painter::{Painter, TextStyle};
-use crate::style::TextAlign;
+use crate::style::{Position, TextAlign};
 
 pub fn paint(ui: &Ui, painter: &mut dyn Painter) {
     // Open `Dropdown`s are collected here instead of drawn inline, so their
@@ -65,11 +65,11 @@ fn paint_node(ui: &Ui, id: NodeId, painter: &mut dyn Painter, popups: &mut Vec<N
         NodeKind::Button { label } => {
             painter.draw_text(label, content_rect, &text_style);
         }
-        NodeKind::TextInput { placeholder, value_path, masked, .. } => {
+        NodeKind::TextInput { placeholder, masked, .. } => {
             // Show the bound value if present; otherwise the placeholder.
-            // (Value resolution against real state happens in the runtime;
-            // here we render the placeholder as the boxes-first default.)
-            let _ = value_path;
+            // (Value resolution against `node.value_path` and live app state
+            // happens in the runtime; here we render the placeholder as the
+            // boxes-first default.)
             let shown = if *masked && !placeholder.is_empty() {
                 placeholder.clone()
             } else {
@@ -99,6 +99,54 @@ fn paint_node(ui: &Ui, id: NodeId, painter: &mut dyn Painter, popups: &mut Vec<N
             label_rect.x += box_size + 6.0;
             label_rect.w -= box_size + 6.0;
             painter.draw_text(label, label_rect, &text_style);
+        }
+        NodeKind::Slider { value } => {
+            let (track_h, thumb_d) = crate::style::slider_metrics(style.font_size);
+            let track_color = style.border_color.unwrap_or(Color::rgb(209, 213, 219));
+            let fill_color = style.text_color;
+
+            let track_rect = Rect::new(
+                content_rect.x,
+                content_rect.y + (content_rect.h - track_h) / 2.0,
+                content_rect.w,
+                track_h,
+            );
+            let track_radius = Edges::all(track_h / 2.0);
+            painter.fill_rect(track_rect, track_color, track_radius);
+
+            let v = value.clamp(0.0, 1.0);
+            let filled_w = track_rect.w * v;
+            if filled_w > 0.0 {
+                painter.fill_rect(Rect::new(track_rect.x, track_rect.y, filled_w, track_h), fill_color, track_radius);
+            }
+
+            // Thumb: a filled circle-ish square (no circle primitive — same
+            // crude-box convention as Checkbox/Dropdown's caret).
+            let thumb_x = content_rect.x + filled_w - thumb_d / 2.0;
+            let thumb_rect = Rect::new(thumb_x, content_rect.y + (content_rect.h - thumb_d) / 2.0, thumb_d, thumb_d);
+            painter.fill_rect(thumb_rect, fill_color, Edges::all(thumb_d / 2.0));
+            if let Some(border) = style.border_color {
+                painter.stroke_rect(thumb_rect, border, 1.0, Edges::all(thumb_d / 2.0));
+            }
+        }
+        NodeKind::ProgressBar { value } => {
+            let (track_h, _) = crate::style::slider_metrics(style.font_size);
+            let track_color = style.border_color.unwrap_or(Color::rgb(229, 231, 235));
+            let fill_color = style.text_color;
+
+            let track_rect = Rect::new(
+                content_rect.x,
+                content_rect.y + (content_rect.h - track_h) / 2.0,
+                content_rect.w,
+                track_h,
+            );
+            let radius = Edges::all(track_h / 2.0);
+            painter.fill_rect(track_rect, track_color, radius);
+
+            let filled_w = track_rect.w * value.clamp(0.0, 1.0);
+            if filled_w > 0.0 {
+                painter.fill_rect(Rect::new(track_rect.x, track_rect.y, filled_w, track_h), fill_color, radius);
+            }
         }
         NodeKind::Dropdown { placeholder, options, selected, open, .. } => {
             let (box_h, _) = crate::style::dropdown_metrics(style.font_size);
@@ -141,17 +189,40 @@ fn paint_node(ui: &Ui, id: NodeId, painter: &mut dyn Painter, popups: &mut Vec<N
         NodeKind::Container => {}
     }
 
-    // Children paint on top, clipped to this node's bounds. `z-index`
-    // reorders *paint* order only (higher paints later, i.e. on top); it
-    // never changes layout, and ties keep source order (stable sort).
+    // Children paint on top. `z-index` reorders *paint* order only (higher
+    // paints later, i.e. on top); it never changes layout, and ties keep
+    // source order (stable sort).
+    //
+    // `position-absolute` children are split out and painted *after*
+    // `pop_clip` — they intentionally escape this node's own clip (their
+    // containing block, per `arrange_absolute` in the solver), so a badge
+    // pinned outside its parent's box via negative offsets isn't cut off.
+    // They're still subject to any ancestor's clip further up the call
+    // stack (that push_clip is still active on the painter) — only this one
+    // level of clipping is skipped, matching the "direct parent only"
+    // containing-block simplification documented in CLAUDE.md.
     if !node.children.is_empty() {
+        let mut in_flow = Vec::new();
+        let mut absolute = Vec::new();
+        for &c in &node.children {
+            if ui.get(c).style.position == Position::Absolute {
+                absolute.push(c);
+            } else {
+                in_flow.push(c);
+            }
+        }
+        in_flow.sort_by_key(|&c| ui.get(c).style.z_index);
+        absolute.sort_by_key(|&c| ui.get(c).style.z_index);
+
         painter.push_clip(rect);
-        let mut children = node.children.clone();
-        children.sort_by_key(|&c| ui.get(c).style.z_index);
-        for child in children {
+        for child in in_flow {
             paint_node(ui, child, painter, popups);
         }
         painter.pop_clip();
+
+        for child in absolute {
+            paint_node(ui, child, painter, popups);
+        }
     }
 
     if style.scroll_x || style.scroll_y {
@@ -275,5 +346,70 @@ mod tests {
         paint(&ui, &mut painter);
 
         assert_eq!(painter.0, vec![red, blue, green], "green (z=10) paints last despite being authored second");
+    }
+
+    #[derive(Debug, PartialEq)]
+    enum Event {
+        Push,
+        Pop,
+        Fill(Color),
+    }
+
+    /// Records clip pushes/pops interleaved with fills, so tests can check
+    /// whether a given fill happened *inside* or *outside* a clip region.
+    #[derive(Default)]
+    struct TracingPainter(Vec<Event>);
+    impl Painter for TracingPainter {
+        fn fill_rect(&mut self, _: Rect, color: Color, _: Edges) {
+            self.0.push(Event::Fill(color));
+        }
+        fn stroke_rect(&mut self, _: Rect, _: Color, _: f32, _: Edges) {}
+        fn draw_text(&mut self, _: &str, _: Rect, _: &TextStyle) {}
+        fn push_clip(&mut self, _: Rect) {
+            self.0.push(Event::Push);
+        }
+        fn pop_clip(&mut self) {
+            self.0.push(Event::Pop);
+        }
+    }
+
+    #[test]
+    fn absolute_child_paints_outside_parents_own_clip() {
+        let mut ui = Ui::new();
+        let red = Color::rgb(255, 0, 0);
+        let green = Color::rgb(0, 255, 0);
+
+        // A badge pinned outside its parent's box via a negative offset —
+        // same shape as `login.nowui`'s "NEW" badge.
+        let badge = ui.push(Node::new(
+            NodeKind::Container,
+            Style { position: Position::Absolute, bg: Some(red), ..Default::default() },
+        ));
+        ui.get_mut(badge).computed = Rect::new(-5.0, -5.0, 20.0, 20.0);
+
+        let parent = ui.push(Node::new(NodeKind::Container, Style { bg: Some(green), ..Default::default() }));
+        ui.get_mut(parent).children = vec![badge];
+        ui.get_mut(parent).computed = Rect::new(0.0, 0.0, 100.0, 100.0);
+
+        let root = ui.push(Node::new(NodeKind::Container, Style::default()));
+        ui.get_mut(root).children = vec![parent];
+        ui.get_mut(root).computed = Rect::new(0.0, 0.0, 200.0, 200.0);
+        ui.add_layer(root, "main");
+
+        let mut painter = TracingPainter::default();
+        paint(&ui, &mut painter);
+
+        // Find the parent's push/pop pair (the first one — root has no
+        // children of its own besides `parent`, so root never pushes a clip
+        // before `parent`'s fill happens).
+        let push_idx = painter.0.iter().position(|e| *e == Event::Push).expect("parent pushes a clip");
+        let pop_idx = painter.0.iter().position(|e| *e == Event::Pop).expect("parent pops its clip");
+        let red_idx = painter.0.iter().position(|e| *e == Event::Fill(red)).expect("badge is painted");
+
+        assert!(
+            !(push_idx < red_idx && red_idx < pop_idx),
+            "absolute child's fill must fall outside its parent's own push_clip/pop_clip pair, got trace {:?}",
+            painter.0
+        );
     }
 }

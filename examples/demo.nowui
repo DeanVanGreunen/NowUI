@@ -69,6 +69,19 @@ layout: App w-[fill] h-[fill] bg-gray-100 {
 
         Checkbox `Enable notifications` text-gray-700 text-sm border border-gray-400 bg-gray-50 rounded pt-2
 
+        // Slider: text-color is the track fill/thumb accent, border-color is
+        // the track background — draggable with the mouse (real interaction,
+        // not just decoration). `{value: 60}` is a literal starting position
+        // (0..=100); a `state.*` path there would be used once reactivity
+        // (roadmap step 6) can resolve it live instead.
+        Text `Volume` text-gray-700 text-sm font-medium pt-2
+        Slider w-full text-blue-600 border-gray-200 {value: 60}
+
+        // ProgressBar: same track/fill styling convention as Slider, but
+        // read-only (no drag interaction).
+        Text `Profile completion` text-gray-700 text-sm font-medium pt-2
+        ProgressBar w-full text-emerald-500 border-gray-200 {value: 82}
+
         Button `SAVE CHANGES` w-full text-center text-white font-semibold bg-blue-600 hover:bg-blue-700 hover:rotate-1 active:scale-95 py-3 rounded transition duration-150 ease-out m-[16px 0 0 0] {onClick: state.save}
       }
 

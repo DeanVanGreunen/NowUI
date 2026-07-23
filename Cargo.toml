@@ -3,8 +3,10 @@ resolver = "2"
 members = [
     "nowui-syntax",
     "nowui-core",
+    "nowui-macros",
     "nowui-render",
     "nowui-runtime",
+    "examples/counter-app",
 ]
 
 # Shared dependency versions. Pinned loosely; run `cargo update` to refresh.
@@ -17,3 +19,6 @@ tiny-skia = "0.11"
 winit = "0.30"
 softbuffer = "0.4"
 cosmic-text = "0.12"
+syn = { version = "2", features = ["full"] }
+quote = "1"
+proc-macro2 = "1"

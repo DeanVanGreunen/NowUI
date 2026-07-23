@@ -77,6 +77,14 @@ fn measure(ui: &mut Ui, id: NodeId, painter: &mut dyn Painter, sizes: &mut HashM
             let m = painter.measure_text(&label, style.font_size);
             Size::new(m.x + 24.0, box_h)
         }
+        crate::arena::NodeKind::Slider { .. } => {
+            let (_, thumb_d) = crate::style::slider_metrics(style.font_size);
+            Size::new(crate::style::DEFAULT_CONTROL_WIDTH, thumb_d)
+        }
+        crate::arena::NodeKind::ProgressBar { .. } => {
+            let (track_h, _) = crate::style::slider_metrics(style.font_size);
+            Size::new(crate::style::DEFAULT_CONTROL_WIDTH, track_h)
+        }
         crate::arena::NodeKind::Container => Size::default(),
     };
 

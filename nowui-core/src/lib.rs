@@ -6,15 +6,23 @@ pub mod geometry;
 pub mod layout;
 pub mod paint;
 pub mod painter;
+pub mod state;
 pub mod style;
 pub mod tailwind;
 
-pub use arena::{Layer, Node, NodeId, NodeKind, Ui};
+pub use arena::{Layer, Node, NodeId, NodeKind, Template, TemplatePart, Ui, EVENT_BINDING_KEYS};
 pub use geometry::{Color, Edges, Point, Rect, Size};
+// `nowui_macros::NowUiState` (a derive macro) and `state::NowUiState` (the
+// trait) share a name but live in separate namespaces (macro vs. type), so
+// this re-export is not a conflict — `#[derive(nowui_core::NowUiState)]` and
+// `impl nowui_core::NowUiState for Foo` both resolve unambiguously.
+pub use nowui_macros::NowUiState;
 pub use painter::{Painter, TextStyle};
+pub use state::{Event, EventKind, NoState, NowUiState, StateValue};
 pub use style::{
-    compute_effective, dropdown_metrics, Align, AnimatableStyle, Direction, Display, GridTrack,
-    Position, Sizing, Style, StyleVariants, TextAlign, Transform2D, Transition,
+    compute_effective, dropdown_metrics, slider_metrics, Align, AnimatableStyle, Direction,
+    Display, GridTrack, Position, Sizing, Style, StyleVariants, TextAlign, Transform2D,
+    Transition, DEFAULT_CONTROL_WIDTH,
 };
 pub use tailwind::Easing;
 

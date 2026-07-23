@@ -3,6 +3,10 @@ name = "nowui-runtime"
 version = "0.1.0"
 edition = "2021"
 
+[lib]
+name = "nowui_runtime"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nowui"
 path = "src/main.rs"

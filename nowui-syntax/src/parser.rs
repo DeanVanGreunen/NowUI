@@ -52,12 +52,12 @@ fn import_directive() -> impl Parser<char, Node, Error = Simple<char>> + Clone {
         .map(|(chars, _): (Vec<char>, _)| Node::Import { path: chars.into_iter().collect::<String>().trim().to_string() })
 }
 
-/// `${name}`
+/// `${name}` or `${a.b.c}` (a dotted state path, e.g. `${state.counter.count}`).
 fn interp() -> impl Parser<char, TplPart, Error = Simple<char>> + Clone {
     just("${")
-        .ignore_then(text::ident())
+        .ignore_then(text::ident().separated_by(just('.')).at_least(1))
         .then_ignore(just('}'))
-        .map(TplPart::Var)
+        .map(|segs: Vec<String>| TplPart::Var(segs.join(".")))
 }
 
 /// A backtick string literal with embedded `${...}`. Empty `` is allowed.
