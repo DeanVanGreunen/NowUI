@@ -129,6 +129,10 @@ pub enum EventKind {
     KeyDown,
     KeyUp,
     Resize,
+    /// Fired exactly once, right after the node is first created — see
+    /// `EVENT_BINDING_KEYS`' doc comment for why `onLoad` doesn't come from a
+    /// real winit input event like every other variant here.
+    Load,
 }
 
 /// Passed to a dispatched handler method (`fn increment(&mut self, event:

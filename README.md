@@ -12,140 +12,6 @@ with a two-pass layout solver, and CPU-rasterized to a window. The reference tar
 throughout development is a login screen: dark top bar, blue field, centered white card with
 username/password inputs and a SIGN IN button (`examples/counter-app/src/login.nowui`).
 
-Pipeline, end to end:
-
-```text
-.nowui file --chumsky parser--> AST --semantic pass--> node arena
-   --layout solver (2-pass)--> computed rects --paint walk--> Painter calls
-   --tiny-skia raster--> Pixmap --softbuffer--> window pixels
-```
-
-Two properties are load-bearing and shape everything else in this document:
-
-- **Retained, not immediate.** The arena persists across frames. A redraw re-walks the existing
-  tree and re-paints it; it does not rebuild the tree from scratch, except where `if`/`for`
-  dynamic regions explicitly re-expand a subtree because the state they depend on changed.
-- **Event-driven, not a game loop.** The window uses `ControlFlow::Wait` and renders only when
-  dirty (a state mutation, a hover, a resize, an in-flight transition). There is **no continuous
-  animation loop** anywhere in this engine — don't add one to solve a redraw problem; see the
-  `ControlFlow` runtime gotcha under "Internal Libraries and Dependencies" below.
-
----
-
-## Internal Libraries and Dependencies
-
-### Third-party crates (do not change without reason)
-
-- **`chumsky`** (0.9) — parser combinators; builds the `.nowui` AST.
-- **`tiny-skia`** (0.11) — CPU rasterizer. Has **no text support** — glyphs come from `cosmic-text`.
-- **`cosmic-text`** (0.12) — text shaping/layout/rasterization, feeds glyphs into tiny-skia.
-- **`winit`** (**0.30**) — windowing + event loop.
-- **`softbuffer`** (0.4) — presents the rasterized pixmap to the OS window.
-- **`syn` / `quote` / `proc-macro2`** (2 / 1 / 1) — power the `#[derive(NowUiState)]` proc-macro.
-
-**winit's version is load-bearing.** The app harness uses `ApplicationHandler` + `run_app`, which
-live in `winit::application` / `winit::event_loop` as of **0.30** — they do not exist on 0.29 or
-earlier (that's the old closure-based API). Keep `winit = "0.30"` in `[workspace.dependencies]`.
-If a build fails with `unresolved import winit::application`, the version was downgraded — fix
-the pin, not the code.
-
-### Internal crates and what each one owns
-
-- **`nowui-syntax`** — the chumsky parser and AST. No `nowui-core` dependency, no render
-  dependency. Owns: widget grammar, style-token grammar, `#` import statements, the `if`/`for`
-  control-flow grammar and its `Expr` sub-language (dotted paths, comparisons, `&&`/`||`/`!`).
-- **`nowui-core`** — the node arena, `Style`, Tailwind design tokens, geometry, the two-pass
-  layout solver, the paint walk, the `Painter` trait, and the reactivity interface
-  (`NowUiState` trait, `StateValue`, `Event`). Pure model — no parser, no renderer.
-- **`nowui-macros`** — `#[derive(NowUiState)]`, a proc-macro that generates `get`/`set`/`call`
-  reflection glue for a plain Rust struct. Re-exported through `nowui-core` so consumers only
-  ever add one dependency.
-- **`nowui-render`** — the tiny-skia `SkiaPainter` implementation of the `Painter` trait, plus
-  the softbuffer presentation bridge.
-- **`nowui-runtime`** — the `#` import loader, the semantic pass (AST → arena, including dynamic
-  `if`/`for` region expansion), the expression evaluator (`dynamic.rs`), the transition driver,
-  and the winit `App<S: NowUiState>` (lib + a thin CLI binary `nowui`) that ties state,
-  layout, and paint together every redraw.
-
-### The one hard architectural rule
-
-**`nowui-core` must never import `chumsky` or `tiny-skia`.** The model stays testable in
-isolation and the renderer stays swappable. If you need syntax or render types in core, you're
-putting something in the wrong crate. Dependency arrows point one direction only:
-`nowui-syntax` / `nowui-render` → (never) `nowui-core` → (never) `nowui-runtime`.
-
-### Architecture decisions (keep consistent with these)
-
-- **Node arena, not a recursive owned tree:** flat `Vec<Node>` + `NodeId(u32)` indices, with
-  **no parent pointers**. Deliberate — avoids borrow-checker fights, makes focus/hover references
-  cheap. A node that needs its ancestor (e.g. a `MenuItem` closing its own `Menu`) can't walk up;
-  the caller that already knows both ids (`App`, which owns the whole arena) does the work
-  instead. Do not refactor into `struct Node { children: Vec<Node> }`.
-- **Layers** = `Vec<Layer>`, each its own layout root, composited back-to-front. Hit-testing goes
-  front-to-back (topmost layer wins).
-- **`Painter` trait is the render boundary** (`fill_rect`, `stroke_rect`, `draw_text`,
-  `push_clip`/`pop_clip`, `measure_text`, `push_transform`/`push_opacity`). tiny-skia is one impl.
-  "Retained" refers to the tree, not cached draw commands — the paint pass re-walks the tree each
-  redraw; don't add draw-command caching until profiling demands it.
-- **Solver** is a compact two-pass measure-then-distribute (a flex approximation: no min/max or
-  wrap) plus CSS-grid-lite (`Display::Grid`: fixed/auto/fr tracks, row-major auto-place with
-  span — no named lines/`minmax()`/`auto-fit`/dense packing). Swappable for `taffy` later
-  without touching the arena or painter.
-- **`Style::radius` is `Edges`, not `f32`** — four independent corner radii (CSS clockwise-from-
-  top-left order): `top`=top-left, `right`=top-right, `bottom`=bottom-right, `left`=bottom-left.
-- **softbuffer bridge:** tiny-skia's `Pixmap` is RGBA8 premultiplied; softbuffer wants `0RGB` u32.
-  An opaque background is filled first (so premultiplied == straight), then packed
-  `(r<<16)|(g<<8)|b`.
-
-### Runtime gotchas (learned the hard way — don't regress these)
-
-- **`request_redraw()` from inside `RedrawRequested` is not a reliable way to keep animating.**
-  Driving continued redraws (e.g. an in-flight `transition`) must go through `ControlFlow`
-  directly: `event_loop.set_control_flow(ControlFlow::Poll)` while `Transitions::any_active()`,
-  back to `ControlFlow::Wait` once it isn't (`App::redraw` takes `&ActiveEventLoop` for exactly
-  this). On Windows, a self-requested `request_redraw()`-only scheme visibly stalls — the redraw
-  gets coalesced with the current frame instead of scheduling a new one.
-- **Diagnosing "the style value looks right but nothing on screen changed":** verify the
-  *animated* (post-`Transitions::step`) value with a temporary `eprintln!`, not just the target,
-  and check the actual redraw count — a suspiciously low count means frames aren't being pumped
-  (see the `ControlFlow` gotcha above) before suspecting style-resolution logic.
-
-### Solver gotchas
-
-- **Pass 2 (`arrange`) must reuse pass 1 (`measure`)'s memoized sizes, never re-derive them.**
-  `measure()` memoizes every node's `Size` into a `HashMap<NodeId, Size>` (`sizes` in `solve()`),
-  threaded through `arrange()`. A from-scratch re-estimate in pass 2 (e.g. a flat placeholder
-  size for anything that isn't `Text`/`Button`) silently collapses any Hug-sized container with
-  real content to a wrong flat default — invisible with placeholder content, obvious with real
-  text/nested widgets.
-
-### Parser gotchas
-
-1. **Comments:** whitespace skipping must also eat `//` line comments — use the `pad()` helper at
-   structural boundaries, not bare `.padded()`.
-2. **Style key** is `ident ('-' ident)*`, where `-` only joins when followed by a key char
-   (lookahead) — otherwise `p-[..]` folds the `-` into the key. Build the key `String` with
-   `.then(...).map(...)`; don't use chumsky `.chain()` (its two `Chain` impls make `T` ambiguous).
-3. **Style value** takes an optional leading `-` then `[...]` — the dash between key and bracket
-   is consumed on the value side.
-4. **`{ }` ambiguity:** bindings `{key: value}` and child blocks `{ Widget... }` both open with
-   `{`. `node()` parses them as two independent optional trailing slots —
-   `bindings().or_not()` then `child_block.clone().or_not()`, **not** an either-or `choice` — so a
-   widget can have bindings, children, both (`Menu`, e.g., needs `{onClick: ...}` on itself *and*
-   a real `{ MenuItem ... }` child list), or neither. Each slot's own `.or_not()` disambiguates on
-   *content*, not position: `bindings()` on an actual child block fails to match
-   `ident ':' bind_value, ...` and un-consumes the `{` cleanly, letting `child_block.or_not()`
-   retry the same `{`. Don't reintroduce a single either-or choice to "fix" a backtracking issue
-   here — disambiguate on content instead.
-5. **Bare-flag styles vs. the next sibling's `kind`:** a bare style flag (`grid`, `row`) and a
-   widget `kind` are both plain identifiers with nothing syntactically between them but
-   whitespace. A style key's first character must be lowercase or `_` (`key_start`), matching the
-   convention that widget kinds are Capitalized — otherwise `style().repeated()` eats the next
-   sibling's `kind` as one more bare flag and two sibling nodes silently merge into one.
-6. **`key_char` includes `/` and `.`** (for Tailwind fraction/decimal-scale classes like `w-1/2`,
-   `py-3.5`). Neither can be a key's *first* character (`key_start` still requires
-   lowercase/`_`), so this doesn't reopen gotcha #5's ambiguity.
-
 ### Build & test discipline
 
 - Fix and build crate-by-crate in dependency order: **syntax → core → render → runtime**. Errors
@@ -761,3 +627,138 @@ npm run package:linux-x64
 npm run stage-lsp
 code --install-extension bin/nowui-extension-linux-x64-0.1.0.vsix
 ```
+
+
+Pipeline, end to end:
+
+```text
+.nowui file --chumsky parser--> AST --semantic pass--> node arena
+   --layout solver (2-pass)--> computed rects --paint walk--> Painter calls
+   --tiny-skia raster--> Pixmap --softbuffer--> window pixels
+```
+
+Two properties are load-bearing and shape everything else in this document:
+
+- **Retained, not immediate.** The arena persists across frames. A redraw re-walks the existing
+  tree and re-paints it; it does not rebuild the tree from scratch, except where `if`/`for`
+  dynamic regions explicitly re-expand a subtree because the state they depend on changed.
+- **Event-driven, not a game loop.** The window uses `ControlFlow::Wait` and renders only when
+  dirty (a state mutation, a hover, a resize, an in-flight transition). There is **no continuous
+  animation loop** anywhere in this engine — don't add one to solve a redraw problem; see the
+  `ControlFlow` runtime gotcha under "Internal Libraries and Dependencies" below.
+
+---
+
+## Internal Libraries and Dependencies
+
+### Third-party crates (do not change without reason)
+
+- **`chumsky`** (0.9) — parser combinators; builds the `.nowui` AST.
+- **`tiny-skia`** (0.11) — CPU rasterizer. Has **no text support** — glyphs come from `cosmic-text`.
+- **`cosmic-text`** (0.12) — text shaping/layout/rasterization, feeds glyphs into tiny-skia.
+- **`winit`** (**0.30**) — windowing + event loop.
+- **`softbuffer`** (0.4) — presents the rasterized pixmap to the OS window.
+- **`syn` / `quote` / `proc-macro2`** (2 / 1 / 1) — power the `#[derive(NowUiState)]` proc-macro.
+
+**winit's version is load-bearing.** The app harness uses `ApplicationHandler` + `run_app`, which
+live in `winit::application` / `winit::event_loop` as of **0.30** — they do not exist on 0.29 or
+earlier (that's the old closure-based API). Keep `winit = "0.30"` in `[workspace.dependencies]`.
+If a build fails with `unresolved import winit::application`, the version was downgraded — fix
+the pin, not the code.
+
+### Internal crates and what each one owns
+
+- **`nowui-syntax`** — the chumsky parser and AST. No `nowui-core` dependency, no render
+  dependency. Owns: widget grammar, style-token grammar, `#` import statements, the `if`/`for`
+  control-flow grammar and its `Expr` sub-language (dotted paths, comparisons, `&&`/`||`/`!`).
+- **`nowui-core`** — the node arena, `Style`, Tailwind design tokens, geometry, the two-pass
+  layout solver, the paint walk, the `Painter` trait, and the reactivity interface
+  (`NowUiState` trait, `StateValue`, `Event`). Pure model — no parser, no renderer.
+- **`nowui-macros`** — `#[derive(NowUiState)]`, a proc-macro that generates `get`/`set`/`call`
+  reflection glue for a plain Rust struct. Re-exported through `nowui-core` so consumers only
+  ever add one dependency.
+- **`nowui-render`** — the tiny-skia `SkiaPainter` implementation of the `Painter` trait, plus
+  the softbuffer presentation bridge.
+- **`nowui-runtime`** — the `#` import loader, the semantic pass (AST → arena, including dynamic
+  `if`/`for` region expansion), the expression evaluator (`dynamic.rs`), the transition driver,
+  and the winit `App<S: NowUiState>` (lib + a thin CLI binary `nowui`) that ties state,
+  layout, and paint together every redraw.
+
+### The one hard architectural rule
+
+**`nowui-core` must never import `chumsky` or `tiny-skia`.** The model stays testable in
+isolation and the renderer stays swappable. If you need syntax or render types in core, you're
+putting something in the wrong crate. Dependency arrows point one direction only:
+`nowui-syntax` / `nowui-render` → (never) `nowui-core` → (never) `nowui-runtime`.
+
+### Architecture decisions (keep consistent with these)
+
+- **Node arena, not a recursive owned tree:** flat `Vec<Node>` + `NodeId(u32)` indices, with
+  **no parent pointers**. Deliberate — avoids borrow-checker fights, makes focus/hover references
+  cheap. A node that needs its ancestor (e.g. a `MenuItem` closing its own `Menu`) can't walk up;
+  the caller that already knows both ids (`App`, which owns the whole arena) does the work
+  instead. Do not refactor into `struct Node { children: Vec<Node> }`.
+- **Layers** = `Vec<Layer>`, each its own layout root, composited back-to-front. Hit-testing goes
+  front-to-back (topmost layer wins).
+- **`Painter` trait is the render boundary** (`fill_rect`, `stroke_rect`, `draw_text`,
+  `push_clip`/`pop_clip`, `measure_text`, `push_transform`/`push_opacity`). tiny-skia is one impl.
+  "Retained" refers to the tree, not cached draw commands — the paint pass re-walks the tree each
+  redraw; don't add draw-command caching until profiling demands it.
+- **Solver** is a compact two-pass measure-then-distribute (a flex approximation: no min/max or
+  wrap) plus CSS-grid-lite (`Display::Grid`: fixed/auto/fr tracks, row-major auto-place with
+  span — no named lines/`minmax()`/`auto-fit`/dense packing). Swappable for `taffy` later
+  without touching the arena or painter.
+- **`Style::radius` is `Edges`, not `f32`** — four independent corner radii (CSS clockwise-from-
+  top-left order): `top`=top-left, `right`=top-right, `bottom`=bottom-right, `left`=bottom-left.
+- **softbuffer bridge:** tiny-skia's `Pixmap` is RGBA8 premultiplied; softbuffer wants `0RGB` u32.
+  An opaque background is filled first (so premultiplied == straight), then packed
+  `(r<<16)|(g<<8)|b`.
+
+### Runtime gotchas (learned the hard way — don't regress these)
+
+- **`request_redraw()` from inside `RedrawRequested` is not a reliable way to keep animating.**
+  Driving continued redraws (e.g. an in-flight `transition`) must go through `ControlFlow`
+  directly: `event_loop.set_control_flow(ControlFlow::Poll)` while `Transitions::any_active()`,
+  back to `ControlFlow::Wait` once it isn't (`App::redraw` takes `&ActiveEventLoop` for exactly
+  this). On Windows, a self-requested `request_redraw()`-only scheme visibly stalls — the redraw
+  gets coalesced with the current frame instead of scheduling a new one.
+- **Diagnosing "the style value looks right but nothing on screen changed":** verify the
+  *animated* (post-`Transitions::step`) value with a temporary `eprintln!`, not just the target,
+  and check the actual redraw count — a suspiciously low count means frames aren't being pumped
+  (see the `ControlFlow` gotcha above) before suspecting style-resolution logic.
+
+### Solver gotchas
+
+- **Pass 2 (`arrange`) must reuse pass 1 (`measure`)'s memoized sizes, never re-derive them.**
+  `measure()` memoizes every node's `Size` into a `HashMap<NodeId, Size>` (`sizes` in `solve()`),
+  threaded through `arrange()`. A from-scratch re-estimate in pass 2 (e.g. a flat placeholder
+  size for anything that isn't `Text`/`Button`) silently collapses any Hug-sized container with
+  real content to a wrong flat default — invisible with placeholder content, obvious with real
+  text/nested widgets.
+
+### Parser gotchas
+
+1. **Comments:** whitespace skipping must also eat `//` line comments — use the `pad()` helper at
+   structural boundaries, not bare `.padded()`.
+2. **Style key** is `ident ('-' ident)*`, where `-` only joins when followed by a key char
+   (lookahead) — otherwise `p-[..]` folds the `-` into the key. Build the key `String` with
+   `.then(...).map(...)`; don't use chumsky `.chain()` (its two `Chain` impls make `T` ambiguous).
+3. **Style value** takes an optional leading `-` then `[...]` — the dash between key and bracket
+   is consumed on the value side.
+4. **`{ }` ambiguity:** bindings `{key: value}` and child blocks `{ Widget... }` both open with
+   `{`. `node()` parses them as two independent optional trailing slots —
+   `bindings().or_not()` then `child_block.clone().or_not()`, **not** an either-or `choice` — so a
+   widget can have bindings, children, both (`Menu`, e.g., needs `{onClick: ...}` on itself *and*
+   a real `{ MenuItem ... }` child list), or neither. Each slot's own `.or_not()` disambiguates on
+   *content*, not position: `bindings()` on an actual child block fails to match
+   `ident ':' bind_value, ...` and un-consumes the `{` cleanly, letting `child_block.or_not()`
+   retry the same `{`. Don't reintroduce a single either-or choice to "fix" a backtracking issue
+   here — disambiguate on content instead.
+5. **Bare-flag styles vs. the next sibling's `kind`:** a bare style flag (`grid`, `row`) and a
+   widget `kind` are both plain identifiers with nothing syntactically between them but
+   whitespace. A style key's first character must be lowercase or `_` (`key_start`), matching the
+   convention that widget kinds are Capitalized — otherwise `style().repeated()` eats the next
+   sibling's `kind` as one more bare flag and two sibling nodes silently merge into one.
+6. **`key_char` includes `/` and `.`** (for Tailwind fraction/decimal-scale classes like `w-1/2`,
+   `py-3.5`). Neither can be a key's *first* character (`key_start` still requires
+   lowercase/`_`), so this doesn't reopen gotcha #5's ambiguity.

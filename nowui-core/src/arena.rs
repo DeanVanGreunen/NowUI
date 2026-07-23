@@ -11,6 +11,14 @@ use crate::style::Style;
 /// widget: `{onClick: ..., onMouseMove: ..., value: ...}` etc. Stored as
 /// plain strings (matching the "keep the parser dumb, semantic resolves"
 /// rule) so adding a new one is a one-line addition here, not a schema change.
+///
+/// `onLoad` is the odd one out: every other entry is dispatched from a real
+/// winit input event, but `onLoad` fires exactly once, right after the node
+/// carrying it is first created — including a node a `for`/`if` region
+/// expands into existence later, not just the initial static tree. See
+/// `nowui-runtime`'s `Semantic::expand` (which records every newly created
+/// node id) and `App::dispatch_pending_on_load` (which drains that list and
+/// actually calls it, once per redraw/initial build).
 pub const EVENT_BINDING_KEYS: &[&str] = &[
     "onMouseMove",
     "onMouseDown",
@@ -20,6 +28,7 @@ pub const EVENT_BINDING_KEYS: &[&str] = &[
     "onKeyUp",
     "onClick",
     "onResize",
+    "onLoad",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

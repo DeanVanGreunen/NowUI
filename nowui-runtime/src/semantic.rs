@@ -40,6 +40,14 @@ pub struct Semantic {
     /// module doc) so `refresh_dynamic_regions` can skip re-expanding one
     /// whose `RegionSignature` hasn't actually changed.
     pub(crate) regions: Vec<DynamicRegion>,
+    /// Every node id created by `expand` since the last `take_pending_on_load`
+    /// drain — both from the initial static tree and from a `for`/`if`
+    /// region's (re-)expansion. `App::dispatch_pending_on_load` drains this
+    /// after each build/refresh and fires `"onLoad"` on whichever of them
+    /// actually bound it; nodes with no `{onLoad: ...}` binding are pushed
+    /// here too (cheaper than checking at creation time) and simply no-op in
+    /// `dispatch_event`.
+    pending_on_load: Vec<NodeId>,
 }
 
 /// A live top-level dynamic region: the still-unexpanded AST it came from,
@@ -85,7 +93,14 @@ impl Semantic {
                 );
             }
         }
-        Semantic { defs, warnings: Vec::new(), regions: Vec::new() }
+        Semantic { defs, warnings: Vec::new(), regions: Vec::new(), pending_on_load: Vec::new() }
+    }
+
+    /// Drain every node id created (by `expand`) since the last call to
+    /// this — called once by `nowui-runtime`'s `App` right after the initial
+    /// build and after every `refresh_dynamic_regions`, to fire `onLoad`.
+    pub(crate) fn take_pending_on_load(&mut self) -> Vec<NodeId> {
+        std::mem::take(&mut self.pending_on_load)
     }
 
     /// Expand `entry` (a top-level layout name) into a fresh `Ui` with one
@@ -231,9 +246,21 @@ impl Semantic {
         for i in 0..self.regions.len() {
             let region = &self.regions[i];
             let (parent, ast, scope, depth) = (region.parent, region.ast.clone(), region.scope.clone(), region.depth);
+            // `expand_region` runs speculatively here on *every* redraw, just
+            // to get a `RegionSignature` to compare — even a no-op redraw
+            // (a hover, a transition tick) calls it, and its `ui.push`ed
+            // nodes get thrown away below when nothing actually changed (see
+            // this fn's own doc comment, and `dynamic.rs`'s module doc on
+            // orphaned nodes). `expand`/`primitive`-adjacent code pushes
+            // every node it creates onto `pending_on_load` unconditionally,
+            // so a discarded speculative expansion must roll those back too
+            // — otherwise `onLoad` would refire every single redraw instead
+            // of only on a genuine rebuild.
+            let on_load_mark = self.pending_on_load.len();
             let (new_ids, new_signature) = self.expand_region(ui, parent, &ast, &scope, state, depth);
             let region = &mut self.regions[i];
             if new_signature == region.signature {
+                self.pending_on_load.truncate(on_load_mark);
                 continue;
             }
             let (start, len) = (region.start, region.len);
@@ -267,6 +294,7 @@ impl Semantic {
             let merged = self.resolve_styles(styles, &base);
             let container = ui.push(ArenaNode::new(NodeKind::Container, merged));
             apply_generic_bindings(ui, container, bindings);
+            self.pending_on_load.push(container);
             let kids = self.expand_children(ui, container, &def.children, &inner, state, depth + 1, true);
             ui.get_mut(container).children = kids;
             return Some(container);
@@ -277,6 +305,7 @@ impl Semantic {
         let arena_kind = self.primitive(kind, string_args, bindings, scope)?;
         let id = ui.push(ArenaNode::new(arena_kind, style));
         apply_generic_bindings(ui, id, bindings);
+        self.pending_on_load.push(id);
 
         // Only worth storing (and re-rendering each frame) if at least one
         // backtick actually has a `${...}` in it — the common all-literal
@@ -1328,6 +1357,50 @@ mod tests {
         sem.refresh_dynamic_regions(&mut ui, &state);
 
         assert_eq!(ui.get(root_id).children, before, "same NodeIds — nothing was rebuilt");
+    }
+
+    #[test]
+    fn take_pending_on_load_returns_every_node_built_initially_then_drains() {
+        let src = "layout: T { Container { Text `a` Text `b` } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+
+        let state = DynamicTestState::default();
+        let ui = sem.build("T", &state).unwrap();
+
+        let pending = sem.take_pending_on_load();
+        // `ui.nodes.len() - 1`: `build()` pushes the entry layout's own root
+        // container directly (not through `expand`), since it has no
+        // `AstNode::Widget` of its own to carry an `onLoad` binding — every
+        // other node (the `Container` and its 2 `Text` children) goes
+        // through `expand` and is tracked.
+        assert_eq!(pending.len(), ui.nodes.len() - 1, "every expand()-created node, container and leaves alike");
+        assert!(sem.take_pending_on_load().is_empty(), "draining again after the first take returns nothing new");
+    }
+
+    #[test]
+    fn take_pending_on_load_reports_freshly_created_ids_again_after_a_for_rebuild() {
+        // A `for`'s region rebuild replaces *every* item's nodes with fresh
+        // ids when its list signature changes (see `expand_region` — there's
+        // no per-item diffing/keying), so `onLoad` genuinely refires for
+        // every row, not just the newly appended one. Documented behavior,
+        // not a bug: this test locks in that shape rather than a
+        // finer-grained "only the new row" semantics the engine doesn't have.
+        let src = "layout: T { for x in state.rows { Text `${x}` } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+
+        let mut state = DynamicTestState { show: false, rows: vec![1, 2] };
+        let mut ui = sem.build("T", &state).unwrap();
+        sem.take_pending_on_load();
+
+        state.rows.push(3);
+        sem.refresh_dynamic_regions(&mut ui, &state);
+        let pending = sem.take_pending_on_load();
+        assert_eq!(pending.len(), 3, "all 3 rows got fresh NodeIds, not just the appended one");
+
+        sem.refresh_dynamic_regions(&mut ui, &state);
+        assert!(sem.take_pending_on_load().is_empty(), "signature unchanged — no rebuild, nothing newly created");
     }
 
     #[test]

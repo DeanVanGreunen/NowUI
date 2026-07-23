@@ -257,6 +257,18 @@ impl<S: NowUiState> App<S> {
         }
     }
 
+    /// Fire `"onLoad"` on every node created since the last call to this —
+    /// called once right after the initial `build()` (see `lib.rs::run_ast`)
+    /// and again after every `refresh_dynamic_regions` in `redraw`, so a
+    /// `for`/`if` region's freshly-expanded nodes get it too, not just the
+    /// static tree. `dispatch_event` already no-ops for a node that didn't
+    /// bind `onLoad`, so this doesn't need to check first.
+    pub(crate) fn dispatch_pending_on_load(&mut self) {
+        for id in self.semantic.take_pending_on_load() {
+            self.dispatch_event(id, "onLoad", EventKind::Load, None);
+        }
+    }
+
     /// Recompute each node's per-frame effective style (`base_style` +
     /// responsive/hover/focus/active overlays), transition-smoothing the
     /// animatable subset (colors/opacity/radius/transform). Non-animatable
@@ -293,6 +305,7 @@ impl<S: NowUiState> App<S> {
         // `value_path`/`templates`/`Style::dynamic` resolved this same
         // frame, not one frame late.
         self.semantic.refresh_dynamic_regions(&mut self.ui, &self.state);
+        self.dispatch_pending_on_load();
 
         self.resolve_values();
         self.resolve_templates();
@@ -1117,6 +1130,36 @@ mod tests {
         app.resolve_dynamic_styles();
 
         assert_eq!(app.ui.get(id).base_style.width, Sizing::Hug, "left at its default");
+    }
+
+    #[test]
+    fn dispatch_pending_on_load_fires_once_for_the_initial_tree_and_again_for_a_new_for_row() {
+        #[derive(Default, Clone, nowui_core::NowUiState)]
+        #[nowui(methods(loaded))]
+        struct S {
+            load_count: i64,
+            rows: Vec<i64>,
+        }
+        impl S {
+            fn loaded(&mut self, _event: &mut nowui_core::Event) {
+                self.load_count += 1;
+            }
+        }
+
+        let src = "layout: T { Container {onLoad: state.loaded} for x in state.rows { Text `${x}` {onLoad: state.loaded} } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = crate::semantic::Semantic::new(&ast);
+        let state = S { load_count: 0, rows: vec![1] };
+        let ui = sem.build("T", &state).unwrap();
+
+        let mut app = App::new(ui, state, sem);
+        app.dispatch_pending_on_load();
+        assert_eq!(app.state.load_count, 2, "the static Container plus the one initial row");
+
+        app.state.rows.push(2);
+        app.semantic.refresh_dynamic_regions(&mut app.ui, &app.state);
+        app.dispatch_pending_on_load();
+        assert_eq!(app.state.load_count, 4, "for rebuilds both rows fresh (no per-item keying) — onLoad refires for each");
     }
 
     #[test]

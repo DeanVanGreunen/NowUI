@@ -61,6 +61,7 @@ fn run_ast<S: NowUiState + 'static>(ast: Vec<Node>, entry: &str, state: S) -> Ex
     // redraw needs the AST it came from, not just the one-time `Ui` it
     // originally produced.
     let mut app = App::new(ui, state, sem);
+    app.dispatch_pending_on_load();
     match event_loop.run_app(&mut app) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
