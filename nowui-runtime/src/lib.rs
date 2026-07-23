@@ -50,9 +50,10 @@ fn run_ast<S: NowUiState + 'static>(ast: Vec<Node>, entry: &str, state: S) -> Ex
         eprintln!("warning: {w}");
     }
 
-    // Event-driven redraw: sleep between events, render on demand. Kept as
-    // winit's own `run_app` loop, not a user-owned poll loop — see CLAUDE.md
-    // for why (this is a deliberate, discussed decision, not an oversight).
+    // A fixed 60fps loop, not event-driven — `App::about_to_wait` owns the
+    // actual `ControlFlow::WaitUntil` pacing and overrides this immediately
+    // once the window exists (`App::resumed`); this initial value only
+    // covers the brief window before that.
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
 

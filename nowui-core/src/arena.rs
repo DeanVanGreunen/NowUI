@@ -167,6 +167,15 @@ pub struct Node {
     /// `NowUiState`, same as `value_path` — a widget can carry both.
     pub templates: Vec<Template>,
     pub dirty: bool,
+    /// Seconds to wait after this node is created before firing `onLoad` —
+    /// from a `{onLoadDelay: 1.0}` binding (a literal number, unlike
+    /// `EVENT_BINDING_KEYS`' state paths; there's no live value to bind a
+    /// delay to). `0.0` (fire immediately, same as no `onLoadDelay` at all)
+    /// when absent. Parsed by the semantic pass; read once by
+    /// `nowui-runtime`'s `App::dispatch_pending_on_load` at the moment
+    /// `onLoad` would otherwise fire, to decide whether to dispatch now or
+    /// queue it for later.
+    pub on_load_delay_secs: f32,
 }
 
 /// One backtick string's literal/variable parts. `Var` holds the dotted path
@@ -194,6 +203,7 @@ impl Node {
             events: HashMap::new(),
             templates: Vec::new(),
             dirty: true,
+            on_load_delay_secs: 0.0,
         }
     }
 }

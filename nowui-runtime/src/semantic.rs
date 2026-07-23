@@ -971,12 +971,18 @@ fn compact_sizing(token: &str) -> Sizing {
 /// Extract the cross-cutting bindings every widget (primitive or custom
 /// layout use) can carry, generically: `{value: state.path}` (stored on
 /// `Node::value_path` — read by `Text`/`TextInput`/`Checkbox`/`Dropdown`/
-/// `Slider`/`ProgressBar`, ignored by anything else) and any of
+/// `Slider`/`ProgressBar`, ignored by anything else), any of
 /// `EVENT_BINDING_KEYS` (stored on `Node::events`, keyed by the binding
-/// name). Both are parsed and stored only — see CLAUDE.md for why nothing
-/// dispatches them yet (no callback/state system exists until roadmap step 6).
+/// name), and `{onLoadDelay: 1.0}` (a literal number of seconds, stored on
+/// `Node::on_load_delay_secs` — see that field's doc comment).
 fn apply_generic_bindings(ui: &mut Ui, id: NodeId, bindings: &[nowui_syntax::ast::Binding]) {
     for b in bindings {
+        if b.key == "onLoadDelay" {
+            if let BindValue::Number(n) = b.value {
+                ui.get_mut(id).on_load_delay_secs = n.max(0.0) as f32;
+            }
+            continue;
+        }
         let BindValue::Path(path) = &b.value else { continue };
         if b.key == "value" {
             ui.get_mut(id).value_path = path.clone();
@@ -1254,6 +1260,37 @@ mod tests {
         assert_eq!(node.events.get("onClick"), Some(&vec!["state".to_string(), "save".to_string()]));
         assert_eq!(node.events.get("onMouseMove"), Some(&vec!["state".to_string(), "track".to_string()]));
         assert_eq!(node.events.get("onKeyDown"), None);
+    }
+
+    #[test]
+    fn resolves_on_load_delay_and_defaults_to_zero_when_absent() {
+        let ast = nowui_syntax::parse(
+            "layout: T { Text `a` {onLoad: state.loaded, onLoadDelay: 1.5} Text `b` {onLoad: state.loaded} }",
+        )
+        .unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+
+        let delayed = ui.get(root.children[0]);
+        assert!((delayed.on_load_delay_secs - 1.5).abs() < 1e-6);
+
+        let immediate = ui.get(root.children[1]);
+        assert_eq!(immediate.on_load_delay_secs, 0.0, "no onLoadDelay binding at all — fires immediately");
+    }
+
+    #[test]
+    fn negative_on_load_delay_clamps_to_zero() {
+        // The parser's number-literal grammar doesn't accept a leading `-`
+        // at all (a pre-existing, unrelated limitation — nothing in this
+        // language needs negative literals yet), so this exercises
+        // `apply_generic_bindings`'s clamp directly with a hand-built
+        // `Binding` rather than through `nowui_syntax::parse`.
+        let mut ui = Ui::new();
+        let id = ui.push(ArenaNode::new(NodeKind::Container, Style::default()));
+        let bindings = vec![nowui_syntax::ast::Binding { key: "onLoadDelay".to_string(), value: BindValue::Number(-2.0) }];
+        apply_generic_bindings(&mut ui, id, &bindings);
+        assert_eq!(ui.get(id).on_load_delay_secs, 0.0);
     }
 
     #[test]

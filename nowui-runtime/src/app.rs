@@ -20,7 +20,7 @@
 
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use nowui_core::{
     compute_effective, display_string, dropdown_metrics, AnimatableStyle, Color, Event, EventKind,
@@ -39,6 +39,12 @@ use crate::transitions::Transitions;
 /// Background color painted before the tree each frame (opaque so premultiplied
 /// == straight for the softbuffer bridge).
 const CLEAR: Color = Color { r: 0x26, g: 0x80, b: 0xd4, a: 255 };
+
+/// A fixed 60fps game loop, by explicit request — a deliberate departure
+/// from this engine's original "event-driven, not a game loop" design (see
+/// `ControlFlow::WaitUntil` usage in `about_to_wait`): every frame redraws
+/// unconditionally, whether or not anything actually changed.
+const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
 pub struct App<S: NowUiState> {
     ui: Ui,
@@ -78,6 +84,18 @@ pub struct App<S: NowUiState> {
     /// from, via `Semantic::refresh_dynamic_regions`. See `dynamic.rs`.
     semantic: crate::semantic::Semantic,
     transitions: Transitions,
+    /// Nodes whose `onLoad` is due later than "now" — from a nonzero
+    /// `{onLoadDelay: ...}` — each paired with the `Instant` it should fire
+    /// at. Checked every frame (the loop is unconditional/fixed-rate now —
+    /// see `FRAME_INTERVAL`/`about_to_wait` — so this no longer needs to
+    /// drive `ControlFlow` itself the way it used to).
+    pending_on_load_timers: Vec<(NodeId, Instant)>,
+    /// The `Instant` the next frame should fire at — `about_to_wait` compares
+    /// against this and, once reached, both requests the redraw and advances
+    /// it by `FRAME_INTERVAL` (not just `now + FRAME_INTERVAL`, to avoid
+    /// drift accumulating frame over frame), then reschedules
+    /// `ControlFlow::WaitUntil` for the new deadline.
+    next_frame: Instant,
 }
 
 impl<S: NowUiState> App<S> {
@@ -96,6 +114,8 @@ impl<S: NowUiState> App<S> {
             modifiers: winit::keyboard::ModifiersState::empty(),
             semantic,
             transitions: Transitions::new(),
+            pending_on_load_timers: Vec::new(),
+            next_frame: Instant::now(),
         }
     }
 
@@ -263,8 +283,41 @@ impl<S: NowUiState> App<S> {
     /// `for`/`if` region's freshly-expanded nodes get it too, not just the
     /// static tree. `dispatch_event` already no-ops for a node that didn't
     /// bind `onLoad`, so this doesn't need to check first.
+    ///
+    /// A node with `on_load_delay_secs` above zero (`{onLoadDelay: 1.0}`)
+    /// doesn't fire immediately — it's queued into `pending_on_load_timers`
+    /// instead; `fire_due_on_load_timers` (called *before* this, not after —
+    /// see its own doc comment) is what actually dispatches it once its
+    /// deadline passes.
     pub(crate) fn dispatch_pending_on_load(&mut self) {
+        let now = Instant::now();
         for id in self.semantic.take_pending_on_load() {
+            let delay = self.ui.get(id).on_load_delay_secs;
+            if delay <= 0.0 {
+                self.dispatch_event(id, "onLoad", EventKind::Load, None);
+            } else {
+                self.pending_on_load_timers.push((id, now + Duration::from_secs_f32(delay)));
+            }
+        }
+    }
+
+    /// Dispatch `"onLoad"` for every queued delayed node (`{onLoadDelay:
+    /// ...}`) whose deadline has passed. Called in `redraw` *before*
+    /// `refresh_dynamic_regions`, deliberately the opposite order from
+    /// `dispatch_pending_on_load` — a delayed `onLoad` handler often mutates
+    /// state an `if`/`for` branches on (e.g. a splash screen navigating away
+    /// after a delay), and that mutation needs to be visible to *this same
+    /// frame's* region re-evaluation, not next frame's. Getting this
+    /// backwards was a real bug: the mutation would land one frame too late,
+    /// and since nothing else was dirty by then, `ControlFlow` had already
+    /// dropped back to `Wait` with no redraw scheduled to pick it up — the
+    /// UI would sit stale until an unrelated input event forced one.
+    fn fire_due_on_load_timers(&mut self) {
+        let now = Instant::now();
+        let (due, still_pending): (Vec<_>, Vec<_>) =
+            self.pending_on_load_timers.drain(..).partition(|&(_, deadline)| deadline <= now);
+        self.pending_on_load_timers = still_pending;
+        for (id, _) in due {
             self.dispatch_event(id, "onLoad", EventKind::Load, None);
         }
     }
@@ -291,7 +344,7 @@ impl<S: NowUiState> App<S> {
         }
     }
 
-    fn redraw(&mut self, event_loop: &ActiveEventLoop) {
+    fn redraw(&mut self) {
         let Some(window) = self.window.clone() else { return };
         if self.surface.is_none() {
             return;
@@ -299,6 +352,12 @@ impl<S: NowUiState> App<S> {
 
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
+
+        // Fire any due delayed `onLoad` *first* — its handler may mutate
+        // state an `if`/`for` branches on, and that needs to be visible to
+        // the region re-evaluation right below, not next frame (see
+        // `fire_due_on_load_timers`'s doc comment).
+        self.fire_due_on_load_timers();
 
         // Re-expand any `if`/`for` whose condition/list actually changed
         // *before* everything else — a newly-appeared node needs its own
@@ -360,20 +419,10 @@ impl<S: NowUiState> App<S> {
         buffer.present().expect("present");
         self.ui.dirty = false;
 
-        // Keep pumping frames only while a transition is actually in-flight —
-        // event-driven otherwise (ControlFlow::Wait), never a free-running loop.
-        //
-        // `request_redraw()` alone isn't reliable here: called from inside the
-        // `RedrawRequested` handler it can get coalesced with the in-flight
-        // redraw instead of scheduling a genuinely new one, silently stalling
-        // an animation partway. Driving the control flow directly guarantees
-        // the next tick actually happens.
-        if self.transitions.any_active(Instant::now()) {
-            event_loop.set_control_flow(ControlFlow::Poll);
-            self.request_redraw();
-        } else {
-            event_loop.set_control_flow(ControlFlow::Wait);
-        }
+        // Frame pacing (a fixed 60fps loop, not event-driven) is owned by
+        // `about_to_wait` — it schedules the next `WaitUntil` deadline and
+        // the next `request_redraw()` regardless of what happened this
+        // frame. Nothing to decide here.
     }
 
     fn request_redraw(&self) {
@@ -891,7 +940,31 @@ impl<S: NowUiState> ApplicationHandler for App<S> {
         self.window = Some(window);
         self.surface = Some(surface);
         self.ui.dirty = true;
+        self.next_frame = Instant::now();
         self.request_redraw();
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
+    }
+
+    /// Fires once winit has delivered every event queued for this iteration
+    /// and is about to go idle — the standard place to schedule the next
+    /// tick of a fixed-rate loop. Requests the next redraw once `next_frame`
+    /// is reached (advancing it by exactly `FRAME_INTERVAL`, not `now +
+    /// FRAME_INTERVAL`, so occasional scheduling jitter doesn't accumulate
+    /// into drift over a long-running session — except when the app actually
+    /// fell behind, e.g. the window was minimized/stalled, in which case
+    /// trying to "catch up" would fire a burst of redraws all at once; that
+    /// case resyncs to `now + FRAME_INTERVAL` instead), then reschedules
+    /// `ControlFlow::WaitUntil` for whatever the new deadline is.
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if now >= self.next_frame {
+            self.next_frame += FRAME_INTERVAL;
+            if self.next_frame < now {
+                self.next_frame = now + FRAME_INTERVAL;
+            }
+            self.request_redraw();
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -1081,11 +1154,10 @@ impl<S: NowUiState> ApplicationHandler for App<S> {
                 }
             }
 
-            WindowEvent::RedrawRequested => {
-                if self.ui.dirty || self.transitions.any_active(Instant::now()) {
-                    self.redraw(event_loop);
-                }
-            }
+            // Unconditional — this is a fixed 60fps loop (see
+            // `about_to_wait`), not an on-demand repaint gated on whether
+            // anything actually changed.
+            WindowEvent::RedrawRequested => self.redraw(),
 
             _ => {}
         }
@@ -1130,6 +1202,104 @@ mod tests {
         app.resolve_dynamic_styles();
 
         assert_eq!(app.ui.get(id).base_style.width, Sizing::Hug, "left at its default");
+    }
+
+    #[test]
+    fn on_load_delay_defers_dispatch_until_its_deadline_passes() {
+        #[derive(Default, Clone, nowui_core::NowUiState)]
+        #[nowui(methods(loaded))]
+        struct S {
+            load_count: i64,
+        }
+        impl S {
+            fn loaded(&mut self, _event: &mut nowui_core::Event) {
+                self.load_count += 1;
+            }
+        }
+
+        let src = "layout: T { Text `a` {onLoad: state.loaded, onLoadDelay: 0.02} }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = crate::semantic::Semantic::new(&ast);
+        let ui = sem.build("T", &S::default()).unwrap();
+
+        let mut app = App::new(ui, S::default(), sem);
+        app.dispatch_pending_on_load();
+        assert_eq!(app.state.load_count, 0, "queued, not fired yet — the delay hasn't elapsed");
+        assert_eq!(app.pending_on_load_timers.len(), 1);
+
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        app.fire_due_on_load_timers();
+        assert_eq!(app.state.load_count, 1, "deadline passed — fires on the next check");
+        assert!(app.pending_on_load_timers.is_empty());
+    }
+
+    #[test]
+    fn a_delayed_on_loads_state_mutation_is_visible_to_the_same_frames_region_refresh() {
+        // Regression test for the real bug this split guarded against: a
+        // splash screen's `{onLoad: state.go, onLoadDelay: ...}` flips
+        // `state.page`, which an `if` branches the visible content on. If
+        // `fire_due_on_load_timers` ran *after* `refresh_dynamic_regions`
+        // (as a single combined `dispatch_pending_on_load` used to), the
+        // flip would land one frame too late — and since nothing else was
+        // dirty by then, the app would go idle (`ControlFlow::Wait`) with
+        // the stale screen showing until an unrelated click/keypress forced
+        // another redraw.
+        #[derive(Default, Clone, nowui_core::NowUiState)]
+        #[nowui(methods(go))]
+        struct S {
+            page: String,
+        }
+        impl S {
+            fn go(&mut self, _event: &mut nowui_core::Event) {
+                self.page = "b".to_string();
+            }
+        }
+
+        let src = "layout: T { if state.page == \"a\" { \
+            Text `A` {onLoad: state.go, onLoadDelay: 0.02} \
+        } else { Text `B` } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = crate::semantic::Semantic::new(&ast);
+        let state = S { page: "a".to_string() };
+        let ui = sem.build("T", &state).unwrap();
+
+        let mut app = App::new(ui, state, sem);
+        app.dispatch_pending_on_load();
+        assert_eq!(app.pending_on_load_timers.len(), 1, "queued, not fired — delay hasn't elapsed yet");
+
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        // Exactly what `redraw` does, in the same order: fire due timers
+        // *first*, then refresh regions.
+        app.fire_due_on_load_timers();
+        app.semantic.refresh_dynamic_regions(&mut app.ui, &app.state);
+
+        let root = app.ui.get(app.ui.layers[0].root);
+        let NodeKind::Text { content } = &app.ui.get(root.children[0]).kind else { panic!("expected Text") };
+        assert_eq!(content, "B", "the region refresh saw state.page == \"b\" this same frame");
+    }
+
+    #[test]
+    fn zero_on_load_delay_fires_immediately_same_as_no_binding_at_all() {
+        #[derive(Default, Clone, nowui_core::NowUiState)]
+        #[nowui(methods(loaded))]
+        struct S {
+            load_count: i64,
+        }
+        impl S {
+            fn loaded(&mut self, _event: &mut nowui_core::Event) {
+                self.load_count += 1;
+            }
+        }
+
+        let src = "layout: T { Text `a` {onLoad: state.loaded, onLoadDelay: 0.0} }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = crate::semantic::Semantic::new(&ast);
+        let ui = sem.build("T", &S::default()).unwrap();
+
+        let mut app = App::new(ui, S::default(), sem);
+        app.dispatch_pending_on_load();
+        assert_eq!(app.state.load_count, 1);
+        assert!(app.pending_on_load_timers.is_empty(), "never queued at all — no delay to wait out");
     }
 
     #[test]
