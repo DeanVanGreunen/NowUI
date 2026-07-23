@@ -1,5 +1,5 @@
 // NowUI — login screen (matches the reference design).
-//
+//  
 // Styled with the Tailwind CSS v4 utility vocabulary this engine supports:
 // spacing/color/typography scales, flexbox (row/col + items-*/justify-*),
 // CSS grid (grid-cols-*/col-span-*), borders + radius, opacity, 2D transforms
@@ -13,7 +13,7 @@
 // `Login` is a reusable, parameterized layout (a custom widget). `App` uses it.
 // Run:  cargo run -p nowui-runtime -- examples/login.nowui App
 
-layout: Login(state) w-[fill] h-[fill] {
+layout: Login(app) w-[fill] h-[fill] {
 
   // Top bar
   Bar row w-full items-center justify-end bg-gray-900 h-12 px-6 {
@@ -35,16 +35,16 @@ layout: Login(state) w-[fill] h-[fill] {
       Text `Login Form` w-full text-center text-gray-800 font-semibold text-lg pb-4
 
       Text `Username` text-gray-700 text-sm font-medium
-      TextInput `` `Enter Username` w-full bg-gray-100 border border-transparent p-[10px] rounded focus:border-blue-500 transition duration-150 {value: state.username}
+      TextInput `` `Enter Username` w-full bg-gray-100 border border-transparent p-[10px] rounded focus:border-blue-500 transition duration-150 {value: app.username}
 
-      // Dynamic region: re-expanded live against `state.username` every
+      // Dynamic region: re-expanded live against `app.username` every
       // redraw (not just once at startup) — see CLAUDE.md's "Dynamic
-      // regions" section. `state.username.length` is the `.length`
+      // regions" section. `app.username.length` is the `.length`
       // pseudo-property (works on a `Str` or a `List`, not a real field).
-      if state.username.length > 3 && state.username.length < 8 {
+      if app.username.length > 3 && app.username.length < 8 {
         Text `Password` text-gray-700 text-sm font-medium pt-3
-        TextInput `` `Enter Password` w-full bg-gray-100 border border-transparent p-[10px] rounded focus:border-blue-500 transition duration-150 {value: state.password, mask: true}
-      } else if state.username.length >= 8 {
+        TextInput `` `Enter Password` w-full bg-gray-100 border border-transparent p-[10px] rounded focus:border-blue-500 transition duration-150 {value: app.password, mask: true}
+      } else if app.username.length >= 8 {
         Text `Entered username is to long` text-gray-700 text-sm font-medium pt-3
       } else {
         Text `Enter your username first` text-gray-700 text-sm font-medium pt-3
@@ -57,7 +57,7 @@ layout: Login(state) w-[fill] h-[fill] {
       // directly as `Grid`'s own children — not wrapped in an extra
       // container, so it doesn't disturb the 2-column cell placement.
       Grid grid grid-cols-2 gap-4 pt-3 w-full {
-        for x in state.rows {
+        for x in app.rows {
           Checkbox `Remember me` text-gray-500 text-sm
           Text `Forgot password? ${x.label}` text-gray-500 text-sm text-right {onClick:x.handleMe}
         }
@@ -69,5 +69,5 @@ layout: Login(state) w-[fill] h-[fill] {
 }
 
 layout: App w-[fill] h-[fill] {
-  Login state=state
+  Login app=state
 }

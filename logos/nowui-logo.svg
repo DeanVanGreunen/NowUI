@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512" role="img">
+  <title>NowUI</title>
+  <desc>Three rounded violet panels arranged as a sidebar and two stacked content blocks on a pale lilac ground.</desc>
+  <rect width="512" height="512" rx="96.0" fill="#EDEAFB"/>
+  <rect x="102.4" y="102.4" width="108.8" height="307.2" rx="22.4" fill="#4B3BD1"/>
+  <rect x="249.6" y="102.4" width="160.0" height="134.4" rx="22.4" fill="#8B7CF0"/>
+  <rect x="249.6" y="275.2" width="160.0" height="134.4" rx="22.4" fill="#B9AFF7"/>
+</svg>

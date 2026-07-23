@@ -16,11 +16,18 @@ let client: LanguageClient | undefined;
  *   1. the `nowui.serverPath` setting, if set;
  *   2. `target/debug/nowui-lsp[.exe]` or `target/release/nowui-lsp[.exe]`
  *      under any open workspace folder (the common case while developing
- *      NowUI itself, right after `cargo build -p nowui-lsp`);
- *   3. bare `nowui-lsp`, resolved via `PATH` (e.g. after
+ *      NowUI itself, right after `cargo build -p nowui-lsp`) — takes
+ *      priority over the bundled binary below so a dev iterating on the
+ *      server gets their own build, not the one shipped in the `.vsix`;
+ *   3. `bin/nowui-lsp[.exe]` inside this extension's own install directory
+ *      — present only in a packaged `.vsix` that ran `npm run stage-lsp`
+ *      before `vsce package` (see `scripts/stage-lsp.js` and the
+ *      `package:<platform>` scripts in `package.json`); absent entirely for
+ *      a plain `npm install && npm run compile` dev checkout;
+ *   4. bare `nowui-lsp`, resolved via `PATH` (e.g. after
  *      `cargo install --path nowui-lsp`).
  */
-function resolveServerPath(): string {
+function resolveServerPath(extensionPath: string): string {
     const configured = workspace.getConfiguration("nowui").get<string>("serverPath");
     if (configured && configured.trim().length > 0) {
         return configured;
@@ -36,11 +43,16 @@ function resolveServerPath(): string {
         }
     }
 
+    const bundled = path.join(extensionPath, "bin", exeName);
+    if (fs.existsSync(bundled)) {
+        return bundled;
+    }
+
     return exeName;
 }
 
-export function activate(_context: ExtensionContext): void {
-    const command = resolveServerPath();
+export function activate(context: ExtensionContext): void {
+    const command = resolveServerPath(context.extensionPath);
     const serverOptions: ServerOptions = {
         run: { command, transport: TransportKind.stdio },
         debug: { command, transport: TransportKind.stdio },

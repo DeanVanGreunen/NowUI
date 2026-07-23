@@ -738,3 +738,26 @@ client, TypeScript/npm) via `vscode-languageclient`.
   highlighting — that's the server's job via semantic tokens). Not a Cargo workspace member; see
   its own `README.md` for the npm dev workflow (`npm install && npm run compile`, then F5 to
   launch an Extension Development Host).
+
+
+# NowUI VSCode Extension
+
+Build and install the vscode extension
+
+for windows
+```
+cargo build --release -p nowui-lsp
+cd nowui-extension
+npm run package:win32-x64
+npm run stage-lsp
+code --install-extension bin/nowui-extension-win32-x64-0.1.0.vsix
+```
+
+for linux
+```
+cargo build --release -p nowui-lsp
+cd nowui-extension
+npm run package:linux-x64
+npm run stage-lsp
+code --install-extension bin/nowui-extension-linux-x64-0.1.0.vsix
+```
