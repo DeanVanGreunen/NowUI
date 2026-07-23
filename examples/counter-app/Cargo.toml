@@ -8,5 +8,5 @@ name = "login-app"
 path = "src/main.rs"
 
 [dependencies]
-nowui-core = { path = "../../nowui-core" }
-nowui-runtime = { path = "../../nowui-runtime" }
+nowui-core = { path = "../../nowui-core", version = "0.1.0" }
+nowui-runtime = { path = "../../nowui-runtime", version = "0.1.0" }

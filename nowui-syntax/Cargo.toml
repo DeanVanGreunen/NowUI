@@ -2,6 +2,9 @@
 name = "nowui-syntax"
 version = "0.1.0"
 edition = "2021"
+description = "Chumsky-based parser and AST for the NowUI .nowui UI description language."
+license = "MIT"
+repository = "https://github.com/DeanVanGreunen/NowUI"
 
 [dependencies]
 chumsky = { workspace = true }

@@ -2,6 +2,9 @@
 name = "nowui-runtime"
 version = "0.1.0"
 edition = "2021"
+description = "Winit application runtime, semantic pass, and dynamic if/for regions for the NowUI UI toolkit."
+license = "MIT"
+repository = "https://github.com/DeanVanGreunen/NowUI"
 
 [lib]
 name = "nowui_runtime"
@@ -12,9 +15,9 @@ name = "nowui"
 path = "src/main.rs"
 
 [dependencies]
-nowui-syntax = { path = "../nowui-syntax" }
-nowui-core = { path = "../nowui-core" }
-nowui-render = { path = "../nowui-render" }
+nowui-syntax = { path = "../nowui-syntax", version = "0.1.0" }
+nowui-core = { path = "../nowui-core", version = "0.1.0" }
+nowui-render = { path = "../nowui-render", version = "0.1.0" }
 winit = { workspace = true }
 softbuffer = { workspace = true }
 tiny-skia = { workspace = true }

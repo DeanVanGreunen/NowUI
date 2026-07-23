@@ -2,6 +2,9 @@
 name = "nowui-macros"
 version = "0.1.0"
 edition = "2021"
+description = "#[derive(NowUiState)] proc-macro for NowUI reactive state structs."
+license = "MIT"
+repository = "https://github.com/DeanVanGreunen/NowUI"
 
 [lib]
 proc-macro = true
@@ -15,4 +18,4 @@ proc-macro2 = { workspace = true }
 # runs entirely at the consuming crate's compile time (never shipped in any
 # binary), and needs a real parser to walk a bundled view's `#`-import graph
 # (see `#[nowui(view(...))]` in lib.rs).
-nowui-syntax = { path = "../nowui-syntax" }
+nowui-syntax = { path = "../nowui-syntax", version = "0.1.0" }

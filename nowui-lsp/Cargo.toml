@@ -2,6 +2,9 @@
 name = "nowui-lsp"
 version = "0.1.0"
 edition = "2021"
+description = "Language server (syntax highlighting + diagnostics) for .nowui files."
+license = "MIT"
+repository = "https://github.com/DeanVanGreunen/NowUI"
 
 [[bin]]
 name = "nowui-lsp"
@@ -13,6 +16,6 @@ path = "src/main.rs"
 # lexer (see src/tokenizer.rs), not driven by the chumsky AST, since
 # nowui-syntax's `ast::Node` carries no source spans (see its own doc
 # comments) and threading them through would be a large, unrelated change.
-nowui-syntax = { path = "../nowui-syntax" }
+nowui-syntax = { path = "../nowui-syntax", version = "0.1.0" }
 tower-lsp = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "io-std", "macros"] }
