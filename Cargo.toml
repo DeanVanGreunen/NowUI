@@ -1,0 +1,19 @@
+[workspace]
+resolver = "2"
+members = [
+    "nowui-syntax",
+    "nowui-core",
+    "nowui-render",
+    "nowui-runtime",
+]
+
+# Shared dependency versions. Pinned loosely; run `cargo update` to refresh.
+# NOTE: winit's API shifts between minor versions — if `nowui-runtime` fails to
+# build, check the winit docs.rs page for the version cargo resolved and adjust
+# the ApplicationHandler method signatures in nowui-runtime/src/app.rs.
+[workspace.dependencies]
+chumsky = "0.9"
+tiny-skia = "0.11"
+winit = "0.30"
+softbuffer = "0.4"
+cosmic-text = "0.12"

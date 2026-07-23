@@ -1,0 +1,16 @@
+[package]
+name = "nowui-runtime"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nowui"
+path = "src/main.rs"
+
+[dependencies]
+nowui-syntax = { path = "../nowui-syntax" }
+nowui-core = { path = "../nowui-core" }
+nowui-render = { path = "../nowui-render" }
+winit = { workspace = true }
+softbuffer = { workspace = true }
+tiny-skia = { workspace = true }

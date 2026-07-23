@@ -1,0 +1,9 @@
+[package]
+name = "nowui-render"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nowui-core = { path = "../nowui-core" }
+tiny-skia = { workspace = true }
+cosmic-text = { workspace = true }

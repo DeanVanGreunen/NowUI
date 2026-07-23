@@ -1,0 +1,9 @@
+// A reusable card, imported by examples/components_demo.nowui via
+// `# widgets/BillingCard.nowui`. Demonstrates that an imported file's
+// `layout:` defs become usable in the importing file exactly as if they'd
+// been defined there.
+
+layout: BillingCard w-full bg-white border border-gray-200 rounded-lg p-6 gap-2 {
+  Text `Pro Plan` text-gray-800 font-semibold text-lg
+  Text `Billing details for this plan` text-gray-500 text-sm
+}

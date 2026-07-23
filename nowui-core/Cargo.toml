@@ -1,0 +1,8 @@
+[package]
+name = "nowui-core"
+version = "0.1.0"
+edition = "2021"
+
+# Deliberately depends on NEITHER chumsky NOR tiny-skia. The model stays
+# testable in isolation and the renderer can be swapped.
+[dependencies]
