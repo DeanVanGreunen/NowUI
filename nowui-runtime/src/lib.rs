@@ -5,16 +5,16 @@
 //!
 //! Three ways to use this:
 //!   * the `nowui` CLI binary (`main.rs`) — arbitrary `.nowui` files, no Rust
-//!     state, via `run_path(path, entry, NoState)`;
+//!     state, via `run_path(window_title, path, entry, NoState)`;
 //!   * your own binary, loading a `.nowui` file from disk at runtime — call
-//!     `nowui_runtime::run_path(path, entry, my_state)`. See
+//!     `nowui_runtime::run_path(window_title, path, entry, my_state)`. See
 //!     `nowui-runtime/examples/counter.rs`.
 //!   * your own binary, with the `.nowui` file **bundled into the
 //!     executable** at compile time — `#[derive(NowUiState)]
 //!     #[nowui(view("/login.nowui"))]` on your state struct (path relative
 //!     to that crate's own `src/` directory), then call
-//!     `nowui_runtime::run(entry, my_state)` with no path at all. See
-//!     `examples/counter-app/src/main.rs`.
+//!     `nowui_runtime::run(window_title, entry, my_state)` with no path at
+//!     all. See `examples/counter-app/src/main.rs`.
 
 pub mod app;
 pub mod dynamic;
@@ -47,8 +47,9 @@ pub enum Backend {
 /// Build the `entry` layout from `ast` and run the winit event loop against
 /// `state` until the window closes — the shared tail end of `run`/
 /// `run_path`, once each has produced an AST by whatever means (bundled
-/// string vs. on-disk file + import resolution).
-fn run_ast<S: NowUiState + 'static>(ast: Vec<Node>, entry: &str, state: S, backend: Backend) -> ExitCode {
+/// string vs. on-disk file + import resolution). `window_title` becomes the
+/// OS window's title bar text (`Window::with_title`).
+fn run_ast<S: NowUiState + 'static>(window_title: &str, ast: Vec<Node>, entry: &str, state: S, backend: Backend) -> ExitCode {
     let mut sem = semantic::Semantic::new(&ast);
     let ui = match sem.build(entry, &state) {
         Some(ui) => ui,
@@ -74,7 +75,7 @@ fn run_ast<S: NowUiState + 'static>(ast: Vec<Node>, entry: &str, state: S, backe
     // the app's whole lifetime — an `if`/`for`'s live re-expansion each
     // redraw needs the AST it came from, not just the one-time `Ui` it
     // originally produced.
-    let mut app = App::new(ui, state, sem, backend);
+    let mut app = App::new(window_title.to_string(), ui, state, sem, backend);
     app.dispatch_pending_on_load();
     match event_loop.run_app(&mut app) {
         Ok(()) => ExitCode::SUCCESS,
@@ -100,18 +101,19 @@ fn run_ast<S: NowUiState + 'static>(ast: Vec<Node>, entry: &str, state: S, backe
 /// panics) if `S` has no `#[nowui(view(...))]` — use `run_path` instead for
 /// a state type that isn't backed by a bundled view.
 ///
-/// Renders via `Backend::Gpu` — use `run_with_backend` to pick `Backend::Cpu`
-/// instead (e.g. on a headless/no-GPU machine).
-pub fn run<S: NowUiState + 'static>(entry: &str, state: S) -> ExitCode {
-    run_with_backend(entry, state, Backend::Gpu)
+/// `window_title` becomes the OS window's title bar text. Renders via
+/// `Backend::Gpu` — use `run_with_backend` to pick `Backend::Cpu` instead
+/// (e.g. on a headless/no-GPU machine).
+pub fn run<S: NowUiState + 'static>(window_title: &str, entry: &str, state: S) -> ExitCode {
+    run_with_backend(window_title, entry, state, Backend::Gpu)
 }
 
 /// Same as `run`, with an explicit `backend` choice instead of the `Gpu` default.
-pub fn run_with_backend<S: NowUiState + 'static>(entry: &str, state: S, backend: Backend) -> ExitCode {
+pub fn run_with_backend<S: NowUiState + 'static>(window_title: &str, entry: &str, state: S, backend: Backend) -> ExitCode {
     let Some(source) = S::nowui_view() else {
         eprintln!(
             "error: `{}` has no `#[nowui(view(\"/path.nowui\"))]` — add one, or call \
-             `nowui_runtime::run_path(path, entry, state)` to load from disk instead",
+             `nowui_runtime::run_path(window_title, path, entry, state)` to load from disk instead",
             std::any::type_name::<S>()
         );
         return ExitCode::FAILURE;
@@ -131,7 +133,7 @@ pub fn run_with_backend<S: NowUiState + 'static>(entry: &str, state: S, backend:
             return ExitCode::FAILURE;
         }
     };
-    run_ast(ast, entry, state, backend)
+    run_ast(window_title, ast, entry, state, backend)
 }
 
 /// Load `path` from disk, resolve its `#` imports, build the `entry` layout,
@@ -140,14 +142,21 @@ pub fn run_with_backend<S: NowUiState + 'static>(entry: &str, state: S, backend:
 /// arbitrary/dev-time `.nowui` file (e.g. the `nowui` CLI binary), or for
 /// iterating on a file without a rebuild.
 ///
-/// Renders via `Backend::Gpu` — use `run_path_with_backend` to pick
-/// `Backend::Cpu` instead (e.g. on a headless/no-GPU machine).
-pub fn run_path<S: NowUiState + 'static>(path: &str, entry: &str, state: S) -> ExitCode {
-    run_path_with_backend(path, entry, state, Backend::Gpu)
+/// `window_title` becomes the OS window's title bar text. Renders via
+/// `Backend::Gpu` — use `run_path_with_backend` to pick `Backend::Cpu`
+/// instead (e.g. on a headless/no-GPU machine).
+pub fn run_path<S: NowUiState + 'static>(window_title: &str, path: &str, entry: &str, state: S) -> ExitCode {
+    run_path_with_backend(window_title, path, entry, state, Backend::Gpu)
 }
 
 /// Same as `run_path`, with an explicit `backend` choice instead of the `Gpu` default.
-pub fn run_path_with_backend<S: NowUiState + 'static>(path: &str, entry: &str, state: S, backend: Backend) -> ExitCode {
+pub fn run_path_with_backend<S: NowUiState + 'static>(
+    window_title: &str,
+    path: &str,
+    entry: &str,
+    state: S,
+    backend: Backend,
+) -> ExitCode {
     let ast = match loader::load_and_resolve(Path::new(path)) {
         Ok(ast) => ast,
         Err(e) => {
@@ -155,7 +164,7 @@ pub fn run_path_with_backend<S: NowUiState + 'static>(path: &str, entry: &str, s
             return ExitCode::FAILURE;
         }
     };
-    run_ast(ast, entry, state, backend)
+    run_ast(window_title, ast, entry, state, backend)
 }
 
 fn available(ast: &[nowui_syntax::ast::Node]) -> Vec<String> {

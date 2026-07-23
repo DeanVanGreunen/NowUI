@@ -8,14 +8,16 @@ Standing instructions for working in the NowUI repository. Read this before maki
 
 NowUI is a file-based, retained-mode UI toolkit for Rust with a custom Tailwind-flavored syntax.
 UIs are described in `.nowui` files, parsed to an AST, expanded into a flat node arena, laid out
-with a two-pass layout solver, and CPU-rasterized to a window. The reference target used
-throughout development is a login screen: dark top bar, blue field, centered white card with
-username/password inputs and a SIGN IN button (`examples/counter-app/src/login.nowui`).
+with a two-pass layout solver, and rasterized to a window through the `Painter` trait — either
+CPU (`tiny-skia`, via `nowui-render`) or GPU (`vello`/`wgpu`, via `nowui-render-gpu`; the default —
+see `nowui_runtime::Backend`). The reference target used throughout development is a login
+screen: dark top bar, blue field, centered white card with username/password inputs and a SIGN IN
+button (`examples/counter-app/src/login.nowui`).
 
 ### Build & test discipline
 
-- Fix and build crate-by-crate in dependency order: **syntax → core → render → runtime**. Errors
-  in higher crates often clear once lower ones compile.
+- Fix and build crate-by-crate in dependency order: **syntax → core → text → render/render-gpu →
+  runtime**. Errors in higher crates often clear once lower ones compile.
 - `cargo test -p nowui-syntax` — parser tests. Fast, no window. Add a test for every grammar
   change, in the same commit.
 - `cargo test -p nowui-core` — solver/paint tests on hand-built arenas. No display needed. Add a
@@ -36,7 +38,12 @@ nowui-core/      arena, Style, tailwind tokens, geometry, solver, paint walk, Pa
                  NowUiState trait / StateValue (incl. `List`/`Object`) / Event (reactivity
                  interface), text_input.rs (cursor/selection/IME string math)
 nowui-macros/    #[derive(NowUiState)] proc-macro (reflection glue), re-exported by nowui-core
-nowui-render/    tiny-skia SkiaPainter + softbuffer bridge
+nowui-text/      shared cosmic-text shaping/measurement (TextContext, shape_text, measure) — used
+                 by both Painter backends below, so shaping logic exists exactly once
+nowui-render/    tiny-skia SkiaPainter (CPU Painter backend) + softbuffer presentation bridge
+nowui-render-gpu/ vello/wgpu GpuPainter (GPU Painter backend, the default — see
+                 nowui_runtime::Backend) + GpuSurfaceState (wgpu surface/device/Renderer owned
+                 across the window's lifetime)
 nowui-runtime/   loader (# imports), semantic pass (incl. dynamic if/for region expansion),
                  dynamic.rs (expression evaluator + loop-variable substitution), transitions
                  driver, winit app (lib + binary `nowui`); generic App<S: NowUiState> resolves
@@ -75,8 +82,8 @@ nowui-runtime/examples/counter.rs + counter.nowui   a smaller `#[derive(NowUiSta
 ```toml
 [workspace]
 members = [
-    "nowui-syntax", "nowui-core", "nowui-macros",
-    "nowui-render", "nowui-runtime", "nowui-lsp", "examples/counter-app",
+    "nowui-syntax", "nowui-core", "nowui-macros", "nowui-text",
+    "nowui-render", "nowui-render-gpu", "nowui-runtime", "nowui-lsp", "examples/counter-app",
 ]
 ```
 
@@ -90,8 +97,11 @@ cargo test -p nowui-syntax                                    # parser, no windo
 cargo test -p nowui-core                                      # solver/paint, no window
 cargo test -p nowui-runtime                                   # semantic/reactivity/app, no window
 cargo test -p nowui-lsp                                        # tokenizer/line-index, no editor needed
+cargo test -p nowui-render-gpu --test offscreen                # GpuPainter vs SkiaPainter, headless GPU, no window
 cargo test --workspace                                        # everything
 
+# All three open a real window via nowui_runtime::Backend::Gpu (the default — vello/wgpu) unless
+# the binary explicitly calls run_with_backend(..., Backend::Cpu) instead.
 cargo run -p nowui-runtime -- examples/counter-app/src/login.nowui App   # opens a window, no Rust state
 cargo run -p nowui-login-app                                             # opens a window, bundled .nowui + real state
 cargo run -p nowui-runtime --example counter                             # opens a window, on-disk .nowui + real state
@@ -403,11 +413,13 @@ Container position-relative w-[960px] h-[160px] {
 
 Three ways to get from a `.nowui` file to a running window, depending on where the source lives:
 
-- **`nowui_runtime::run(entry, state)`** — `.nowui` source **bundled into the binary** via
-  `#[nowui(view("/path.nowui"))]`. Use when shipping a real app: no `.nowui` file needed on disk
-  at runtime.
-- **`nowui_runtime::run_path(path, entry, state)`** — `.nowui` source loaded from disk at
-  runtime. Use when iterating on a `.nowui` file without a rebuild, or one with `#` imports.
+- **`nowui_runtime::run(window_title, entry, state)`** — `.nowui` source **bundled into the
+  binary** via `#[nowui(view("/path.nowui"))]`. Use when shipping a real app: no `.nowui` file
+  needed on disk at runtime. `window_title` becomes the OS window's title bar text.
+- **`nowui_runtime::run_path(window_title, path, entry, state)`** — `.nowui` source loaded from
+  disk at runtime. Use when iterating on a `.nowui` file without a rebuild, or one with `#` imports.
+- Both default to `Backend::Gpu` (`vello`/`wgpu`) — call `run_with_backend`/`run_path_with_backend`
+  (same arguments, plus an explicit `Backend` last) to pick `Backend::Cpu` instead.
 - **the `nowui` CLI binary** (`nowui-runtime/src/main.rs`) — loaded from disk, `NoState`. Use for
   quickly previewing an arbitrary `.nowui` file with no Rust state at all.
 
@@ -416,7 +428,7 @@ Three ways to get from a `.nowui` file to a running window, depending on where t
 Add the attribute alongside `#[derive(NowUiState)]` on your top-level state struct. The path is
 resolved **relative to that crate's own `src/` directory** and embedded at compile time via
 `include_str!` — the string literally becomes part of the binary, so nothing needs to exist on
-disk at runtime. Then call `nowui_runtime::run(entry, state)` with no path argument at all:
+disk at runtime. Then call `nowui_runtime::run(window_title, entry, state)` with no path argument at all:
 
 add `#[nowui(view("/login.nowui"))]` to specify the root entry UI point
 add `#[nowui(methods(sign_in))]` to specify the each method that will be used by the view
@@ -453,7 +465,7 @@ impl Row {
 }
 
 fn main() -> ExitCode {
-    nowui_runtime::run( "App", App {
+    nowui_runtime::run( "Counter App", "App", App {
         username: "".to_string(),
         password: "".to_string(),
         rows: vec![Row { id: "x".to_string(), label:"x".to_string()}],
@@ -531,7 +543,7 @@ impl Counter {
 
 fn main() -> ExitCode {
     let nowui_file = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/counter.nowui");
-    nowui_runtime::run_path(nowui_file, "App", AppState::default())
+    nowui_runtime::run_path("Counter", nowui_file, "App", AppState::default())
 }
 ```
 
@@ -634,7 +646,8 @@ Pipeline, end to end:
 ```text
 .nowui file --chumsky parser--> AST --semantic pass--> node arena
    --layout solver (2-pass)--> computed rects --paint walk--> Painter calls
-   --tiny-skia raster--> Pixmap --softbuffer--> window pixels
+   --Backend::Gpu (vello/wgpu raster, default)--------> window pixels
+   --Backend::Cpu (tiny-skia raster --> Pixmap --softbuffer)--> window pixels
 ```
 
 Two properties are load-bearing and shape everything else in this document:
@@ -642,10 +655,11 @@ Two properties are load-bearing and shape everything else in this document:
 - **Retained, not immediate.** The arena persists across frames. A redraw re-walks the existing
   tree and re-paints it; it does not rebuild the tree from scratch, except where `if`/`for`
   dynamic regions explicitly re-expand a subtree because the state they depend on changed.
-- **Event-driven, not a game loop.** The window uses `ControlFlow::Wait` and renders only when
-  dirty (a state mutation, a hover, a resize, an in-flight transition). There is **no continuous
-  animation loop** anywhere in this engine — don't add one to solve a redraw problem; see the
-  `ControlFlow` runtime gotcha under "Internal Libraries and Dependencies" below.
+- **A fixed 60fps loop, by explicit design choice — not event-driven.** `App::about_to_wait`
+  schedules `ControlFlow::WaitUntil` at a steady `FRAME_INTERVAL` and redraws unconditionally every
+  tick, whether or not anything changed. This is a deliberate departure from this engine's earlier
+  event-driven-only model (still visible in some older comments/gotchas below) — don't "fix" it
+  back to on-demand-only without re-checking with whoever owns this decision.
 
 ---
 
@@ -654,10 +668,21 @@ Two properties are load-bearing and shape everything else in this document:
 ### Third-party crates (do not change without reason)
 
 - **`chumsky`** (0.9) — parser combinators; builds the `.nowui` AST.
-- **`tiny-skia`** (0.11) — CPU rasterizer. Has **no text support** — glyphs come from `cosmic-text`.
-- **`cosmic-text`** (0.12) — text shaping/layout/rasterization, feeds glyphs into tiny-skia.
+- **`tiny-skia`** (0.11) — CPU rasterizer (`Backend::Cpu`). Has **no text support** — glyphs come
+  from `cosmic-text`, rasterized by `swash` and blitted pixel-by-pixel (see `nowui-render`'s
+  module doc for why this means CPU-backend text never rotates with its node's transform).
+- **`cosmic-text`** (0.12) — text shaping/layout, shared by *both* backends via `nowui-text`.
+  Feeds shaped glyphs into `swash` (CPU) or straight into `vello` (GPU) — see `nowui-render-gpu`'s
+  module doc for how a shaped glyph run maps onto `vello::Scene::draw_glyphs`.
+- **`vello`** (0.9) — GPU 2D scene renderer (`Backend::Gpu`, the default), built on `wgpu`.
+  Re-exports `wgpu`/`peniko`/`kurbo` as `vello::wgpu`/`vello::peniko`/`vello::kurbo` — use those
+  re-exports rather than adding separate `wgpu`/`peniko`/`kurbo` workspace deps, so their versions
+  can never drift out of sync with what `vello` itself was built against.
+- **`pollster`** (0.3) — blocks on the one-time async `wgpu` adapter/device negotiation in
+  `GpuSurfaceState::new` (called from `App::resumed`, itself synchronous) — the only blocking-async
+  call anywhere in this codebase.
 - **`winit`** (**0.30**) — windowing + event loop.
-- **`softbuffer`** (0.4) — presents the rasterized pixmap to the OS window.
+- **`softbuffer`** (0.4) — presents the rasterized `Pixmap` to the OS window, `Backend::Cpu` only.
 - **`syn` / `quote` / `proc-macro2`** (2 / 1 / 1) — power the `#[derive(NowUiState)]` proc-macro.
 
 **winit's version is load-bearing.** The app harness uses `ApplicationHandler` + `run_app`, which
@@ -677,19 +702,31 @@ the pin, not the code.
 - **`nowui-macros`** — `#[derive(NowUiState)]`, a proc-macro that generates `get`/`set`/`call`
   reflection glue for a plain Rust struct. Re-exported through `nowui-core` so consumers only
   ever add one dependency.
-- **`nowui-render`** — the tiny-skia `SkiaPainter` implementation of the `Painter` trait, plus
-  the softbuffer presentation bridge.
+- **`nowui-text`** — `TextContext` (font database + glyph cache) and the cosmic-text
+  shaping/measurement functions (`shape_text`, `measure`), shared by both `Painter` backends below
+  so this logic exists exactly once regardless of how a backend rasterizes the glyphs it gets
+  back. Pure cosmic-text — no `tiny-skia`, no `vello`/`wgpu`.
+- **`nowui-render`** — the tiny-skia `SkiaPainter` implementation of the `Painter` trait
+  (`Backend::Cpu`), plus the softbuffer presentation bridge.
+- **`nowui-render-gpu`** — the vello/wgpu `GpuPainter` implementation of the `Painter` trait
+  (`Backend::Gpu`, the default), plus `GpuSurfaceState` (owns the `wgpu::Surface`/`Device`/`Queue`
+  and `vello::Renderer` tied to an on-screen window's lifetime, via `vello::util::RenderContext` —
+  see its module doc for why an intermediate storage-capable texture + blit is needed rather than
+  rendering directly into the swapchain image).
 - **`nowui-runtime`** — the `#` import loader, the semantic pass (AST → arena, including dynamic
   `if`/`for` region expansion), the expression evaluator (`dynamic.rs`), the transition driver,
   and the winit `App<S: NowUiState>` (lib + a thin CLI binary `nowui`) that ties state,
-  layout, and paint together every redraw.
+  layout, and paint together every redraw. Owns `Backend` (`Cpu`/`Gpu`) and the
+  `run`/`run_path`/`run_with_backend`/`run_path_with_backend` entry points.
 
 ### The one hard architectural rule
 
-**`nowui-core` must never import `chumsky` or `tiny-skia`.** The model stays testable in
-isolation and the renderer stays swappable. If you need syntax or render types in core, you're
-putting something in the wrong crate. Dependency arrows point one direction only:
-`nowui-syntax` / `nowui-render` → (never) `nowui-core` → (never) `nowui-runtime`.
+**`nowui-core` must never import `chumsky`, `tiny-skia`, or `vello`/`wgpu`.** The model stays
+testable in isolation and the renderer stays swappable — `nowui-render` and `nowui-render-gpu`
+are proof: two independent `Painter` implementations behind the same trait, neither known to
+`nowui-core`. If you need syntax or render types in core, you're putting something in the wrong
+crate. Dependency arrows point one direction only:
+`nowui-syntax` / `nowui-render` / `nowui-render-gpu` → (never) `nowui-core` → (never) `nowui-runtime`.
 
 ### Architecture decisions (keep consistent with these)
 
@@ -701,9 +738,22 @@ putting something in the wrong crate. Dependency arrows point one direction only
 - **Layers** = `Vec<Layer>`, each its own layout root, composited back-to-front. Hit-testing goes
   front-to-back (topmost layer wins).
 - **`Painter` trait is the render boundary** (`fill_rect`, `stroke_rect`, `draw_text`,
-  `push_clip`/`pop_clip`, `measure_text`, `push_transform`/`push_opacity`). tiny-skia is one impl.
+  `push_clip`/`pop_clip`, `measure_text`, `push_transform`/`push_opacity`). Two independent impls:
+  `SkiaPainter` (CPU, `nowui-render`) and `GpuPainter` (GPU/`vello`, `nowui-render-gpu`, the
+  default — see `nowui_runtime::Backend`). Both mirror the same design for the clip/transform/
+  opacity stacks: plain cumulative data (`Vec<Transform>`/`Vec<f32>` opacity), applied fresh as a
+  parameter to each individual draw call — *not* pushed as nested render-target/layer state,
+  because the paint walk's push/pop sequence doesn't nest as simple symmetric layers (a node can
+  pop its own clip partway through painting its children while its transform/opacity stay active
+  for what's painted after). `GpuPainter` is the one exception: it *does* use a real
+  `vello::Scene::push_layer`/`pop_layer` for clips specifically, since `push_clip`/`pop_clip` are
+  the one stack that's always properly nested — see that crate's module doc.
+  A real, documented fidelity difference between the two: `SkiaPainter` blits glyphs as pixels, so
+  text never rotates/scales/skews with its node's transform; `GpuPainter` draws glyphs as real
+  transformable primitives via `vello::Scene::draw_glyphs`, so text *does* follow the active
+  transform. This is intentional — a GPU-backend improvement, not backported to CPU.
   "Retained" refers to the tree, not cached draw commands — the paint pass re-walks the tree each
-  redraw; don't add draw-command caching until profiling demands it.
+  redraw regardless of backend; don't add draw-command caching until profiling demands it.
 - **Solver** is a compact two-pass measure-then-distribute (a flex approximation: no min/max or
   wrap) plus CSS-grid-lite (`Display::Grid`: fixed/auto/fr tracks, row-major auto-place with
   span — no named lines/`minmax()`/`auto-fit`/dense packing). Swappable for `taffy` later
@@ -716,16 +766,26 @@ putting something in the wrong crate. Dependency arrows point one direction only
 
 ### Runtime gotchas (learned the hard way — don't regress these)
 
-- **`request_redraw()` from inside `RedrawRequested` is not a reliable way to keep animating.**
-  Driving continued redraws (e.g. an in-flight `transition`) must go through `ControlFlow`
-  directly: `event_loop.set_control_flow(ControlFlow::Poll)` while `Transitions::any_active()`,
-  back to `ControlFlow::Wait` once it isn't (`App::redraw` takes `&ActiveEventLoop` for exactly
-  this). On Windows, a self-requested `request_redraw()`-only scheme visibly stalls — the redraw
-  gets coalesced with the current frame instead of scheduling a new one.
+- **Frame pacing is `about_to_wait`'s job, not `redraw`'s.** The engine runs a fixed 60fps loop
+  (`FRAME_INTERVAL`): `App::about_to_wait` compares against `next_frame`, requests a redraw and
+  advances `next_frame` by exactly `FRAME_INTERVAL` (not `now + FRAME_INTERVAL`, to avoid drift
+  accumulating over a long session — except when the app genuinely fell behind, e.g. the window
+  was minimized, in which case it resyncs to `now + FRAME_INTERVAL` instead of firing a catch-up
+  burst), then reschedules `ControlFlow::WaitUntil(next_frame)`. `WindowEvent::RedrawRequested`
+  calls `redraw()` unconditionally — no dirty-flag gate — since every tick redraws regardless of
+  whether anything changed. Older code/comments describing an on-demand, `ControlFlow::Poll`-
+  while-a-transition-is-active scheme are stale; transitions and delayed `onLoad` timers
+  (`pending_on_load_timers`) still work exactly as before, they just no longer need to drive
+  `ControlFlow` themselves, since it's always ticking now.
+- **Delayed `onLoad` (`{onLoadDelay: ...}`) must fire *before* `refresh_dynamic_regions` in
+  `redraw`, not after.** A delayed handler often mutates state an `if`/`for` branches on (e.g. a
+  splash screen navigating away); firing it after that frame's region re-evaluation already ran
+  means the branch flip lands one frame late — `App::fire_due_on_load_timers` is deliberately
+  called first, before `Semantic::refresh_dynamic_regions`, for exactly this reason.
 - **Diagnosing "the style value looks right but nothing on screen changed":** verify the
-  *animated* (post-`Transitions::step`) value with a temporary `eprintln!`, not just the target,
-  and check the actual redraw count — a suspiciously low count means frames aren't being pumped
-  (see the `ControlFlow` gotcha above) before suspecting style-resolution logic.
+  *animated* (post-`Transitions::step`) value with a temporary `eprintln!`, not just the target —
+  now that every frame redraws unconditionally, a stale-looking screen points at state/region
+  resolution logic, not at a missed redraw the way it used to.
 
 ### Solver gotchas
 

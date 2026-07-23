@@ -49,6 +49,10 @@ const CLEAR: Color = Color { r: 0x26, g: 0x80, b: 0xd4, a: 255 };
 const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
 pub struct App<S: NowUiState> {
+    /// The OS window's title bar text — set once at `App::new` (from
+    /// `run`/`run_path`'s `window_title` argument) and applied in `resumed`
+    /// when the winit `Window` is actually created.
+    title: String,
     ui: Ui,
     /// The live app state `value`/event bindings read from and dispatch to —
     /// usually a `#[derive(NowUiState)]` struct; `nowui_core::NoState` for
@@ -113,8 +117,9 @@ pub struct App<S: NowUiState> {
 }
 
 impl<S: NowUiState> App<S> {
-    pub fn new(ui: Ui, state: S, semantic: crate::semantic::Semantic, backend: Backend) -> Self {
+    pub fn new(title: String, ui: Ui, state: S, semantic: crate::semantic::Semantic, backend: Backend) -> Self {
         App {
+            title,
             ui,
             state,
             window: None,
@@ -985,7 +990,7 @@ fn apply_resolved_templates(kind: &mut NodeKind, values: &[String]) {
 impl<S: NowUiState> ApplicationHandler for App<S> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
-            .with_title("NowUI")
+            .with_title(self.title.clone())
             .with_inner_size(winit::dpi::LogicalSize::new(1024.0, 640.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let size = window.inner_size();
@@ -1247,7 +1252,7 @@ mod tests {
         let id = ui.push(Node::new(NodeKind::Container, style));
         ui.add_layer(id, "main");
 
-        let mut app = App::new(ui, DemoState { width: 250.0 }, crate::semantic::Semantic::new(&[]), Backend::Cpu);
+        let mut app = App::new("test".to_string(), ui, DemoState { width: 250.0 }, crate::semantic::Semantic::new(&[]), Backend::Cpu);
         app.resolve_dynamic_styles();
 
         assert_eq!(app.ui.get(id).base_style.width, Sizing::Fixed(250.0));
@@ -1261,7 +1266,7 @@ mod tests {
         let id = ui.push(Node::new(NodeKind::Container, style));
         ui.add_layer(id, "main");
 
-        let mut app = App::new(ui, DemoState::default(), crate::semantic::Semantic::new(&[]), Backend::Cpu);
+        let mut app = App::new("test".to_string(), ui, DemoState::default(), crate::semantic::Semantic::new(&[]), Backend::Cpu);
         app.resolve_dynamic_styles();
 
         assert_eq!(app.ui.get(id).base_style.width, Sizing::Hug, "left at its default");
@@ -1285,7 +1290,7 @@ mod tests {
         let mut sem = crate::semantic::Semantic::new(&ast);
         let ui = sem.build("T", &S::default()).unwrap();
 
-        let mut app = App::new(ui, S::default(), sem, Backend::Cpu);
+        let mut app = App::new("test".to_string(), ui, S::default(), sem, Backend::Cpu);
         app.dispatch_pending_on_load();
         assert_eq!(app.state.load_count, 0, "queued, not fired yet — the delay hasn't elapsed");
         assert_eq!(app.pending_on_load_timers.len(), 1);
@@ -1326,7 +1331,7 @@ mod tests {
         let state = S { page: "a".to_string() };
         let ui = sem.build("T", &state).unwrap();
 
-        let mut app = App::new(ui, state, sem, Backend::Cpu);
+        let mut app = App::new("test".to_string(), ui, state, sem, Backend::Cpu);
         app.dispatch_pending_on_load();
         assert_eq!(app.pending_on_load_timers.len(), 1, "queued, not fired — delay hasn't elapsed yet");
 
@@ -1359,7 +1364,7 @@ mod tests {
         let mut sem = crate::semantic::Semantic::new(&ast);
         let ui = sem.build("T", &S::default()).unwrap();
 
-        let mut app = App::new(ui, S::default(), sem, Backend::Cpu);
+        let mut app = App::new("test".to_string(), ui, S::default(), sem, Backend::Cpu);
         app.dispatch_pending_on_load();
         assert_eq!(app.state.load_count, 1);
         assert!(app.pending_on_load_timers.is_empty(), "never queued at all — no delay to wait out");
@@ -1385,7 +1390,7 @@ mod tests {
         let state = S { load_count: 0, rows: vec![1] };
         let ui = sem.build("T", &state).unwrap();
 
-        let mut app = App::new(ui, state, sem, Backend::Cpu);
+        let mut app = App::new("test".to_string(), ui, state, sem, Backend::Cpu);
         app.dispatch_pending_on_load();
         assert_eq!(app.state.load_count, 2, "the static Container plus the one initial row");
 
@@ -1402,7 +1407,7 @@ mod tests {
         let menu = ui.push(Node::new(NodeKind::Menu { label: "Preferences".to_string(), open: false }, Style::default()));
         ui.get_mut(menu).children = vec![item];
         ui.add_layer(menu, "main");
-        let mut app = App::new(ui, nowui_core::NoState, crate::semantic::Semantic::new(&[]), Backend::Cpu);
+        let mut app = App::new("test".to_string(), ui, nowui_core::NoState, crate::semantic::Semantic::new(&[]), Backend::Cpu);
 
         app.handle_click(menu);
         let NodeKind::Menu { open, .. } = &app.ui.get(menu).kind else { panic!() };
@@ -1438,7 +1443,7 @@ mod tests {
         // normal in-flow hit-testing — clicking it goes through
         // `select_menu_item`, mirroring `select_dropdown_option`.
         ui.get_mut(item).computed = Rect::new(0.0, 40.0, 100.0, 20.0);
-        let mut app = App::new(ui, S::default(), crate::semantic::Semantic::new(&[]), Backend::Cpu);
+        let mut app = App::new("test".to_string(), ui, S::default(), crate::semantic::Semantic::new(&[]), Backend::Cpu);
         app.select_menu_item(menu, Point::new(10.0, 50.0));
 
         assert!(app.state.item_clicked, "MenuItem's own onClick fired, not the parent Menu's");
@@ -1465,7 +1470,7 @@ mod tests {
             Style::default(),
         ));
         ui.add_layer(id, "main");
-        (App::new(ui, nowui_core::NoState, crate::semantic::Semantic::new(&[]), Backend::Cpu), id)
+        (App::new("test".to_string(), ui, nowui_core::NoState, crate::semantic::Semantic::new(&[]), Backend::Cpu), id)
     }
 
     fn text_input_state(app: &App<nowui_core::NoState>, id: NodeId) -> (String, usize, Option<usize>) {

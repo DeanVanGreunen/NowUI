@@ -29,7 +29,7 @@ impl Row {
 }
 
 fn main() -> ExitCode {
-    nowui_runtime::run( "App", App {
+    nowui_runtime::run( "Counter App", "App", App {
         username: "".to_string(),
         password: "".to_string(),
         rows: vec![Row { id: "x".to_string(), label:"x".to_string()}],

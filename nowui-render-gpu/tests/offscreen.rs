@@ -5,6 +5,8 @@
 //! color-space pipelines — see `nowui-render-gpu/src/lib.rs`'s module doc)
 //! — a coarse tolerance is deliberate, not a placeholder to tighten later.
 
+use std::sync::Mutex;
+
 use nowui_core::{Color, Edges, Painter, Rect};
 use nowui_render_gpu::{GpuFontCache, GpuPainter};
 use vello::wgpu;
@@ -12,6 +14,16 @@ use vello::wgpu;
 const WHITE: Color = Color { r: 255, g: 255, b: 255, a: 255 };
 const RED: Color = Color { r: 220, g: 30, b: 30, a: 255 };
 const BLUE: Color = Color { r: 30, g: 30, b: 220, a: 255 };
+
+/// Rust's test harness runs every `#[test]` fn in this binary concurrently
+/// by default, and each `render_gpu` call spins up its own `wgpu::Instance`/
+/// `Device` — several alive at once (especially the text tests, whose glyph
+/// atlas allocations are larger) can exhaust a driver's resource limits and
+/// fail with a spurious `wgpu error: Out of Memory` that has nothing to do
+/// with the scene being rendered. Serialize GPU device creation/use across
+/// tests in this binary to avoid that; it's the tests fighting each other
+/// for GPU resources, not a real per-scene resource problem.
+static GPU_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 async fn create_device() -> (wgpu::Device, wgpu::Queue) {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -23,6 +35,7 @@ async fn create_device() -> (wgpu::Device, wgpu::Queue) {
 }
 
 fn render_gpu(width: u32, height: u32, draw: impl FnOnce(&mut GpuPainter)) -> Vec<u8> {
+    let _guard = GPU_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (device, queue) = pollster::block_on(create_device());
     let mut renderer = vello::Renderer::new(
         &device,
