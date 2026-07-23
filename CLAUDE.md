@@ -175,6 +175,16 @@ nowui-runtime/   loader (# imports), semantic pass (incl. dynamic if/for region 
                  dynamic.rs (expression evaluator + loop-variable substitution), transitions
                  driver, winit app (lib + binary `nowui`); generic App<S: NowUiState> resolves
                  values, dispatches events, and refreshes dynamic regions every redraw
+nowui-lsp/       standalone editor-tooling crate — a language server (binary `nowui-lsp`, over
+                 stdio) for `.nowui` files: syntax highlighting via `textDocument/
+                 semanticTokens/full` (tokenizer.rs — a lexer independent of nowui-syntax's AST,
+                 since ast::Node carries no source spans) and parse-error diagnostics via
+                 nowui_syntax::parse. Depends on nowui-syntax only (compile-time editor tooling,
+                 not shipped in any NowUI app binary — doesn't participate in the "no chumsky in
+                 nowui-core" hard rule, which is about the runtime model crate specifically).
+nowui-extension/ the VS Code client (TypeScript/npm, not a Cargo workspace member) — registers
+                 the `nowui` language and spawns nowui-lsp as a language client. See its own
+                 README.md for the dev workflow (npm install && npm run compile, then F5).
 examples/counter-app/           standalone workspace member (own Cargo.toml, package
                                  `nowui-login-app`, binary `login-app`) — a login-form-shaped
                                  reactivity demo exercising `if`/`else if`/`else`, `for`, and a
@@ -200,9 +210,12 @@ nowui-runtime/examples/counter.rs + counter.nowui   a smaller `#[derive(NowUiSta
 [workspace]
 members = [
     "nowui-syntax", "nowui-core", "nowui-macros",
-    "nowui-render", "nowui-runtime", "examples/counter-app",
+    "nowui-render", "nowui-runtime", "nowui-lsp", "examples/counter-app",
 ]
 ```
+
+`nowui-extension` is a separate npm project (not a Cargo workspace member — it has no Rust code
+of its own) living alongside these at the repo root.
 
 ### Running things
 
@@ -210,11 +223,15 @@ members = [
 cargo test -p nowui-syntax                                    # parser, no window
 cargo test -p nowui-core                                      # solver/paint, no window
 cargo test -p nowui-runtime                                   # semantic/reactivity/app, no window
+cargo test -p nowui-lsp                                        # tokenizer/line-index, no editor needed
 cargo test --workspace                                        # everything
 
 cargo run -p nowui-runtime -- examples/counter-app/src/login.nowui App   # opens a window, no Rust state
 cargo run -p nowui-login-app                                             # opens a window, bundled .nowui + real state
 cargo run -p nowui-runtime --example counter                             # opens a window, on-disk .nowui + real state
+
+cargo build -p nowui-lsp                                       # builds target/debug/nowui-lsp[.exe]
+cd nowui-extension && npm install && npm run compile            # then F5 in VS Code — see its README.md
 ```
 
 ### Roadmap status (each step runnable before the next)
@@ -668,3 +685,36 @@ where every `get`/`set`/`call` returns `None`/`false`:
 ```sh
 cargo run -p nowui-runtime -- path/to/file.nowui EntryLayoutName
 ```
+
+---
+
+## Editor tooling (`nowui-lsp` + `nowui-extension`)
+
+`.nowui` syntax highlighting is provided by a real language server, not a static TextMate
+grammar — `nowui-lsp` (a Rust binary, LSP over stdio) talks to `nowui-extension` (a VS Code
+client, TypeScript/npm) via `vscode-languageclient`.
+
+- **`nowui-lsp`** implements two things: `textDocument/semanticTokens/full` (the actual
+  highlighting) and `publishDiagnostics` (parse errors, via `nowui_syntax::parse` — the same
+  parser everything else uses, so a diagnostic here means the file genuinely won't build).
+  Highlighting is driven by `tokenizer.rs`, a **standalone lexer**, deliberately not built on
+  `nowui_syntax`'s AST — `ast::Node` carries no source spans at all (see its own module doc
+  comment), and threading spans through every AST variant just for editor tooling would be a
+  large, unrelated change to the parser crate. The tokenizer is single-pass, best-effort, and
+  documents its own simplifications (no `${...}` sub-highlighting inside a backtick, no
+  punctuation tokens, a heuristic — not the parser's real grammar-position rule — for
+  telling a `variant:key` compound style token apart from a `{key: value}` binding's colon).
+  `line_index.rs` converts its char-offset spans (and `chumsky::Simple<char>`'s parse-error
+  spans — also char-offsets) into LSP's UTF-16-code-unit `Position`s.
+  Depends on `nowui-syntax` directly (for `parse`) — this is compile-time-only editor tooling
+  that ships in no NowUI app binary, so it doesn't participate in `nowui-core`'s "no chumsky"
+  hard rule, which is specifically about the runtime *model* crate staying parser-agnostic.
+  `TextDocumentSyncKind::FULL` (simplest correct option — re-tokenizing a whole `.nowui` file on
+  every keystroke is cheap) — no incremental sync, no completion/hover/go-to-definition yet.
+- **`nowui-extension`** is a thin client: `src/extension.ts` resolves the `nowui-lsp` executable
+  (the `nowui.serverPath` setting, then `target/debug|release/nowui-lsp[.exe]` under an open
+  workspace folder, then bare `nowui-lsp` on `PATH`) and starts a `LanguageClient` over stdio.
+  `language-configuration.json` covers comment-toggling/bracket-matching (editing ergonomics, not
+  highlighting — that's the server's job via semantic tokens). Not a Cargo workspace member; see
+  its own `README.md` for the npm dev workflow (`npm install && npm run compile`, then F5 to
+  launch an Extension Development Host).
