@@ -1,0 +1,56 @@
+{
+  "name": "nowui-extension",
+  "displayName": "NowUI",
+  "description": "Syntax highlighting and diagnostics for .nowui files, via the nowui-lsp language server.",
+  "version": "0.1.0",
+  "private": true,
+  "publisher": "nowui",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:nowui"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "nowui",
+        "aliases": [
+          "NowUI",
+          "nowui"
+        ],
+        "extensions": [
+          ".nowui"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "configuration": {
+      "title": "NowUI",
+      "properties": {
+        "nowui.serverPath": {
+          "type": "string",
+          "default": "",
+          "description": "Path to the nowui-lsp executable. Leave empty to auto-detect target/debug or target/release under the open workspace's root, falling back to PATH (e.g. after `cargo install --path nowui-lsp`)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

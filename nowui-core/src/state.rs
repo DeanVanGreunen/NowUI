@@ -9,18 +9,38 @@
 //! `#[derive(NowUiState)]` in the sibling `nowui-macros` crate; the runtime
 //! (`nowui-runtime`) is what calls `get`/`set`/`call` each frame.
 
+use crate::arena::Node;
 use crate::geometry::Point;
 
 /// A value crossing the reflection boundary in either direction: read from a
 /// widget's bound state field, or written back to it (e.g. a dragged
 /// `Slider`). Intentionally small — just the widget-displayable scalar types
 /// `#[derive(NowUiState)]` currently supports (`String`, `bool`, and numeric
-/// fields normalized to `f64`/`i64`). Not a general-purpose `Value` type.
+/// fields, kept as separate `Int`/`Float` variants rather than one collapsed
+/// `Number(f64)` — the derive knows a field's real Rust type (`i32` vs.
+/// `f64`), and losing that at the `StateValue` boundary meant display code
+/// had to *guess* whether e.g. `3.0` was an integer or a whole-number float
+/// via `n.fract() == 0.0`, which is both a guess and wrong for a float that
+/// genuinely lands on a whole number this frame). Not a general-purpose
+/// `Value` type.
+/// `List` backs a `for IDENT in state.path { ... }` loop's iterable — see
+/// `nowui-runtime`'s `dynamic.rs`. Elements are themselves `StateValue`s:
+/// either scalars (`Vec<String>`/`Vec<bool>`/`Vec<{int}>`/`Vec<{float}>`) or,
+/// via `Object`, a snapshot of a `Vec<T: NowUiState>` element (`T` deriving
+/// `NowUiState` itself) — see `NowUiState::to_state_value`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum StateValue {
     Str(String),
-    Number(f64),
+    Int(i64),
+    Float(f64),
     Bool(bool),
+    List(Vec<StateValue>),
+    /// A snapshot of a `#[derive(NowUiState)]` struct's fields (name, value,
+    /// in declaration order) — how a `Vec<T>` element that *isn't* a scalar
+    /// crosses into a `for` loop's iterable, so `${item.field}` can resolve
+    /// per-iteration (see `nowui-runtime`'s `dynamic.rs`). Not a general
+    /// live handle — a one-time copy, same as every other `StateValue`.
+    Object(Vec<(String, StateValue)>),
 }
 
 impl StateValue {
@@ -31,9 +51,60 @@ impl StateValue {
         }
     }
 
+    pub fn as_list(&self) -> Option<&[StateValue]> {
+        match self {
+            StateValue::List(l) => Some(l),
+            _ => None,
+        }
+    }
+
+    pub fn as_object(&self) -> Option<&[(String, StateValue)]> {
+        match self {
+            StateValue::Object(fields) => Some(fields),
+            _ => None,
+        }
+    }
+
+    /// Look up a field by name on an `Object` — `None` for any other
+    /// variant, or if the field isn't present.
+    pub fn get_field(&self, name: &str) -> Option<&StateValue> {
+        self.as_object()?.iter().find(|(k, _)| k == name).map(|(_, v)| v)
+    }
+
+    /// Whether this value counts as "true" when used bare as an `if`
+    /// condition (`if state.loggedIn { ... }`, not a comparison) — the usual
+    /// scripting-language convention: a real `bool`, a non-empty string, a
+    /// nonzero number, or a non-empty list/object.
+    pub fn truthy(&self) -> bool {
+        match self {
+            StateValue::Bool(b) => *b,
+            StateValue::Str(s) => !s.is_empty(),
+            StateValue::Int(n) => *n != 0,
+            StateValue::Float(n) => *n != 0.0,
+            StateValue::List(l) => !l.is_empty(),
+            StateValue::Object(fields) => !fields.is_empty(),
+        }
+    }
+
+    /// Any numeric variant, widened to `f64` — used by code that just needs
+    /// a number regardless of whether the field behind it is an int or a
+    /// float (e.g. `Slider`/`ProgressBar`'s `0..=100` percent math).
     pub fn as_f64(&self) -> Option<f64> {
         match self {
-            StateValue::Number(n) => Some(*n),
+            StateValue::Int(n) => Some(*n as f64),
+            StateValue::Float(n) => Some(*n),
+            _ => None,
+        }
+    }
+
+    /// Any numeric variant, narrowed to `i64` (a `Float` is truncated, same
+    /// as a plain `as i64` cast) — for a field that's declared as an integer
+    /// type but is being written from a value that happens to be a `Float`
+    /// (e.g. a `Slider`'s value, always `Float`, bound to an `i64` field).
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            StateValue::Int(n) => Some(*n),
+            StateValue::Float(n) => Some(*n as i64),
             _ => None,
         }
     }
@@ -61,14 +132,23 @@ pub enum EventKind {
 }
 
 /// Passed to a dispatched handler method (`fn increment(&mut self, event:
-/// &nowui_core::Event)`). Fields are populated only when meaningful for
+/// &mut nowui_core::Event)`). Fields are populated only when meaningful for
 /// `kind` (e.g. `key` is `None` for mouse events) — a placeholder-era
 /// equivalent of a DOM event object, not a complete one.
-#[derive(Debug, Clone)]
-pub struct Event {
+///
+/// `node` is a live handle to the arena node the event fired on — every
+/// field on `Node` is `pub`, so a handler can read/write its `style`
+/// (`event.node.style.opacity = 0.5`), flip `kind`-specific state
+/// (`NodeKind::Checkbox { checked, .. }`), inspect `computed`/`children`,
+/// etc., in addition to (or instead of) mutating `self`. It borrows the live
+/// arena for the duration of the call, so `Event` can't be `Clone` — build a
+/// fresh one per dispatch (see `nowui-runtime`'s `App::dispatch_event`).
+#[derive(Debug)]
+pub struct Event<'a> {
     pub kind: EventKind,
     pub cursor: Point,
     pub key: Option<String>,
+    pub node: &'a mut Node,
 }
 
 /// Implemented by a live application state object — usually via
@@ -92,7 +172,71 @@ pub trait NowUiState {
     /// `["counter", "increment"]` for an `{onClick: state.counter.increment}`
     /// binding), passing `event`. Returns `false` if no such method is
     /// declared (see `#[nowui(methods(...))]` on the derive).
-    fn call(&mut self, path: &[&str], event: &Event) -> bool;
+    fn call(&mut self, path: &[&str], event: &mut Event<'_>) -> bool;
+
+    /// Snapshot `self` as a `StateValue::Object` (field name -> value, in
+    /// declaration order). Used only when `Self` is a `Vec<T>` element type
+    /// on some *other* state struct (`T: NowUiState`) — that outer struct's
+    /// derive calls this generically through the trait bound to convert
+    /// each element for a `for`-loop's iterable, since it has no visibility
+    /// into `T`'s own field list at macro-expansion time (separate derive
+    /// invocations don't share information). Default returns an empty
+    /// object (an opt-out for `NoState`/hand-written impls) —
+    /// `#[derive(NowUiState)]` always overrides it to enumerate the exact
+    /// same fields `get`/`set` already know about.
+    fn to_state_value(&self) -> StateValue {
+        StateValue::Object(Vec::new())
+    }
+
+    /// The `.nowui` source bundled into the binary for this state type, if
+    /// any — set via `#[nowui(view("/path.nowui"))]` on the derive, which
+    /// embeds the file's contents at compile time with `include_str!` (path
+    /// resolved relative to the crate's own `src/` directory), so the
+    /// running executable needs no `.nowui` file on disk at all. Default
+    /// `None` (the common case: `nowui_runtime::run_path` loads from disk
+    /// instead). `where Self: Sized` keeps the trait object-safe for the
+    /// `&dyn NowUiState` uses elsewhere (`nowui-runtime`'s semantic pass) —
+    /// a `Self`-returning associated function with no receiver can't go
+    /// through a vtable, but doesn't have to since callers always know the
+    /// concrete `S` when they'd want this.
+    fn nowui_view() -> Option<&'static str>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    /// The literal path given to `#[nowui(view("..."))]` (e.g. `"/login.nowui"`),
+    /// so `nowui_runtime::run` can work out the bundled entry's own `#`-import
+    /// base directory (`nowui_syntax::import_dirname`) the same way
+    /// `nowui_view_imports`'s keys were computed. `None` alongside
+    /// `nowui_view() == None` when there's no bundled view at all.
+    fn nowui_view_path() -> Option<&'static str>
+    where
+        Self: Sized,
+    {
+        None
+    }
+
+    /// Every file transitively `#`-imported by the bundled view, embedded at
+    /// compile time too — the derive macro walks the whole import graph
+    /// starting from `#[nowui(view(...))]`'s entry file (reading and parsing
+    /// each file it finds, recursively, at macro-expansion time) and embeds
+    /// each one's contents via `include_str!`, so a bundled entry file is no
+    /// longer required to be import-free. Each pair is `(key, source)` where
+    /// `key` is the import's path normalized relative to the bundled view's
+    /// own `src/`-relative root (via `nowui_syntax::join_import_path`) —
+    /// `nowui_runtime`'s loader re-derives the same key for each `#`-import
+    /// it encounters while expanding the bundled source, and looks it up
+    /// here instead of reading a file. `Some(&[])` (not `None`) when
+    /// `view(...)` is set but the file has no imports. `None` when there's
+    /// no bundled view at all.
+    fn nowui_view_imports() -> Option<&'static [(&'static str, &'static str)]>
+    where
+        Self: Sized,
+    {
+        None
+    }
 }
 
 /// The state object the plain `nowui` CLI binary uses for `.nowui` files
@@ -110,7 +254,35 @@ impl NowUiState for NoState {
     fn set(&mut self, _path: &[&str], _value: StateValue) -> bool {
         false
     }
-    fn call(&mut self, _path: &[&str], _event: &Event) -> bool {
+    fn call(&mut self, _path: &[&str], _event: &mut Event<'_>) -> bool {
         false
+    }
+}
+
+/// Render a `StateValue` for display — whichever variant it is, without the
+/// caller needing to know the field's original type. Shared by
+/// `nowui-runtime`'s `App::display_string` use sites (`Text` content,
+/// backtick templates, dynamic style values) and `dynamic.rs`'s `for`-loop
+/// signature/`${var}` substitution, so both agree on exactly how e.g. a
+/// `Float` looks as text. `Int`/`Float` are kept distinct on purpose (see
+/// `StateValue`'s doc comment) — `Int` never carries a decimal point,
+/// `Float` always does, even on a whole number (`3.0`, not `3`). `List`/
+/// `Object` have no sensible single-line rendering as arbitrary display
+/// text, so they render as a placeholder — either is meant to be iterated
+/// with `for`/accessed field-by-field (`${item.field}`), not shown whole.
+pub fn display_string(value: &StateValue) -> String {
+    match value {
+        StateValue::Str(s) => s.clone(),
+        StateValue::Bool(b) => b.to_string(),
+        StateValue::Int(n) => n.to_string(),
+        StateValue::Float(n) => {
+            if n.fract() == 0.0 {
+                format!("{n:.1}")
+            } else {
+                format!("{n}")
+            }
+        }
+        StateValue::List(items) => format!("[{} items]", items.len()),
+        StateValue::Object(fields) => format!("{{{} fields}}", fields.len()),
     }
 }

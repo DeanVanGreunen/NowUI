@@ -1,0 +1,10 @@
+// Minimal end-to-end reactivity demo backing nowui-runtime/examples/counter.rs.
+// Run:  cargo run -p nowui-runtime --example counter
+
+layout: App w-[fill] h-[fill] items-center justify-center gap-4 bg-gray-100 {
+  Text `Count: ${state.counter.count}` text-2xl font-semibold text-gray-800
+  Container row gap-3 {
+    Button `-` w-[48px] text-center text-white bg-gray-600 rounded py-2 {onClick: state.counter.decrement}
+    Button `+` w-[48px] text-center text-white bg-blue-600 rounded py-2 {onClick: state.counter.increment}
+  }
+}

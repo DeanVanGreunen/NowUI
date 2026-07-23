@@ -1,0 +1,6 @@
+# widgets/Badge.nowui
+
+layout: App {
+  Badge
+  Text `bundled view with an import graph`
+}

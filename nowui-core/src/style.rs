@@ -184,6 +184,13 @@ pub struct Style {
     /// mouse wheel to pan it (see `nowui-runtime`'s wheel handler).
     pub scroll_x: bool,
     pub scroll_y: bool,
+    /// `multi` bare flag: a `TextInput` wraps at its own box width and
+    /// treats Enter as a literal `\n` instead of ignoring it, rather than
+    /// the single-line, horizontally-scrolling default. See CLAUDE.md's
+    /// `TextInput` section for exactly what "wrapping" does and doesn't
+    /// account for (explicit `\n` line breaks are caret/selection-aware;
+    /// word-wrap-induced line breaks are visually correct but not).
+    pub multiline: bool,
     pub bg: Option<Color>,
     pub text_color: Color,
     pub text_align: TextAlign,
@@ -227,11 +234,11 @@ pub struct Style {
     /// here — keyed by the style key it would otherwise have set (`"w"`,
     /// `"bg-color"`, ...) — instead of being parsed as a literal. The
     /// corresponding field is left at whatever it already was (its default,
-    /// or an earlier class's value) since there's no live state object yet
-    /// to resolve it against (roadmap step 6, reactivity — same status as
-    /// `${var}` in backtick text and `Node::value_path`/`events`). Mixed
-    /// literal+variable values (`"10${state.x}px"`) are NOT supported — the
-    /// whole bracket must be the interpolation.
+    /// or an earlier class's value) until `nowui-runtime`'s
+    /// `App::resolve_dynamic_styles` resolves it against live state each
+    /// redraw (see CLAUDE.md's "Reactivity" section). Mixed literal+variable
+    /// values (`"10${state.x}px"`) are NOT supported — the whole bracket
+    /// must be the interpolation.
     pub dynamic: HashMap<String, Vec<String>>,
 }
 
@@ -251,6 +258,7 @@ impl Default for Style {
             margin: Edges::default(),
             scroll_x: false,
             scroll_y: false,
+            multiline: false,
             bg: None,
             text_color: Color::BLACK,
             text_align: TextAlign::Left,

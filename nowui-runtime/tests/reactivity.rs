@@ -9,7 +9,7 @@
 //! delegating `call` arm for every non-scalar field, exactly parallel to
 //! `get`/`set`.
 
-use nowui_core::{Event, EventKind, NowUiState, Point};
+use nowui_core::{Event, EventKind, Node, NodeKind, NowUiState, Point, Style};
 
 #[derive(Default, Clone, NowUiState)]
 struct AppState {
@@ -23,26 +23,27 @@ struct Counter {
 }
 
 impl Counter {
-    fn increment(&mut self, _event: &Event) {
+    fn increment(&mut self, _event: &mut Event) {
         self.count += 1;
     }
 
-    fn decrement(&mut self, _event: &Event) {
+    fn decrement(&mut self, _event: &mut Event) {
         self.count -= 1;
     }
 }
 
-fn click() -> Event {
-    Event { kind: EventKind::Click, cursor: Point::default(), key: None }
+fn click(node: &mut Node) -> Event<'_> {
+    Event { kind: EventKind::Click, cursor: Point::default(), key: None, node }
 }
 
 #[test]
 fn call_delegates_through_a_nested_state_field() {
     let mut state = AppState::default();
+    let mut node = Node::new(NodeKind::Container, Style::default());
 
-    assert!(state.call(&["counter", "increment"], &click()));
-    assert!(state.call(&["counter", "increment"], &click()));
-    assert!(state.call(&["counter", "decrement"], &click()));
+    assert!(state.call(&["counter", "increment"], &mut click(&mut node)));
+    assert!(state.call(&["counter", "increment"], &mut click(&mut node)));
+    assert!(state.call(&["counter", "decrement"], &mut click(&mut node)));
 
     assert_eq!(state.counter.count, 1);
 }
@@ -50,6 +51,29 @@ fn call_delegates_through_a_nested_state_field() {
 #[test]
 fn call_returns_false_for_an_unknown_path() {
     let mut state = AppState::default();
-    assert!(!state.call(&["counter", "nope"], &click()));
-    assert!(!state.call(&["nope"], &click()));
+    let mut node = Node::new(NodeKind::Container, Style::default());
+    assert!(!state.call(&["counter", "nope"], &mut click(&mut node)));
+    assert!(!state.call(&["nope"], &mut click(&mut node)));
+}
+
+#[test]
+fn handler_can_mutate_the_originating_node() {
+    // The event carries a live handle to the node it fired on — a handler
+    // can reach into its style/kind directly, not just `self`.
+    #[derive(Default, Clone, NowUiState)]
+    #[nowui(methods(hide))]
+    struct Hider {
+        _unused: bool,
+    }
+    impl Hider {
+        fn hide(&mut self, event: &mut Event) {
+            event.node.style.opacity = 0.0;
+        }
+    }
+
+    let mut state = Hider::default();
+    let mut node = Node::new(NodeKind::Container, Style::default());
+    assert_ne!(node.style.opacity, 0.0);
+    assert!(state.call(&["hide"], &mut click(&mut node)));
+    assert_eq!(node.style.opacity, 0.0);
 }

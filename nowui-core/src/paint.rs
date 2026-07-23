@@ -8,16 +8,19 @@ use crate::painter::{Painter, TextStyle};
 use crate::style::{Position, TextAlign};
 
 pub fn paint(ui: &Ui, painter: &mut dyn Painter) {
-    // Open `Dropdown`s are collected here instead of drawn inline, so their
-    // option list floats on top of *everything* (drawn after every layer,
+    // Open `Dropdown`s/`Menu`s are collected here instead of drawn inline, so
+    // their popup floats on top of *everything* (drawn after every layer,
     // once no ancestor clip is active) instead of being clipped by whatever
-    // container it happens to sit in — see `paint_dropdown_popup`.
+    // container it happens to sit in — see `paint_dropdown_popup`/
+    // `paint_menu_popup`. `popups` mixes both kinds; each pop-up fn matches
+    // its own `NodeKind` and no-ops (returns early) on the other's ids.
     let mut popups = Vec::new();
     for layer in &ui.layers {
         paint_node(ui, layer.root, painter, &mut popups);
     }
     for id in popups {
         paint_dropdown_popup(ui, id, painter);
+        paint_menu_popup(ui, id, painter);
     }
 }
 
@@ -65,17 +68,21 @@ fn paint_node(ui: &Ui, id: NodeId, painter: &mut dyn Painter, popups: &mut Vec<N
         NodeKind::Button { label } => {
             painter.draw_text(label, content_rect, &text_style);
         }
-        NodeKind::TextInput { placeholder, masked, .. } => {
-            // Show the bound value if present; otherwise the placeholder.
-            // (Value resolution against `node.value_path` and live app state
-            // happens in the runtime; here we render the placeholder as the
-            // boxes-first default.)
-            let shown = if *masked && !placeholder.is_empty() {
-                placeholder.clone()
-            } else {
-                placeholder.clone()
-            };
-            painter.draw_text(&shown, content_rect, &text_style);
+        NodeKind::TextInput { label, placeholder, masked, cursor, selection_anchor, ime_preview } => {
+            paint_text_input(
+                painter,
+                content_rect,
+                &text_style,
+                style,
+                label,
+                placeholder,
+                *masked,
+                *cursor,
+                *selection_anchor,
+                ime_preview,
+                ui.focus == Some(id),
+                node.scroll_offset,
+            );
         }
         NodeKind::Checkbox { label, checked } => {
             let box_size = style.font_size;
@@ -186,8 +193,28 @@ fn paint_node(ui: &Ui, id: NodeId, painter: &mut dyn Painter, popups: &mut Vec<N
                 popups.push(id);
             }
         }
+        NodeKind::Menu { label, open, .. } => {
+            painter.draw_text(label, content_rect, &text_style);
+            // Deferred: see `paint_menu_popup` — floats on top of everything
+            // once the whole tree has painted, same as `Dropdown`'s popup.
+            // Only queued when there's actually something to show: a Menu
+            // with no children must never produce a popup, open or not.
+            if *open && !node.children.is_empty() {
+                popups.push(id);
+            }
+        }
+        NodeKind::MenuItem { label } => {
+            painter.draw_text(label, content_rect, &text_style);
+        }
         NodeKind::Container => {}
     }
+
+    // A `Menu`'s children never paint as normal in-flow children — open or
+    // closed, they never got a real in-flow `computed` rect either (see
+    // `layout::arrange`'s own comment); they only ever appear via the
+    // floating `paint_menu_popup` above, using the rects `arrange_menu_
+    // popups` gave them.
+    let paint_children = !matches!(&node.kind, NodeKind::Menu { .. });
 
     // Children paint on top. `z-index` reorders *paint* order only (higher
     // paints later, i.e. on top); it never changes layout, and ties keep
@@ -201,7 +228,7 @@ fn paint_node(ui: &Ui, id: NodeId, painter: &mut dyn Painter, popups: &mut Vec<N
     // stack (that push_clip is still active on the painter) — only this one
     // level of clipping is skipped, matching the "direct parent only"
     // containing-block simplification documented in CLAUDE.md.
-    if !node.children.is_empty() {
+    if paint_children && !node.children.is_empty() {
         let mut in_flow = Vec::new();
         let mut absolute = Vec::new();
         for &c in &node.children {
@@ -273,6 +300,243 @@ fn paint_dropdown_popup(ui: &Ui, id: NodeId, painter: &mut dyn Painter) {
     }
 }
 
+/// Draws an open `Menu`'s popup: a background panel sized from the popup
+/// rect `layout::arrange_menu_popups` computed and stashed in `Node::
+/// content_size`, then each `MenuItem` (or whatever real widget the author
+/// nested) painted via the ordinary `paint_node` recursion — unlike
+/// `Dropdown`'s hand-drawn text rows, Menu's children are genuine arena
+/// nodes with their own real `computed` rects from the popup arrange pass,
+/// so they can be arbitrarily complex and just paint normally. Any popups
+/// nested inside (e.g. a `Dropdown` or another `Menu` used as a `MenuItem`)
+/// are drained into their own pass so they still float correctly.
+fn paint_menu_popup(ui: &Ui, id: NodeId, painter: &mut dyn Painter) {
+    let node = ui.get(id);
+    let NodeKind::Menu { .. } = &node.kind else { return };
+
+    let style = &node.style;
+    let popup_size = node.content_size;
+    let popup_rect = Rect::new(node.computed.x, node.computed.y + node.computed.h, popup_size.w, popup_size.h);
+
+    if let Some(bg) = style.bg {
+        painter.fill_rect(popup_rect, bg, style.radius);
+    }
+    if let Some(border) = style.border_color {
+        painter.stroke_rect(popup_rect, border, 1.0, style.radius);
+    }
+
+    let mut nested_popups = Vec::new();
+    for &child in &node.children {
+        paint_node(ui, child, painter, &mut nested_popups);
+    }
+    for nested in nested_popups {
+        paint_dropdown_popup(ui, nested, painter);
+        paint_menu_popup(ui, nested, painter);
+    }
+}
+
+/// Width, in pixels, of the first `char_count` chars of `shown` — the shared
+/// building block for placing the caret and the selection highlight, both of
+/// which just need "how wide is the text up to here."
+fn char_prefix_width(painter: &mut dyn Painter, shown: &str, char_count: usize, font_size: f32) -> f32 {
+    if char_count == 0 {
+        return 0.0;
+    }
+    let prefix: String = shown.chars().take(char_count).collect();
+    painter.measure_text(&prefix, font_size).x
+}
+
+/// A `TextInput`'s full paint: placeholder-vs-value, selection highlight,
+/// caret, and an IME composition underline — all keyed off the exact same
+/// `text_input::display_string` the runtime's click hit-testing measures
+/// against (see `App::char_index_for_click`), so what's drawn and what a
+/// click lands on always agree.
+///
+/// `scroll` shifts the drawn text (and every position derived from it) so a
+/// caret past the box's edge is still visible — `App::update_text_input_
+/// scroll` (`nowui-runtime`) computes and persists it on `Node::scroll_
+/// offset` each redraw (reused here for a TextInput's own internal text
+/// view, unrelated to its normal use for `scroll-h`/`scroll-v` *containers*
+/// — a `TextInput` has no children for that mechanism to apply to).
+/// Everything is clipped to `content_rect` so the scrolled-out portion
+/// doesn't bleed past the box.
+///
+/// `style.multiline` (`multi` bare flag) switches between two entirely
+/// different layouts (see CLAUDE.md's `TextInput` section for the full
+/// design and its disclosed limitation — caret/selection placement is
+/// accurate for explicit `\n` line breaks, only approximate for word-wrap-
+/// induced ones):
+///   * single-line (default): horizontal scroll, no wrapping at all (the
+///     `draw_text` bounds are sized to the text's full natural width so
+///     cosmic-text never wraps it).
+///   * multiline: vertical scroll, real wrapping at `content_rect.w` (both
+///     explicit `\n` and word-wrap). Caret/selection Y position is derived
+///     from a *hard-line* count (`text_input::line_and_col`, split on `\n`
+///     only) — a hard line that itself wraps into multiple visual lines
+///     renders correctly as text, but the caret/selection overlay doesn't
+///     account for those extra wrapped visual lines.
+///
+/// Known simplification (see CLAUDE.md): only left-aligned text positions
+/// the caret/selection/underline correctly — `text-right`/`text-center` on a
+/// `TextInput` isn't accounted for here.
+#[allow(clippy::too_many_arguments)]
+fn paint_text_input(
+    painter: &mut dyn Painter,
+    content_rect: Rect,
+    text_style: &TextStyle,
+    style: &crate::style::Style,
+    label: &str,
+    placeholder: &str,
+    masked: bool,
+    cursor: usize,
+    selection_anchor: Option<usize>,
+    ime_preview: &str,
+    focused: bool,
+    scroll: Point,
+) {
+    let shown = crate::text_input::display_string(label, cursor, ime_preview, masked);
+
+    if shown.is_empty() {
+        painter.draw_text(placeholder, content_rect, text_style);
+        return;
+    }
+
+    painter.push_clip(content_rect);
+
+    if style.multiline {
+        paint_multiline_text_input(painter, content_rect, text_style, style, &shown, cursor, selection_anchor, ime_preview, focused, scroll.y);
+        painter.pop_clip();
+        return;
+    }
+
+    // Every x position below is computed unscrolled (as if the text started
+    // at `content_rect.x`), then shifted left by `scroll.x` right before use
+    // — so a `scroll.x` that keeps the caret in view shifts the highlight/
+    // caret/underline/text together, in lockstep.
+    //
+    // `text_rect.w` must reach at least the full natural width of `shown`,
+    // not just `content_rect.w` (or `content_rect.w + scroll.x`): `draw_text`
+    // passes `bounds.w` straight through as cosmic-text's word-wrap boundary,
+    // measured from `bounds.x`. `scroll.x` only keeps the *caret* in view —
+    // if the caret isn't at the very end (Left arrow, or a click mid-string),
+    // there can still be text after it extending further right than
+    // `content_rect.w + scroll.x`, which would then wrap onto a second,
+    // clipped-away line instead of continuing on this one. Sizing off the
+    // full measured width (not off `scroll.x`) rules that out regardless of
+    // where the caret sits — single-line mode never wants wrapping at all,
+    // only scroll+clip, so effectively-infinite width here is exactly right.
+    let full_width = painter.measure_text(&shown, style.font_size).x;
+    let text_rect = Rect { x: content_rect.x - scroll.x, w: full_width.max(content_rect.w) + 1.0, ..content_rect };
+
+    // Caret sits after the whole in-progress composition, if any — there's
+    // no inner preedit-cursor tracking (see the `ime_preview` field doc).
+    let caret_char = cursor + crate::text_input::char_len(ime_preview);
+
+    // A selection is only drawn while not mid-composition — composing while
+    // a selection is active is a rare combination this doesn't model (the
+    // composition would normally replace the selection on commit).
+    if focused && ime_preview.is_empty() {
+        if let Some(anchor) = selection_anchor {
+            let (lo, hi) = crate::text_input::ordered_range(cursor, anchor);
+            if lo != hi {
+                let x0 = text_rect.x + char_prefix_width(painter, &shown, lo, style.font_size);
+                let x1 = text_rect.x + char_prefix_width(painter, &shown, hi, style.font_size);
+                // No dedicated `selection-*` class — reuses `text_color` at
+                // low alpha, same convention as the scrollbar thumb/track.
+                let highlight = Color { a: 60, ..style.text_color };
+                painter.fill_rect(Rect::new(x0, content_rect.y, x1 - x0, content_rect.h), highlight, Edges::default());
+            }
+        }
+    }
+
+    painter.draw_text(&shown, text_rect, text_style);
+
+    if !focused {
+        painter.pop_clip();
+        return;
+    }
+
+    if !ime_preview.is_empty() {
+        let x0 = text_rect.x + char_prefix_width(painter, &shown, cursor, style.font_size);
+        let w = char_prefix_width(painter, &shown, caret_char, style.font_size) - (x0 - text_rect.x);
+        let underline_y = content_rect.y + content_rect.h - 2.0;
+        painter.fill_rect(Rect::new(x0, underline_y, w.max(1.0), 1.5), style.text_color, Edges::default());
+    }
+
+    let caret_x = text_rect.x + char_prefix_width(painter, &shown, caret_char, style.font_size);
+    painter.fill_rect(Rect::new(caret_x, content_rect.y, 1.5, content_rect.h), style.text_color, Edges::default());
+
+    painter.pop_clip();
+}
+
+/// The `style.multiline` half of `paint_text_input` — see its doc comment
+/// for the overall design and disclosed hard-line-only caret/selection
+/// limitation. Draws `shown` as a *single* `draw_text` call at
+/// `content_rect.w` (letting cosmic-text wrap it for real, both on `\n` and
+/// on overflow), then overlays selection/caret/underline positioned by
+/// hard-line count — never horizontally scrolled (wrapping replaces the
+/// need for it), only vertically, via `scroll_y`.
+#[allow(clippy::too_many_arguments)]
+fn paint_multiline_text_input(
+    painter: &mut dyn Painter,
+    content_rect: Rect,
+    text_style: &TextStyle,
+    style: &crate::style::Style,
+    shown: &str,
+    cursor: usize,
+    selection_anchor: Option<usize>,
+    ime_preview: &str,
+    focused: bool,
+    scroll_y: f32,
+) {
+    let line_h = crate::text_input::line_height(style.font_size);
+    let lines = crate::text_input::hard_lines(shown);
+    let line_y = |line: usize| content_rect.y + line as f32 * line_h - scroll_y;
+    let line_width = |painter: &mut dyn Painter, line: usize, chars: usize| -> f32 {
+        let text: String = lines[line].chars().take(chars).collect();
+        painter.measure_text(&text, style.font_size).x
+    };
+
+    let text_rect = Rect { y: content_rect.y - scroll_y, w: content_rect.w, ..content_rect };
+
+    let caret_char = cursor + crate::text_input::char_len(ime_preview);
+
+    if focused && ime_preview.is_empty() {
+        if let Some(anchor) = selection_anchor {
+            let (lo, hi) = crate::text_input::ordered_range(cursor, anchor);
+            if lo != hi {
+                let (lo_line, lo_col) = crate::text_input::line_and_col(shown, lo);
+                let (hi_line, hi_col) = crate::text_input::line_and_col(shown, hi);
+                let highlight = Color { a: 60, ..style.text_color };
+                for line in lo_line..=hi_line {
+                    let x0 = if line == lo_line { content_rect.x + line_width(painter, line, lo_col) } else { content_rect.x };
+                    let x1 = if line == hi_line { content_rect.x + line_width(painter, line, hi_col) } else { content_rect.x + content_rect.w };
+                    if x1 > x0 {
+                        painter.fill_rect(Rect::new(x0, line_y(line), x1 - x0, line_h), highlight, Edges::default());
+                    }
+                }
+            }
+        }
+    }
+
+    painter.draw_text(shown, text_rect, text_style);
+
+    if !focused {
+        return;
+    }
+
+    let (caret_line, caret_col) = crate::text_input::line_and_col(shown, caret_char);
+    let caret_x = content_rect.x + line_width(painter, caret_line, caret_col);
+
+    if !ime_preview.is_empty() {
+        let (start_line, start_col) = crate::text_input::line_and_col(shown, cursor);
+        let x0 = content_rect.x + line_width(painter, start_line, start_col);
+        let underline_y = line_y(caret_line) + line_h - 2.0;
+        painter.fill_rect(Rect::new(x0, underline_y, (caret_x - x0).max(1.0), 1.5), style.text_color, Edges::default());
+    }
+
+    painter.fill_rect(Rect::new(caret_x, line_y(caret_line), 1.5, line_h), style.text_color, Edges::default());
+}
+
 const SCROLLBAR_THICKNESS: f32 = 8.0;
 const SCROLLBAR_TRACK_DEFAULT: Color = Color { r: 0, g: 0, b: 0, a: 18 };
 const SCROLLBAR_THUMB_DEFAULT: Color = Color { r: 0, g: 0, b: 0, a: 110 };
@@ -324,6 +588,368 @@ mod tests {
         fn draw_text(&mut self, _: &str, _: Rect, _: &TextStyle) {}
         fn push_clip(&mut self, _: Rect) {}
         fn pop_clip(&mut self) {}
+    }
+
+    /// Records every `draw_text` call's string, in call order.
+    #[derive(Default)]
+    struct TextRecordingPainter(Vec<String>);
+    impl Painter for TextRecordingPainter {
+        fn fill_rect(&mut self, _: Rect, _: Color, _: Edges) {}
+        fn stroke_rect(&mut self, _: Rect, _: Color, _: f32, _: Edges) {}
+        fn draw_text(&mut self, text: &str, _: Rect, _: &TextStyle) {
+            self.0.push(text.to_string());
+        }
+        fn push_clip(&mut self, _: Rect) {}
+        fn pop_clip(&mut self) {}
+    }
+
+    /// Builds a `TextInput` with the given label/placeholder/masked and
+    /// cursor at the end, no selection, no IME composition in progress —
+    /// the common case tests start from before customizing further.
+    fn text_input_kind(label: &str, placeholder: &str, masked: bool) -> NodeKind {
+        NodeKind::TextInput {
+            label: label.to_string(),
+            placeholder: placeholder.to_string(),
+            masked,
+            cursor: label.chars().count(),
+            selection_anchor: None,
+            ime_preview: String::new(),
+        }
+    }
+
+    #[test]
+    fn text_input_shows_placeholder_only_while_label_is_empty() {
+        // Regression: `paint_node`'s TextInput arm used to render the
+        // placeholder unconditionally — `label` (the actual typed/bound
+        // value) was destructured but never read, so nothing ever appeared
+        // to update on screen even once the value did.
+        let mut ui = Ui::new();
+        let empty = ui.push(Node::new(text_input_kind("", "Enter Username", false), Style::default()));
+        let filled = ui.push(Node::new(text_input_kind("dean", "Enter Username", false), Style::default()));
+        let root = ui.push(Node::new(NodeKind::Container, Style::default()));
+        ui.get_mut(root).children = vec![empty, filled];
+        ui.add_layer(root, "main");
+
+        let mut painter = TextRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.0, vec!["Enter Username".to_string(), "dean".to_string()]);
+    }
+
+    #[test]
+    fn masked_text_input_shows_bullets_not_the_real_value() {
+        let mut ui = Ui::new();
+        let id = ui.push(Node::new(text_input_kind("hunter2", "", true), Style::default()));
+        ui.add_layer(id, "main");
+
+        let mut painter = TextRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.0, vec!["*******".to_string()]);
+    }
+
+    /// Records every `fill_rect` (rect + color), `draw_text` (string + the
+    /// `bounds` it was drawn at), and `push_clip` call, in order — lets
+    /// caret/selection/underline/scroll tests check both *that* they drew
+    /// and *where*/*when* relative to the text itself.
+    #[derive(Default)]
+    struct FullRecordingPainter {
+        fills: Vec<(Rect, Color)>,
+        texts: Vec<String>,
+        text_bounds: Vec<Rect>,
+        clips: Vec<Rect>,
+    }
+    impl Painter for FullRecordingPainter {
+        fn fill_rect(&mut self, rect: Rect, color: Color, _: Edges) {
+            self.fills.push((rect, color));
+        }
+        fn stroke_rect(&mut self, _: Rect, _: Color, _: f32, _: Edges) {}
+        fn draw_text(&mut self, text: &str, bounds: Rect, _: &TextStyle) {
+            self.texts.push(text.to_string());
+            self.text_bounds.push(bounds);
+        }
+        fn push_clip(&mut self, rect: Rect) {
+            self.clips.push(rect);
+        }
+        fn pop_clip(&mut self) {}
+    }
+
+    #[test]
+    fn unfocused_text_input_draws_no_caret_or_selection() {
+        let mut ui = Ui::new();
+        let mut kind = text_input_kind("hello", "", false);
+        if let NodeKind::TextInput { selection_anchor, .. } = &mut kind {
+            *selection_anchor = Some(0);
+        }
+        let id = ui.push(Node::new(kind, Style::default()));
+        ui.add_layer(id, "main");
+        // Not focused: `ui.focus` stays `None`.
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.texts, vec!["hello".to_string()]);
+        assert!(painter.fills.is_empty(), "no caret/selection while unfocused, even with a selection set");
+    }
+
+    #[test]
+    fn focused_text_input_draws_a_caret() {
+        let mut ui = Ui::new();
+        let id = ui.push(Node::new(text_input_kind("hello", "", false), Style::default()));
+        ui.add_layer(id, "main");
+        ui.focus = Some(id);
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.fills.len(), 1, "exactly one fill: the caret (no selection, no IME)");
+    }
+
+    #[test]
+    fn focused_text_input_with_selection_draws_a_highlight_before_the_text_and_a_caret_after() {
+        let mut ui = Ui::new();
+        let mut kind = text_input_kind("hello", "", false);
+        if let NodeKind::TextInput { cursor, selection_anchor, .. } = &mut kind {
+            *cursor = 5;
+            *selection_anchor = Some(1);
+        }
+        let id = ui.push(Node::new(kind, Style::default()));
+        ui.add_layer(id, "main");
+        ui.focus = Some(id);
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.fills.len(), 2, "selection highlight + caret");
+        let (highlight_rect, _) = painter.fills[0];
+        assert!(highlight_rect.w > 1.5, "highlight spans the 4 selected chars, wider than a 1.5px caret");
+    }
+
+    #[test]
+    fn focused_text_input_composing_shows_preview_and_underline_not_selection() {
+        let mut ui = Ui::new();
+        let mut kind = text_input_kind("ab", "", false);
+        if let NodeKind::TextInput { cursor, selection_anchor, ime_preview, .. } = &mut kind {
+            *cursor = 1;
+            *selection_anchor = Some(0); // active selection...
+            *ime_preview = "X".to_string(); // ...but composing takes priority
+        }
+        let id = ui.push(Node::new(kind, Style::default()));
+        ui.add_layer(id, "main");
+        ui.focus = Some(id);
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.texts, vec!["aXb".to_string()], "preview spliced in at the cursor");
+        assert_eq!(painter.fills.len(), 2, "underline + caret, no selection highlight while composing");
+    }
+
+    #[test]
+    fn text_input_clips_to_its_content_rect() {
+        let mut ui = Ui::new();
+        let id = ui.push(Node::new(text_input_kind("hello", "", false), Style::default()));
+        ui.get_mut(id).computed = Rect::new(5.0, 5.0, 100.0, 30.0);
+        ui.add_layer(id, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.clips, vec![Rect::new(5.0, 5.0, 100.0, 30.0)]);
+    }
+
+    #[test]
+    fn empty_text_input_showing_the_placeholder_does_not_clip() {
+        // The early-return-to-placeholder path skips push_clip entirely —
+        // nothing to scroll/clip when there's no value yet.
+        let mut ui = Ui::new();
+        let id = ui.push(Node::new(text_input_kind("", "Enter Username", false), Style::default()));
+        ui.add_layer(id, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert!(painter.clips.is_empty());
+    }
+
+    #[test]
+    fn scroll_x_shifts_the_drawn_text_and_caret_by_the_same_amount() {
+        fn paint_at(scroll_x: f32) -> FullRecordingPainter {
+            let mut ui = Ui::new();
+            let id = ui.push(Node::new(text_input_kind("hello world", "", false), Style::default()));
+            ui.get_mut(id).computed = Rect::new(0.0, 0.0, 200.0, 30.0);
+            ui.get_mut(id).scroll_offset.x = scroll_x;
+            ui.add_layer(id, "main");
+            ui.focus = Some(id);
+            let mut painter = FullRecordingPainter::default();
+            paint(&ui, &mut painter);
+            painter
+        }
+
+        let unscrolled = paint_at(0.0);
+        let scrolled = paint_at(15.0);
+
+        assert_eq!(unscrolled.text_bounds[0].x - scrolled.text_bounds[0].x, 15.0, "text shifts left by scroll_x");
+        let unscrolled_caret = unscrolled.fills.last().unwrap().0.x;
+        let scrolled_caret = scrolled.fills.last().unwrap().0.x;
+        assert_eq!(unscrolled_caret - scrolled_caret, 15.0, "caret shifts by the same amount as the text");
+    }
+
+    #[test]
+    fn draw_text_bounds_always_reach_the_full_natural_text_width() {
+        // Regression: `draw_text`'s `bounds.w` is cosmic-text's word-wrap
+        // boundary, measured from `bounds.x`. Sizing it off `content_rect.w`
+        // (or even `content_rect.w + scroll_x`, an earlier, incomplete fix)
+        // could still fall short of the text's true width whenever the caret
+        // isn't at the very end — e.g. after Left/Home or a mid-string click
+        // — since `scroll_x` only guarantees *the caret* is in view, not
+        // whatever text comes after it. Sizing off the actual measured width
+        // instead rules that out regardless of scroll/caret position: a
+        // `TextInput` never wants wrapping at all, only scroll+clip.
+        let mut ui = Ui::new();
+        let mut kind = text_input_kind("hello world", "", false);
+        if let NodeKind::TextInput { cursor, .. } = &mut kind {
+            *cursor = 3; // nowhere near the true end — the scenario this test guards
+        }
+        let id = ui.push(Node::new(kind, Style::default()));
+        // A box far narrower than "hello world"'s natural width, so this
+        // only means something if the box width isn't what determines
+        // `bounds.w` here.
+        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 50.0, 30.0);
+        ui.get_mut(id).scroll_offset.x = 15.0;
+        ui.add_layer(id, "main");
+        ui.focus = Some(id);
+
+        let mut painter = FullRecordingPainter::default();
+        let natural_width = painter.measure_text("hello world", 16.0).x;
+        paint(&ui, &mut painter);
+
+        assert!(
+            painter.text_bounds[0].w > natural_width,
+            "wrap boundary ({}) must clear the text's full natural width ({natural_width}), not just the box or box+scroll_x",
+            painter.text_bounds[0].w
+        );
+    }
+
+    #[test]
+    fn multiline_text_input_draws_the_whole_value_in_one_call_wrapped_at_the_box_width() {
+        let mut ui = Ui::new();
+        let style = Style { multiline: true, ..Style::default() };
+        let id = ui.push(Node::new(text_input_kind("line one\nline two", "", false), style));
+        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 200.0, 60.0);
+        ui.add_layer(id, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.texts, vec!["line one\nline two".to_string()]);
+        assert_eq!(painter.text_bounds[0].w, 200.0, "wraps at the box width, not the full text width");
+    }
+
+    #[test]
+    fn multiline_text_input_places_the_caret_on_its_hard_line() {
+        let mut ui = Ui::new();
+        let style = Style { multiline: true, ..Style::default() };
+        let mut kind = text_input_kind("ab\ncd", "", false);
+        if let NodeKind::TextInput { cursor, .. } = &mut kind {
+            *cursor = 4; // char 4 is 'd' -> line 1 ("cd"), col 1
+        }
+        let id = ui.push(Node::new(kind, style));
+        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 200.0, 60.0);
+        ui.add_layer(id, "main");
+        ui.focus = Some(id);
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        let line_h = nowui_core_line_height();
+        let caret = painter.fills.last().unwrap().0;
+        assert_eq!(caret.y, line_h, "caret sits on the second hard line, one line_height down");
+        assert!(caret.x > 0.0, "col 1 into \"cd\" is past the box's left edge");
+    }
+
+    #[test]
+    fn multiline_text_input_selection_spanning_lines_draws_one_highlight_per_line() {
+        let mut ui = Ui::new();
+        let style = Style { multiline: true, ..Style::default() };
+        let mut kind = text_input_kind("aaa\nbbb\nccc", "", false);
+        if let NodeKind::TextInput { cursor, selection_anchor, .. } = &mut kind {
+            *cursor = 9; // into the third line
+            *selection_anchor = Some(1); // from the first line
+        }
+        let id = ui.push(Node::new(kind, style));
+        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 200.0, 90.0);
+        ui.add_layer(id, "main");
+        ui.focus = Some(id);
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        // 3 highlight rects (one per spanned line) + 1 caret.
+        assert_eq!(painter.fills.len(), 4);
+    }
+
+    fn nowui_core_line_height() -> f32 {
+        crate::text_input::line_height(Style::default().font_size)
+    }
+
+    #[test]
+    fn closed_menu_paints_its_header_but_not_its_items() {
+        let mut ui = Ui::new();
+        let item = ui.push(Node::new(NodeKind::MenuItem { label: "Open Preferences".to_string() }, Style::default()));
+        let menu = ui.push(Node::new(NodeKind::Menu { label: "Preferences".to_string(), open: false }, Style::default()));
+        ui.get_mut(menu).children = vec![item];
+        ui.add_layer(menu, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.texts, vec!["Preferences".to_string()], "header paints, item does not");
+    }
+
+    #[test]
+    fn open_menu_paints_its_header_and_its_items() {
+        let mut ui = Ui::new();
+        let item = ui.push(Node::new(NodeKind::MenuItem { label: "Open Preferences".to_string() }, Style::default()));
+        let menu = ui.push(Node::new(NodeKind::Menu { label: "Preferences".to_string(), open: true }, Style::default()));
+        ui.get_mut(menu).children = vec![item];
+        ui.add_layer(menu, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.texts, vec!["Preferences".to_string(), "Open Preferences".to_string()]);
+    }
+
+    #[test]
+    fn open_menu_with_no_children_paints_only_its_header() {
+        let mut ui = Ui::new();
+        let menu = ui.push(Node::new(NodeKind::Menu { label: "Preferences".to_string(), open: true }, Style::default()));
+        ui.add_layer(menu, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.texts, vec!["Preferences".to_string()], "no children means no popup, even while open");
+    }
+
+    #[test]
+    fn open_menu_popup_draws_a_background_panel_from_the_menus_own_style() {
+        let mut ui = Ui::new();
+        let panel_color = Color::rgb(30, 30, 30);
+        let item = ui.push(Node::new(NodeKind::MenuItem { label: "Open Preferences".to_string() }, Style::default()));
+        let menu = ui.push(Node::new(
+            NodeKind::Menu { label: "Preferences".to_string(), open: true },
+            Style { bg: Some(panel_color), ..Default::default() },
+        ));
+        ui.get_mut(menu).children = vec![item];
+        ui.get_mut(menu).content_size = Size::new(100.0, 40.0);
+        ui.add_layer(menu, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert!(painter.fills.iter().any(|&(_, color)| color == panel_color), "popup panel painted with Menu's own bg");
     }
 
     #[test]

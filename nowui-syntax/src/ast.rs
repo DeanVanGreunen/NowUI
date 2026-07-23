@@ -35,6 +35,56 @@ pub enum Node {
         bindings: Vec<Binding>,
         children: Vec<Node>,
     },
+    /// `if EXPR { ... } else if EXPR { ... } else { ... }` — `branches` is
+    /// the `if` condition plus every `else if`, in source order; `else_branch`
+    /// is empty when there's no trailing `else`. Which branch (if any) is
+    /// live is re-evaluated against *live* state every time the enclosing
+    /// dynamic region refreshes — not decided once at parse time. See
+    /// `nowui-runtime`'s `dynamic.rs`.
+    If {
+        branches: Vec<(Expr, Vec<Node>)>,
+        else_branch: Vec<Node>,
+    },
+    /// `for IDENT in EXPR { ... }` — `body` is re-expanded once per item in
+    /// the list `iter` resolves to, with `${IDENT}` in a backtick
+    /// substituted for that item's value. `var` is a bare loop-local name,
+    /// not rooted at `state`. See `nowui-runtime`'s `dynamic.rs`.
+    For {
+        var: String,
+        iter: Expr,
+        body: Vec<Node>,
+    },
+}
+
+/// A boolean/comparison expression — an `if`'s condition or a `for`'s
+/// iterable. Deliberately small and non-Turing-complete (see CLAUDE.md):
+/// literals, dotted paths, comparisons, `&&`/`||`, unary `!`. No arithmetic
+/// operators — nothing in the language needs them yet, and adding them is a
+/// mechanical extension of this same enum if that changes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Bool(bool),
+    Number(f64),
+    Str(String),
+    /// A dotted path: `state.username`, or a bare `for` loop variable name
+    /// like `x`. Resolving it — state lookup vs. loop-variable substitution,
+    /// and the special `.length` pseudo-property — is nowui-runtime's job;
+    /// this crate just records the segments.
+    Path(Vec<String>),
+    Not(Box<Expr>),
+    Cmp(Box<Expr>, CmpOp, Box<Expr>),
+    And(Box<Expr>, Box<Expr>),
+    Or(Box<Expr>, Box<Expr>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CmpOp {
+    Eq,
+    Ne,
+    Lt,
+    Le,
+    Gt,
+    Ge,
 }
 
 /// A layout parameter, optionally with a default value.

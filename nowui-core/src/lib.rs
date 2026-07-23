@@ -9,6 +9,7 @@ pub mod painter;
 pub mod state;
 pub mod style;
 pub mod tailwind;
+pub mod text_input;
 
 pub use arena::{Layer, Node, NodeId, NodeKind, Template, TemplatePart, Ui, EVENT_BINDING_KEYS};
 pub use geometry::{Color, Edges, Point, Rect, Size};
@@ -18,7 +19,7 @@ pub use geometry::{Color, Edges, Point, Rect, Size};
 // `impl nowui_core::NowUiState for Foo` both resolve unambiguously.
 pub use nowui_macros::NowUiState;
 pub use painter::{Painter, TextStyle};
-pub use state::{Event, EventKind, NoState, NowUiState, StateValue};
+pub use state::{display_string, Event, EventKind, NoState, NowUiState, StateValue};
 pub use style::{
     compute_effective, dropdown_metrics, slider_metrics, Align, AnimatableStyle, Direction,
     Display, GridTrack, Position, Sizing, Style, StyleVariants, TextAlign, Transform2D,
@@ -219,5 +220,96 @@ mod tests {
         assert_eq!(ui.get(root).content_size, Size::new(100.0, 100.0));
         assert_eq!(ui.get(a).computed.y, -20.0, "scrolled up by the offset");
         assert_eq!(ui.get(b).computed.y, 30.0);
+    }
+
+    #[test]
+    fn closed_menu_ignores_its_children_entirely() {
+        let mut ui = Ui::new();
+        let item = ui.push(Node::new(
+            NodeKind::MenuItem { label: "Open Preferences".to_string() },
+            Style { height: Sizing::Fixed(40.0), width: Sizing::Fill(1.0), ..Default::default() },
+        ));
+        let menu = ui.push(Node::new(NodeKind::Menu { label: "Preferences".to_string(), open: false }, Style::default()));
+        ui.get_mut(menu).children = vec![item];
+        // `Menu` as the layer *root* would always fill the viewport
+        // (`solve`'s special-casing for roots), masking its own Hug height
+        // — nest it under a plain wrapper, like every other Hug-sizing test
+        // here, so its measured height is actually observable.
+        let root = ui.push(Node::new(NodeKind::Container, Style::default()));
+        ui.get_mut(root).children = vec![menu];
+        ui.add_layer(root, "main");
+
+        layout::solve(&mut ui, Size::new(200.0, 100.0), &mut NullPainter);
+
+        // Hug height is just the header label's own text height — the
+        // 40px-tall item contributes nothing while closed.
+        let header_h = ui.get(menu).computed.h;
+        assert!(header_h < 40.0, "closed Menu's height ({header_h}) must not include its item's 40px");
+    }
+
+    #[test]
+    fn open_menu_never_grows_its_own_size_from_children() {
+        // Unlike an accordion, an open Menu's own box never changes size —
+        // its children float in a popup below it instead (same principle as
+        // Dropdown's open option list never affecting its own box size).
+        let mut ui = Ui::new();
+        let item = ui.push(Node::new(
+            NodeKind::MenuItem { label: "Open Preferences".to_string() },
+            Style { height: Sizing::Fixed(40.0), width: Sizing::Fill(1.0), ..Default::default() },
+        ));
+        let closed_menu =
+            ui.push(Node::new(NodeKind::Menu { label: "Preferences".to_string(), open: false }, Style::default()));
+        let open_menu = ui.push(Node::new(NodeKind::Menu { label: "Preferences".to_string(), open: true }, Style::default()));
+        ui.get_mut(open_menu).children = vec![item];
+        let root = ui.push(Node::new(NodeKind::Container, Style::default()));
+        ui.get_mut(root).children = vec![closed_menu, open_menu];
+        ui.add_layer(root, "main");
+
+        layout::solve(&mut ui, Size::new(200.0, 100.0), &mut NullPainter);
+
+        assert_eq!(
+            ui.get(closed_menu).computed.h,
+            ui.get(open_menu).computed.h,
+            "open or closed, a Menu's own height is just its header text — never its children's"
+        );
+    }
+
+    #[test]
+    fn open_menu_popup_positions_its_children_floating_below_the_header() {
+        let mut ui = Ui::new();
+        let item = ui.push(Node::new(
+            NodeKind::MenuItem { label: "Open Preferences".to_string() },
+            Style { height: Sizing::Fixed(40.0), width: Sizing::Fill(1.0), ..Default::default() },
+        ));
+        let menu = ui.push(Node::new(NodeKind::Menu { label: "Preferences".to_string(), open: true }, Style::default()));
+        ui.get_mut(menu).children = vec![item];
+        let root = ui.push(Node::new(NodeKind::Container, Style::default()));
+        ui.get_mut(root).children = vec![menu];
+        ui.add_layer(root, "main");
+
+        layout::solve(&mut ui, Size::new(200.0, 100.0), &mut NullPainter);
+
+        let menu_rect = ui.get(menu).computed;
+        let item_rect = ui.get(item).computed;
+        assert_eq!(item_rect.y, menu_rect.y + menu_rect.h, "item floats directly below the header, not inside it");
+        assert_eq!(item_rect.h, 40.0);
+        assert_eq!(ui.get(menu).content_size, Size::new(menu_rect.w, 40.0), "popup size recorded for paint/hit-testing");
+    }
+
+    #[test]
+    fn closed_or_childless_menu_gets_no_popup_size() {
+        let mut ui = Ui::new();
+        let closed_menu =
+            ui.push(Node::new(NodeKind::Menu { label: "Preferences".to_string(), open: false }, Style::default()));
+        let no_children_menu =
+            ui.push(Node::new(NodeKind::Menu { label: "Preferences".to_string(), open: true }, Style::default()));
+        let root = ui.push(Node::new(NodeKind::Container, Style::default()));
+        ui.get_mut(root).children = vec![closed_menu, no_children_menu];
+        ui.add_layer(root, "main");
+
+        layout::solve(&mut ui, Size::new(200.0, 100.0), &mut NullPainter);
+
+        assert_eq!(ui.get(closed_menu).content_size, Size::default());
+        assert_eq!(ui.get(no_children_menu).content_size, Size::default());
     }
 }

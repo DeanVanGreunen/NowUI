@@ -23,15 +23,40 @@ use std::collections::HashMap;
 
 use nowui_core::{
     tailwind, Align, Color, Direction, Display, Easing, Edges, GridTrack, Node as ArenaNode,
-    NodeId, NodeKind, Position, Sizing, Style, TextAlign, Transition, Ui, EVENT_BINDING_KEYS,
+    NodeId, NodeKind, NowUiState, Position, Sizing, Style, TextAlign, Transition, Ui, EVENT_BINDING_KEYS,
 };
 use nowui_syntax::ast::{BindValue, NamedArg, Node as AstNode, Param, StylePair, Template, TplPart};
+
+use crate::dynamic::{self, RegionAst, RegionSignature};
 
 const MAX_EXPANSION_DEPTH: usize = 64;
 
 pub struct Semantic {
     defs: HashMap<String, LayoutDef>,
     pub warnings: Vec<String>,
+    /// Every *top-level* `if`/`for` discovered so far — one whose ancestor
+    /// chain doesn't pass through another dynamic region. Persisted across
+    /// redraws (unlike a nested region's own bookkeeping — see `dynamic.rs`'s
+    /// module doc) so `refresh_dynamic_regions` can skip re-expanding one
+    /// whose `RegionSignature` hasn't actually changed.
+    pub(crate) regions: Vec<DynamicRegion>,
+}
+
+/// A live top-level dynamic region: the still-unexpanded AST it came from,
+/// where its currently-generated nodes sit within its parent's children
+/// list, and what it last computed (to detect a real change before
+/// rebuilding). See `dynamic.rs`'s module doc for the full design.
+pub(crate) struct DynamicRegion {
+    parent: NodeId,
+    ast: RegionAst,
+    /// Captured at registration time — needed to correctly re-resolve any
+    /// `NamedArg`/callback-path bindings inside the region's body if it sits
+    /// inside a custom-widget use (e.g. `onSubmit` bound to a param).
+    scope: Scope,
+    depth: usize,
+    start: usize,
+    len: usize,
+    signature: RegionSignature,
 }
 
 #[derive(Clone)]
@@ -60,12 +85,16 @@ impl Semantic {
                 );
             }
         }
-        Semantic { defs, warnings: Vec::new() }
+        Semantic { defs, warnings: Vec::new(), regions: Vec::new() }
     }
 
-    /// Expand `entry` (a top-level layout name) into a fresh `Ui` with one layer
-    /// per top-level child of the entry layout.
-    pub fn build(&mut self, entry: &str) -> Option<Ui> {
+    /// Expand `entry` (a top-level layout name) into a fresh `Ui` with one
+    /// layer per top-level child of the entry layout, against `state`'s
+    /// *current* values — an `if`/`for` in `entry`'s body is expanded for
+    /// real here (not left empty until the first redraw), so e.g. a `for`
+    /// over a list that already has 3 items starts with 3 items' worth of
+    /// nodes, not zero.
+    pub fn build(&mut self, entry: &str, state: &dyn NowUiState) -> Option<Ui> {
         let def = self.defs.get(entry)?.clone();
         let mut ui = Ui::new();
         let scope = Scope::new();
@@ -73,26 +102,151 @@ impl Semantic {
         // The entry layout becomes the root container of a single layer.
         let root_style = self.resolve_styles(&def.styles, &Style::default());
         let root = ui.push(ArenaNode::new(NodeKind::Container, root_style));
-        let mut kids = Vec::new();
-        for child in &def.children {
-            if let Some(id) = self.expand(&mut ui, child, &scope, 0) {
-                kids.push(id);
-            }
-        }
+        let kids = self.expand_children(&mut ui, root, &def.children, &scope, state, 0, true);
         ui.get_mut(root).children = kids;
         ui.add_layer(root, entry);
         Some(ui)
     }
 
-    /// Expand one AST node into the arena, returning its id (None if skipped).
-    fn expand(&mut self, ui: &mut Ui, node: &AstNode, scope: &Scope, depth: usize) -> Option<NodeId> {
+    /// Expand `children` into `parent`'s children list, intercepting `if`/
+    /// `for` (which expand to zero, one, or many sibling nodes, unlike every
+    /// other `AstNode` variant, which is 1:1 with `expand()`) as dynamic
+    /// regions instead of delegating them to `expand()` (which simply skips
+    /// any `AstNode` it doesn't recognize, `If`/`For` included). `track`
+    /// governs whether a region discovered here gets persisted into
+    /// `self.regions` for later change-detection — `true` for "ordinary"
+    /// (non-region) contexts: the root layout, a widget's own children, a
+    /// custom-layout-def's children; `false` while already inside another
+    /// region's own re-expansion, since nested regions are simply
+    /// recomputed fresh every time their ancestor rebuilds rather than
+    /// independently tracked (see `dynamic.rs`'s module doc for why).
+    fn expand_children(
+        &mut self,
+        ui: &mut Ui,
+        parent: NodeId,
+        children: &[AstNode],
+        scope: &Scope,
+        state: &dyn NowUiState,
+        depth: usize,
+        track: bool,
+    ) -> Vec<NodeId> {
+        let mut kids = Vec::new();
+        for child in children {
+            match child {
+                AstNode::If { branches, else_branch } => {
+                    let start = kids.len();
+                    let ast = RegionAst::If { branches: branches.clone(), else_branch: else_branch.clone() };
+                    let (ids, signature) = self.expand_region(ui, parent, &ast, scope, state, depth);
+                    let len = ids.len();
+                    kids.extend(ids);
+                    if track {
+                        self.regions.push(DynamicRegion { parent, ast, scope: scope.clone(), depth, start, len, signature });
+                    }
+                }
+                AstNode::For { var, iter, body } => {
+                    let start = kids.len();
+                    let ast = RegionAst::For { var: var.clone(), iter: iter.clone(), body: body.clone() };
+                    let (ids, signature) = self.expand_region(ui, parent, &ast, scope, state, depth);
+                    let len = ids.len();
+                    kids.extend(ids);
+                    if track {
+                        self.regions.push(DynamicRegion { parent, ast, scope: scope.clone(), depth, start, len, signature });
+                    }
+                }
+                _ => {
+                    if let Some(id) = self.expand(ui, child, scope, state, depth) {
+                        kids.push(id);
+                    }
+                }
+            }
+        }
+        kids
+    }
+
+    /// Evaluate `ast` against `state`/`scope` right now and expand the
+    /// chosen branch (`If`) or every iteration (`For`) into fresh arena
+    /// nodes under `parent`. Nested `if`/`for` inside the chosen body are
+    /// expanded via `expand_children` with `track: false` — see its doc.
+    fn expand_region(
+        &mut self,
+        ui: &mut Ui,
+        parent: NodeId,
+        ast: &RegionAst,
+        scope: &Scope,
+        state: &dyn NowUiState,
+        depth: usize,
+    ) -> (Vec<NodeId>, RegionSignature) {
+        if depth > MAX_EXPANSION_DEPTH {
+            self.warnings.push("expansion depth exceeded (recursive layout, or if/for nested too deeply?)".into());
+            return (Vec::new(), RegionSignature::Branch(0));
+        }
+        match ast {
+            RegionAst::If { branches, else_branch } => {
+                let mut resolve = dynamic::make_resolver(state, None);
+                let chosen = branches.iter().position(|(cond, _)| dynamic::eval_bool(cond, &mut resolve));
+                let body = match chosen {
+                    Some(i) => &branches[i].1,
+                    None => else_branch,
+                };
+                let ids = self.expand_children(ui, parent, body, scope, state, depth + 1, false);
+                (ids, RegionSignature::Branch(chosen.unwrap_or(branches.len())))
+            }
+            RegionAst::For { var, iter, body } => {
+                let mut resolve = dynamic::make_resolver(state, None);
+                let items = dynamic::eval_expr(iter, &mut resolve)
+                    .and_then(|v| v.as_list().map(<[_]>::to_vec))
+                    .unwrap_or_default();
+
+                let mut ids = Vec::new();
+                let mut signature_items = Vec::with_capacity(items.len());
+                for item in &items {
+                    signature_items.push(dynamic::signature_string(item));
+                    let substituted: Vec<AstNode> =
+                        body.iter().map(|c| dynamic::substitute_loop_var(c, var, item)).collect();
+                    let iter_ids = self.expand_children(ui, parent, &substituted, scope, state, depth + 1, false);
+                    ids.extend(iter_ids);
+                }
+                (ids, RegionSignature::Items(signature_items))
+            }
+        }
+    }
+
+    /// Re-evaluate every top-level dynamic region against `state`'s current
+    /// values, rebuilding only the ones whose `RegionSignature` actually
+    /// changed since last time (an unrelated redraw — a hover, a transition
+    /// tick — leaves every region's nodes/`NodeId`s untouched, so e.g. a
+    /// `TextInput` inside one doesn't lose focus/cursor state for no
+    /// reason). Called once per redraw, before `layout::solve`, by
+    /// `nowui-runtime`'s `App`.
+    pub fn refresh_dynamic_regions(&mut self, ui: &mut Ui, state: &dyn NowUiState) {
+        for i in 0..self.regions.len() {
+            let region = &self.regions[i];
+            let (parent, ast, scope, depth) = (region.parent, region.ast.clone(), region.scope.clone(), region.depth);
+            let (new_ids, new_signature) = self.expand_region(ui, parent, &ast, &scope, state, depth);
+            let region = &mut self.regions[i];
+            if new_signature == region.signature {
+                continue;
+            }
+            let (start, len) = (region.start, region.len);
+            ui.get_mut(parent).children.splice(start..start + len, new_ids.iter().copied());
+            region.len = new_ids.len();
+            region.signature = new_signature;
+        }
+    }
+
+    /// Expand one AST node into the arena, returning its id (None if
+    /// skipped — including for `If`/`For`, which `expand_children` (not
+    /// this function) is responsible for turning into 0, 1, or many ids).
+    fn expand(&mut self, ui: &mut Ui, node: &AstNode, scope: &Scope, state: &dyn NowUiState, depth: usize) -> Option<NodeId> {
         if depth > MAX_EXPANSION_DEPTH {
             self.warnings.push("expansion depth exceeded (recursive layout?)".into());
             return None;
         }
 
         let AstNode::Widget { kind, args, string_args, styles, bindings, children } = node else {
-            // A nested LayoutDef inside a body is unusual; ignore for now.
+            // A nested LayoutDef, or a bare If/For (handled by
+            // `expand_children`, never reaches here) inside a body is
+            // unusual; ignore for now.
             return None;
         };
 
@@ -104,12 +258,7 @@ impl Semantic {
             let merged = self.resolve_styles(styles, &base);
             let container = ui.push(ArenaNode::new(NodeKind::Container, merged));
             apply_generic_bindings(ui, container, bindings);
-            let mut kids = Vec::new();
-            for c in &def.children {
-                if let Some(id) = self.expand(ui, c, &inner, depth + 1) {
-                    kids.push(id);
-                }
-            }
+            let kids = self.expand_children(ui, container, &def.children, &inner, state, depth + 1, true);
             ui.get_mut(container).children = kids;
             return Some(container);
         }
@@ -127,12 +276,7 @@ impl Semantic {
             ui.get_mut(id).templates = string_args.iter().map(to_core_template).collect();
         }
 
-        let mut kids = Vec::new();
-        for c in children {
-            if let Some(cid) = self.expand(ui, c, scope, depth + 1) {
-                kids.push(cid);
-            }
-        }
+        let kids = self.expand_children(ui, id, children, scope, state, depth + 1, true);
         ui.get_mut(id).children = kids;
         Some(id)
     }
@@ -156,7 +300,14 @@ impl Semantic {
                     .find(|b| b.key == "mask")
                     .map(|b| matches!(b.value, BindValue::Bool(true)))
                     .unwrap_or(false);
-                Some(NodeKind::TextInput { label: arg(0), placeholder: arg(1), masked })
+                Some(NodeKind::TextInput {
+                    label: arg(0),
+                    placeholder: arg(1),
+                    masked,
+                    cursor: 0,
+                    selection_anchor: None,
+                    ime_preview: String::new(),
+                })
             }
             "Dropdown" => Some(NodeKind::Dropdown {
                 placeholder: arg(0),
@@ -176,6 +327,16 @@ impl Semantic {
                 let initial = literal_percent(bindings).unwrap_or(0.0);
                 Some(NodeKind::ProgressBar { value: initial })
             }
+            // `Menu` is the only primitive besides layout-defs/custom-widget
+            // uses that keeps real children (typically `MenuItem`, but
+            // anything works) — see `NodeKind::Menu`'s doc comment. Its
+            // `children` are expanded completely normally by the caller
+            // (`expand`/`expand_children` don't special-case any widget
+            // `kind` for children handling); only *whether they occupy any
+            // layout space or paint* is gated on `open`, in `layout.rs`/
+            // `paint.rs`.
+            "Menu" => Some(NodeKind::Menu { label: arg(0), open: false }),
+            "MenuItem" => Some(NodeKind::MenuItem { label: arg(0) }),
             // Bare containers used directly in a body (e.g. `Card`, `Row`).
             "Card" | "Container" | "Row" | "Column" | "Bar" | "Grid" | "List" => Some(NodeKind::Container),
             other => {
@@ -312,7 +473,7 @@ fn dynamic_var_path(v: &str) -> Option<Vec<String>> {
 
 /// Exact-key matches: bare flags and the legacy `key-[value]` bracket forms
 /// (kept for arbitrary values Tailwind would spell `p-[13px]`, `bg-[#fff]`, etc).
-fn apply_exact(s: &mut Style, key: &str, v: &str) -> bool {
+pub(crate) fn apply_exact(s: &mut Style, key: &str, v: &str) -> bool {
     match key {
         "row" => s.direction = Direction::Row,
         "column" | "col" => s.direction = Direction::Column,
@@ -330,6 +491,10 @@ fn apply_exact(s: &mut Style, key: &str, v: &str) -> bool {
         "bottom" => s.bottom = Some(parse_px(v)),
         "scroll-h" => s.scroll_x = true,
         "scroll-v" => s.scroll_y = true,
+        // `TextInput multi { ... }` — wraps at the box width and treats
+        // Enter as a literal newline instead of the single-line,
+        // horizontally-scrolling default. Harmlessly unused on anything else.
+        "multi" | "multiline" => s.multiline = true,
 
         "w" => s.width = parse_sizing(v),
         "h" => s.height = parse_sizing(v),
@@ -446,7 +611,7 @@ fn default_transition() -> Transition {
 /// `scale-x-`, `gap-x-`, ...) are checked before their shorter, generic
 /// relatives (`border-`, `scale-`, `gap-`) since `strip_prefix` alone can't
 /// tell "the whole rest is the token" from "there's more prefix to strip".
-fn apply_prefixed(s: &mut Style, key: &str, v: &str) -> bool {
+pub(crate) fn apply_prefixed(s: &mut Style, key: &str, v: &str) -> bool {
     if !v.is_empty() {
         // Compact classes never carry a bracket value; if one is present this
         // was already handled (or not) by `apply_exact`.
@@ -843,7 +1008,7 @@ mod tests {
     fn first_child_style(src: &str) -> Style {
         let ast = nowui_syntax::parse(src).expect("should parse");
         let mut sem = Semantic::new(&ast);
-        let ui = sem.build("T").expect("entry layout");
+        let ui = sem.build("T", &nowui_core::NoState).expect("entry layout");
         let root = ui.get(ui.layers[0].root);
         ui.get(root.children[0]).style.clone()
     }
@@ -920,7 +1085,7 @@ mod tests {
     fn unsupported_variant_warns_instead_of_silently_applying() {
         let ast = nowui_syntax::parse("layout: T { Card dark:bg-black { Text `hi` } }").unwrap();
         let mut sem = Semantic::new(&ast);
-        let ui = sem.build("T").unwrap();
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
         let root = ui.get(ui.layers[0].root);
         let s = &ui.get(root.children[0]).style;
         assert_eq!(s.bg, None, "dark: has no state model, so it must not apply");
@@ -951,6 +1116,15 @@ mod tests {
     }
 
     #[test]
+    fn resolves_multi_bare_flag_on_a_text_input() {
+        let ast = nowui_syntax::parse("layout: T { TextInput `` `placeholder` multi }").unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        assert!(ui.get(root.children[0]).style.multiline);
+    }
+
+    #[test]
     fn resolves_z_index_bracket_and_compact_forms() {
         let bracket = first_child_style("layout: T { Card z-index-[5] { Text `hi` } }");
         assert_eq!(bracket.z_index, 5);
@@ -965,7 +1139,7 @@ mod tests {
         )
         .unwrap();
         let mut sem = Semantic::new(&ast);
-        let ui = sem.build("T").unwrap();
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
         let root = ui.get(ui.layers[0].root);
         let node = ui.get(root.children[0]);
         let nowui_core::NodeKind::Dropdown { placeholder, options, selected, open } = &node.kind else {
@@ -979,13 +1153,44 @@ mod tests {
     }
 
     #[test]
+    fn resolves_menu_with_its_own_onclick_and_menu_item_children() {
+        // The exact shape a `Menu` needs and `Dropdown` doesn't: an `onClick`
+        // binding on the widget itself *and* real children, each independently
+        // styleable/bindable (unlike `Dropdown`'s flat `Vec<String>` options)
+        // — the reason the parser's bindings/children trailer had to stop
+        // being an either-or choice.
+        let src = r#"layout: T {
+            Menu `Preferences` w-[400px] text-center {onClick: state.menuClick} {
+                MenuItem `Open Preferences` w-[400px] {onClick: state.itemClick}
+            }
+        }"#;
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let menu = ui.get(root.children[0]);
+
+        let nowui_core::NodeKind::Menu { label, open } = &menu.kind else { panic!("expected a Menu node") };
+        assert_eq!(label, "Preferences");
+        assert!(!open, "starts closed");
+        assert_eq!(menu.events.get("onClick"), Some(&vec!["state".to_string(), "menuClick".to_string()]));
+        assert_eq!(menu.style.width, Sizing::Fixed(400.0));
+
+        assert_eq!(menu.children.len(), 1);
+        let item = ui.get(menu.children[0]);
+        let nowui_core::NodeKind::MenuItem { label } = &item.kind else { panic!("expected a MenuItem node") };
+        assert_eq!(label, "Open Preferences");
+        assert_eq!(item.events.get("onClick"), Some(&vec!["state".to_string(), "itemClick".to_string()]));
+    }
+
+    #[test]
     fn resolves_slider_and_progress_bar_initial_values() {
         let ast = nowui_syntax::parse(
             "layout: T { Slider {value: 75} ProgressBar {value: 30} }",
         )
         .unwrap();
         let mut sem = Semantic::new(&ast);
-        let ui = sem.build("T").unwrap();
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
         let root = ui.get(ui.layers[0].root);
         let nowui_core::NodeKind::Slider { value } = &ui.get(root.children[0]).kind else {
             panic!("expected a Slider node");
@@ -1004,7 +1209,7 @@ mod tests {
         )
         .unwrap();
         let mut sem = Semantic::new(&ast);
-        let ui = sem.build("T").unwrap();
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
         let root = ui.get(ui.layers[0].root);
         let node = ui.get(root.children[0]);
         assert_eq!(node.value_path, vec!["state".to_string(), "count".to_string()]);
@@ -1017,7 +1222,7 @@ mod tests {
     fn dynamic_backtick_interpolation_is_recorded_as_a_template() {
         let ast = nowui_syntax::parse("layout: T { Text `Count: ${state.counter.count}` } ").unwrap();
         let mut sem = Semantic::new(&ast);
-        let ui = sem.build("T").unwrap();
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
         let root = ui.get(ui.layers[0].root);
         let node = ui.get(root.children[0]);
         assert_eq!(
@@ -1036,7 +1241,7 @@ mod tests {
     fn purely_literal_backtick_leaves_templates_empty() {
         let ast = nowui_syntax::parse("layout: T { Text `Static label` }").unwrap();
         let mut sem = Semantic::new(&ast);
-        let ui = sem.build("T").unwrap();
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
         let root = ui.get(ui.layers[0].root);
         let node = ui.get(root.children[0]);
         assert!(node.templates.is_empty());
@@ -1054,7 +1259,177 @@ mod tests {
     fn dynamic_style_var_does_not_warn_as_an_unknown_or_malformed_value() {
         let ast = nowui_syntax::parse("layout: T { Card w-[${state.myWidth}] { Text `hi` } }").unwrap();
         let mut sem = Semantic::new(&ast);
-        sem.build("T").unwrap();
+        sem.build("T", &nowui_core::NoState).unwrap();
         assert!(sem.warnings.is_empty(), "unexpected warnings: {:?}", sem.warnings);
+    }
+
+    #[derive(Default, Clone, nowui_core::NowUiState)]
+    struct DynamicTestState {
+        show: bool,
+        rows: Vec<i64>,
+    }
+
+    fn text_contents(ui: &Ui, ids: &[NodeId]) -> Vec<String> {
+        ids.iter()
+            .map(|&id| match &ui.get(id).kind {
+                NodeKind::Text { content } => content.clone(),
+                other => panic!("expected a Text node, got {other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn if_picks_the_matching_branch_at_initial_build() {
+        let src = "layout: T { if state.show { Text `yes` } else { Text `no` } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+
+        let ui = sem.build("T", &DynamicTestState { show: true, rows: Vec::new() }).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        assert_eq!(text_contents(&ui, &root.children), vec!["yes".to_string()]);
+    }
+
+    #[test]
+    fn if_falls_back_to_else_and_re_expands_on_refresh() {
+        let src = "layout: T { if state.show { Text `yes` } else { Text `no` } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+
+        let mut state = DynamicTestState { show: false, rows: Vec::new() };
+        let mut ui = sem.build("T", &state).unwrap();
+        let root_id = ui.layers[0].root;
+        assert_eq!(text_contents(&ui, &ui.get(root_id).children), vec!["no".to_string()]);
+
+        state.show = true;
+        sem.refresh_dynamic_regions(&mut ui, &state);
+        assert_eq!(text_contents(&ui, &ui.get(root_id).children), vec!["yes".to_string()]);
+    }
+
+    #[test]
+    fn refresh_is_a_noop_and_preserves_node_ids_when_nothing_changed() {
+        let src = "layout: T { if state.show { Text `yes` } else { Text `no` } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+
+        let state = DynamicTestState { show: true, rows: Vec::new() };
+        let mut ui = sem.build("T", &state).unwrap();
+        let root_id = ui.layers[0].root;
+        let before = ui.get(root_id).children.clone();
+
+        sem.refresh_dynamic_regions(&mut ui, &state);
+
+        assert_eq!(ui.get(root_id).children, before, "same NodeIds — nothing was rebuilt");
+    }
+
+    #[test]
+    fn for_expands_to_flat_siblings_not_wrapped_in_an_extra_container() {
+        // A `for` inside a `Grid` must produce its children directly as the
+        // grid's own cells, not one wrapper container occupying a single
+        // cell — otherwise it'd defeat the point of a multi-column grid.
+        let src = "layout: T { Grid grid grid-cols-2 { for x in state.rows { Text `a` Text `b` } } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+
+        let state = DynamicTestState { show: false, rows: vec![1, 2, 3] };
+        let ui = sem.build("T", &state).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let grid = ui.get(root.children[0]);
+        assert_eq!(grid.children.len(), 6, "3 items x 2 Text nodes each, flattened directly under Grid");
+        for &id in &grid.children {
+            assert!(matches!(ui.get(id).kind, NodeKind::Text { .. }));
+        }
+    }
+
+    #[test]
+    fn for_substitutes_the_loop_variable_into_backticks() {
+        let src = "layout: T { for x in state.rows { Text `Row ${x}` } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+
+        let state = DynamicTestState { show: false, rows: vec![10, 20, 30] };
+        let ui = sem.build("T", &state).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        assert_eq!(
+            text_contents(&ui, &root.children),
+            vec!["Row 10".to_string(), "Row 20".to_string(), "Row 30".to_string()]
+        );
+    }
+
+    #[derive(Default, Clone, nowui_core::NowUiState)]
+    struct RowItem {
+        label: String,
+    }
+
+    #[derive(Default, Clone, nowui_core::NowUiState)]
+    struct RowListState {
+        rows: Vec<RowItem>,
+    }
+
+    #[test]
+    fn for_resolves_dotted_field_access_into_a_vec_of_struct_field() {
+        let src = "layout: T { for x in state.rows { Text `${x.label}` } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+
+        let state = RowListState {
+            rows: vec![
+                RowItem { label: "First".to_string() },
+                RowItem { label: "Second".to_string() },
+            ],
+        };
+        let ui = sem.build("T", &state).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        assert_eq!(text_contents(&ui, &root.children), vec!["First".to_string(), "Second".to_string()]);
+    }
+
+    #[test]
+    fn for_rebuilds_when_the_list_changes_length_and_is_a_noop_when_it_does_not() {
+        let src = "layout: T { for x in state.rows { Text `${x}` } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+
+        let mut state = DynamicTestState { show: false, rows: vec![1, 2] };
+        let mut ui = sem.build("T", &state).unwrap();
+        let root_id = ui.layers[0].root;
+        assert_eq!(ui.get(root_id).children.len(), 2);
+
+        // Unchanged list -> refresh is a no-op (same NodeIds).
+        let before = ui.get(root_id).children.clone();
+        sem.refresh_dynamic_regions(&mut ui, &state);
+        assert_eq!(ui.get(root_id).children, before);
+
+        // Longer list -> rebuilds with the new count.
+        state.rows = vec![1, 2, 3, 4];
+        sem.refresh_dynamic_regions(&mut ui, &state);
+        assert_eq!(ui.get(root_id).children.len(), 4);
+        assert_eq!(
+            text_contents(&ui, &ui.get(root_id).children),
+            vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string()]
+        );
+    }
+
+    #[derive(Default, Clone, nowui_core::NowUiState)]
+    struct UsernameState {
+        username: String,
+    }
+
+    #[test]
+    fn if_condition_using_length_pseudo_property_updates_when_the_field_changes() {
+        let src = "layout: T { if state.username.length > 3 { Text `long` } else { Text `short` } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+
+        let mut state = UsernameState { username: String::new() };
+        let mut ui = sem.build("T", &state).unwrap();
+        let root_id = ui.layers[0].root;
+        assert_eq!(text_contents(&ui, &ui.get(root_id).children), vec!["short".to_string()]);
+
+        state.username = "dean".to_string();
+        sem.refresh_dynamic_regions(&mut ui, &state);
+        assert_eq!(
+            text_contents(&ui, &ui.get(root_id).children),
+            vec!["long".to_string()],
+            "username.length went from 0 to 4, so the branch should flip"
+        );
     }
 }

@@ -32,5 +32,6 @@ impl Counter {
 }
 
 fn main() -> ExitCode {
-    nowui_runtime::run("examples/counter.nowui", "App", AppState::default())
+    let nowui_file = concat!(env!("CARGO_MANIFEST_DIR"), "/examples/counter.nowui");
+    nowui_runtime::run_path(nowui_file, "App", AppState::default())
 }

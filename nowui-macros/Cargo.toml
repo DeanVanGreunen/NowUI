@@ -10,3 +10,9 @@ proc-macro = true
 syn = { workspace = true }
 quote = { workspace = true }
 proc-macro2 = { workspace = true }
+# Not a violation of nowui-core's "no chumsky" hard rule — that rule is about
+# the runtime *model* crate staying renderer/parser-agnostic. This proc-macro
+# runs entirely at the consuming crate's compile time (never shipped in any
+# binary), and needs a real parser to walk a bundled view's `#`-import graph
+# (see `#[nowui(view(...))]` in lib.rs).
+nowui-syntax = { path = "../nowui-syntax" }

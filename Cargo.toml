@@ -6,6 +6,7 @@ members = [
     "nowui-macros",
     "nowui-render",
     "nowui-runtime",
+    "nowui-lsp",
     "examples/counter-app",
 ]
 
@@ -22,3 +23,5 @@ cosmic-text = "0.12"
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
+tower-lsp = "0.20"
+tokio = "1"

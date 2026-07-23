@@ -1,0 +1,18 @@
+[package]
+name = "nowui-lsp"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "nowui-lsp"
+path = "src/main.rs"
+
+[dependencies]
+# Reuses the real parser for diagnostics (parse errors), same as
+# nowui-runtime — but semantic-token highlighting is a separate, standalone
+# lexer (see src/tokenizer.rs), not driven by the chumsky AST, since
+# nowui-syntax's `ast::Node` carries no source spans (see its own doc
+# comments) and threading them through would be a large, unrelated change.
+nowui-syntax = { path = "../nowui-syntax" }
+tower-lsp = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "io-std", "macros"] }

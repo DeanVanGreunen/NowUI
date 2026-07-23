@@ -23,6 +23,65 @@ pub fn load_and_resolve(entry_path: &Path) -> Result<Vec<Node>, String> {
     Ok(out)
 }
 
+/// Parse an in-memory `.nowui` source with no filesystem access at all, and
+/// no `#`-import resolution — for a bundled source (see
+/// `nowui_core::NowUiState::nowui_view`) known to have no `#` imports at
+/// all. Prefer `load_and_resolve_bundled` in general (it degrades to
+/// exactly this when `imports` is empty); this is kept as the simple case
+/// for direct/synthetic sources (tests, `NoState`-style ad hoc use) that
+/// don't go through the `NowUiState` bundled-view machinery.
+pub fn load_and_resolve_str(source: &str) -> Result<Vec<Node>, String> {
+    nowui_syntax::parse(source).map_err(|errors| format!("parse error(s) in bundled view:\n{errors:?}"))
+}
+
+/// Like `load_and_resolve`, but for a `#[nowui(view(...))]`-bundled source
+/// whose whole `#`-import graph was *also* embedded into the binary at
+/// compile time (see `nowui-macros`'s `build_embedded_view`) — resolves
+/// imports against `imports` (a `(key, source)` list, keyed exactly the way
+/// the derive macro computed them: `nowui_syntax::join_import_path`/
+/// `import_dirname`, starting from `entry_dir`, the bundled entry file's own
+/// `#`-import base directory) instead of the filesystem. No disk access at
+/// all — correct for a source that has genuinely been fully embedded.
+pub fn load_and_resolve_bundled(entry_source: &str, entry_dir: &str, imports: &[(&str, &str)]) -> Result<Vec<Node>, String> {
+    let map: std::collections::HashMap<&str, &str> = imports.iter().copied().collect();
+    let mut out = Vec::new();
+    let mut visited = HashSet::new();
+    load_bundled_into(entry_source, entry_dir, &map, &mut out, &mut visited)?;
+    Ok(out)
+}
+
+fn load_bundled_into(
+    source: &str,
+    dir: &str,
+    map: &std::collections::HashMap<&str, &str>,
+    out: &mut Vec<Node>,
+    visited: &mut HashSet<String>,
+) -> Result<(), String> {
+    let ast = nowui_syntax::parse(source).map_err(|errors| format!("parse error(s) in bundled view:\n{errors:?}"))?;
+
+    for node in ast {
+        match node {
+            Node::Import { path: rel } => {
+                let key = nowui_syntax::join_import_path(dir, &rel);
+                if !visited.insert(key.clone()) {
+                    continue;
+                }
+                let child_source = map.get(key.as_str()).ok_or_else(|| {
+                    format!(
+                        "bundled import `{rel}` (resolved to `{key}`) was not embedded — this indicates a mismatch \
+                         between the derive macro's compile-time import-graph walk and this resolution, or the \
+                         `.nowui` source changing since the last build"
+                    )
+                })?;
+                let child_dir = nowui_syntax::import_dirname(&key);
+                load_bundled_into(child_source, child_dir, map, out, visited)?;
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(())
+}
+
 fn load_into(path: &Path, out: &mut Vec<Node>, visited: &mut HashSet<PathBuf>) -> Result<(), String> {
     let canonical = path
         .canonicalize()

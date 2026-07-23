@@ -1,0 +1,73 @@
+// NowUI — login screen (matches the reference design).
+//
+// Styled with the Tailwind CSS v4 utility vocabulary this engine supports:
+// spacing/color/typography scales, flexbox (row/col + items-*/justify-*),
+// CSS grid (grid-cols-*/col-span-*), borders + radius, opacity, 2D transforms
+// (scale-*/rotate-*/translate-*/skew-*), transitions, and hover:/focus:/
+// active:/sm:/md:/lg:/xl:/2xl: variants. `w-[fill]`/`w-[hug]` and bare
+// `row`/`col`/`grid` flags are NowUI's own (non-Tailwind) sizing/layout
+// primitives — see CLAUDE.md for the full list and what's deliberately out
+// of scope (3D transforms, dark:/group-*/peer-*, filters/shadows, keyframe
+// animations, grid minmax()/auto-fit/named lines).
+//
+// `Login` is a reusable, parameterized layout (a custom widget). `App` uses it.
+// Run:  cargo run -p nowui-runtime -- examples/login.nowui App
+
+layout: Login(state) w-[fill] h-[fill] {
+
+  // Top bar
+  Bar row w-full items-center justify-end bg-gray-900 h-12 px-6 {
+    Text `Login` text-white font-medium
+  }
+
+  // Centered card on the blue field
+  Container w-[fill] h-[fill] items-center justify-center {
+    // Responsive: narrower on small viewports, full 440px from `sm:` (640px) up.
+    Card position-relative w-[320px] sm:w-[440px] bg-white border border-gray-200 rounded-lg p-8 gap-1 {
+
+      // position-absolute demo: a small badge pinned to the card's own
+      // (position-relative) box via top/right offsets, out of normal flow —
+      // it doesn't take up any layout space or push the title down.
+      Container position-absolute top-[-10px] right-[16px] bg-blue-600 text-sm font-semibold px-[10px] py-[2px] rounded-full {
+        Text `NEW` text-white
+      }
+
+      Text `Login Form` w-full text-center text-gray-800 font-semibold text-lg pb-4
+
+      Text `Username` text-gray-700 text-sm font-medium
+      TextInput `` `Enter Username` w-full bg-gray-100 border border-transparent p-[10px] rounded focus:border-blue-500 transition duration-150 {value: state.username}
+
+      // Dynamic region: re-expanded live against `state.username` every
+      // redraw (not just once at startup) — see CLAUDE.md's "Dynamic
+      // regions" section. `state.username.length` is the `.length`
+      // pseudo-property (works on a `Str` or a `List`, not a real field).
+      if state.username.length > 3 && state.username.length < 8 {
+        Text `Password` text-gray-700 text-sm font-medium pt-3
+        TextInput `` `Enter Password` w-full bg-gray-100 border border-transparent p-[10px] rounded focus:border-blue-500 transition duration-150 {value: state.password, mask: true}
+      } else if state.username.length >= 8 {
+        Text `Entered username is to long` text-gray-700 text-sm font-medium pt-3
+      } else {
+        Text `Enter your username first` text-gray-700 text-sm font-medium pt-3
+      }
+
+      // Grid demo: two equal-width columns. `w-full`: a `display:grid`
+      // container has no natural (fr-track) intrinsic width of its own, same
+      // as CSS — it needs an explicit width instead of NowUI's default Hug.
+      // The `for` below re-expands to a flat pair of grid cells per row,
+      // directly as `Grid`'s own children — not wrapped in an extra
+      // container, so it doesn't disturb the 2-column cell placement.
+      Grid grid grid-cols-2 gap-4 pt-3 w-full {
+        for x in state.rows {
+          Checkbox `Remember me` text-gray-500 text-sm
+          Text `Forgot password? ${x.label}` text-gray-500 text-sm text-right
+        }
+      }
+
+      Button `SIGN IN` w-full text-center text-white font-semibold bg-blue-600 hover:bg-blue-700 active:scale-95 py-3.5 rounded transition duration-150 ease-out m-[20px 0 0 0]
+    }
+  }
+}
+
+layout: App w-[fill] h-[fill] {
+  Login state=state
+}

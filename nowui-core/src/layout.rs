@@ -27,6 +27,43 @@ pub fn solve(ui: &mut Ui, viewport: Size, painter: &mut dyn Painter) {
         // Root fills the viewport unless it has an explicit fixed size.
         let root_rect = Rect::new(0.0, 0.0, viewport.w, viewport.h);
         arrange(ui, root, root_rect, &sizes);
+        // After the normal pass, so every `Menu`'s own `computed` rect
+        // (which anchors its popup) is final.
+        arrange_menu_popups(ui, root, &sizes);
+    }
+}
+
+/// Give every *open, non-empty* `Menu`'s children real `computed` rects,
+/// stacked in a column floating directly below the header — same
+/// "floating, doesn't affect normal layout" principle as `Dropdown`'s open
+/// option list, but with real arena-node children (typically `MenuItem`),
+/// so (unlike `Dropdown`'s hand-drawn text rows) they get a genuine
+/// `arrange_flow` pass and can be arbitrarily complex widgets themselves.
+/// `Node::content_size` is repurposed here to record the popup's own
+/// resolved (width, height) — `paint_menu_popup` and the runtime's click
+/// hit-testing both need it and would otherwise have to recompute it.
+fn arrange_menu_popups(ui: &mut Ui, id: NodeId, sizes: &HashMap<NodeId, Size>) {
+    let children = ui.get(id).children.clone();
+    let is_open_with_children = matches!(&ui.get(id).kind, crate::arena::NodeKind::Menu { open: true, .. }) && !children.is_empty();
+    if is_open_with_children {
+        let style = ui.get(id).style.clone();
+        let rect = ui.get(id).computed;
+        let gap_total = style.gap * children.len().saturating_sub(1) as f32;
+        let popup_h: f32 = children.iter().map(|c| sizes.get(c).map(|s| s.h).unwrap_or(0.0)).sum::<f32>()
+            + gap_total
+            + style.padding.top
+            + style.padding.bottom
+            + style.border_width.top
+            + style.border_width.bottom;
+        let popup_rect = Rect::new(rect.x, rect.y + rect.h, rect.w, popup_h);
+        let inner = popup_rect.inset(style.padding).inset(style.border_width);
+        arrange_flow(ui, &style, &children, inner, sizes, Point::default());
+        ui.get_mut(id).content_size = Size::new(popup_rect.w, popup_rect.h);
+    }
+    // Recurse regardless — a Menu can be nested inside another popup/widget,
+    // and popups need this same treatment wherever they occur in the tree.
+    for c in children {
+        arrange_menu_popups(ui, c, sizes);
     }
 }
 
@@ -85,10 +122,28 @@ fn measure(ui: &mut Ui, id: NodeId, painter: &mut dyn Painter, sizes: &mut HashM
             let (track_h, _) = crate::style::slider_metrics(style.font_size);
             Size::new(crate::style::DEFAULT_CONTROL_WIDTH, track_h)
         }
+        crate::arena::NodeKind::Menu { label, .. } => {
+            let m = painter.measure_text(label, style.font_size);
+            Size::new(m.x, m.y)
+        }
+        crate::arena::NodeKind::MenuItem { label } => {
+            let m = painter.measure_text(label, style.font_size);
+            Size::new(m.x, m.y)
+        }
         crate::arena::NodeKind::Container => Size::default(),
     };
 
-    let content = if style.display == Display::Grid {
+    // A `Menu`'s children (real arena nodes, typically `MenuItem`) never
+    // contribute to its own size, open or not — its popup floats below the
+    // header (see `arrange_menu_popups`/`paint_menu_popup`), same principle
+    // as `Dropdown`'s open option list never affecting its box size. They're
+    // still measured above (bottom-up, unconditionally) so the popup pass
+    // has their real sizes memoized in `sizes` when it needs them.
+    let is_menu = matches!(&node.kind, crate::arena::NodeKind::Menu { .. });
+
+    let content = if is_menu {
+        Size::new(own.w, own.h)
+    } else if style.display == Display::Grid {
         grid_intrinsic(&children, &style, sizes)
     } else {
         // Fold children along the main axis. Absolutely-positioned children
@@ -146,6 +201,14 @@ fn arrange(ui: &mut Ui, id: NodeId, rect: Rect, sizes: &HashMap<NodeId, Size>) {
     let style = ui.get(id).style.clone();
     let children = ui.get(id).children.clone();
     if children.is_empty() {
+        return;
+    }
+    // A `Menu`'s children are never part of its own normal-flow arrangement
+    // (open or closed) — they only ever get real rects via
+    // `arrange_menu_popups`, positioned as a floating popup below the
+    // header, once every layer's normal arrange pass has finished (so the
+    // header's own `computed` rect, which anchors the popup, is final).
+    if matches!(&ui.get(id).kind, crate::arena::NodeKind::Menu { .. }) {
         return;
     }
 

@@ -38,6 +38,22 @@ pub enum NodeKind {
         label: String,
         placeholder: String,
         masked: bool,
+        /// Caret position, in **chars** (not bytes — see `text_input.rs`)
+        /// into `label`; always in `0..=text_input::char_len(label)`.
+        cursor: usize,
+        /// `Some(a)` means a selection spans `min(a, cursor)..max(a,
+        /// cursor)`; `None` means no selection, just a bare caret at
+        /// `cursor`. Order-independent on purpose — shift-selecting left
+        /// vs. right both just move `cursor` and leave `anchor` where the
+        /// selection started, same as every mainstream text editor.
+        selection_anchor: Option<usize>,
+        /// In-progress IME composition text (winit `Ime::Preedit`) —
+        /// spliced into the *displayed* string at `cursor` by
+        /// `text_input::display_string`, but not yet part of `label` until
+        /// `Ime::Commit` lands. No inner composition-cursor is tracked (a
+        /// simplification — see CLAUDE.md); the caret always renders at the
+        /// end of the preview while composing.
+        ime_preview: String,
     },
     Button {
         label: String,
@@ -69,6 +85,27 @@ pub enum NodeKind {
     /// A read-only fill indicator, `0.0..=1.0` normalized. No interaction.
     ProgressBar {
         value: f32,
+    },
+    /// A clickable header that expands/collapses its own `Node::children` in
+    /// place (accordion-style — column-stacked beneath the header, pushing
+    /// later siblings down when open) rather than as a floating popup like
+    /// `Dropdown`. Its children are real arena nodes (typically `MenuItem`,
+    /// but anything works), so — unlike `Dropdown`'s flat `Vec<String>`
+    /// options — each one can carry its own styles/`onClick`/further
+    /// children like any other widget. Self-contained `open` state, toggled
+    /// on click same as `Checkbox`/`Dropdown` (`App::handle_click`); no
+    /// value to write back (there's no single "selected" value the way
+    /// `Dropdown` has one), so it's one-way, not two-way, bound.
+    Menu {
+        label: String,
+        open: bool,
+    },
+    /// A single item inside a `Menu`'s child list — just a clickable label;
+    /// a real arena node, so its styles/`onClick`/children work exactly
+    /// like any other widget's (see `Node::events`), not the flattened-
+    /// string mechanism `Dropdown`'s options use.
+    MenuItem {
+        label: String,
     },
 }
 
@@ -230,6 +267,16 @@ impl Ui {
             }
         }
         true
+    }
+
+    /// Hit-test just `id`'s children (not `id` itself) against `p`, using the
+    /// same deepest-child-wins recursion as `hit_test` — for content that
+    /// lives outside its own parent's `computed` rect (e.g. a `Menu`'s
+    /// floating popup: the children have real rects from `arrange_menu_
+    /// popups`, but the popup rect itself isn't `id`'s own `computed`, so
+    /// `hit_test` can't reach them starting from the tree root).
+    pub fn hit_test_within(&self, id: NodeId, p: crate::geometry::Point) -> Option<NodeId> {
+        self.get(id).children.iter().rev().find_map(|&child| self.hit_test_node(child, p))
     }
 
     fn hit_test_node(&self, id: NodeId, p: crate::geometry::Point) -> Option<NodeId> {

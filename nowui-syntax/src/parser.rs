@@ -81,25 +81,88 @@ fn path() -> impl Parser<char, BindValue, Error = Simple<char>> + Clone {
         .map(BindValue::Path)
 }
 
-/// The value side of a binding / named arg / param default.
-fn bind_value() -> impl Parser<char, BindValue, Error = Simple<char>> + Clone {
-    let number = text::int(10)
+/// `123` or `123.45` — shared by `bind_value()` and `expr()`.
+fn number_literal() -> impl Parser<char, f64, Error = Simple<char>> + Clone {
+    text::int(10)
         .then(just('.').ignore_then(text::digits(10)).or_not())
         .map(|(int, frac): (String, Option<String>)| {
             let s = match frac {
                 Some(f) => format!("{int}.{f}"),
                 None => int,
             };
-            BindValue::Number(s.parse().unwrap())
-        });
+            s.parse().unwrap()
+        })
+}
 
+/// The value side of a binding / named arg / param default.
+fn bind_value() -> impl Parser<char, BindValue, Error = Simple<char>> + Clone {
     choice((
         just("true").to(BindValue::Bool(true)),
         just("false").to(BindValue::Bool(false)),
-        number,
+        number_literal().map(BindValue::Number),
         template_str().map(|t| BindValue::Str(t.render_flat())),
         path(),
     ))
+}
+
+/// `"..."` — a plain quoted string literal, used only inside `expr()`
+/// (backtick strings stay reserved for widget text templates; mixing the
+/// two syntaxes inside a condition like `if state.role == \`admin\`` would
+/// read as if it were interpolated text, which it isn't here).
+fn quoted_string() -> impl Parser<char, String, Error = Simple<char>> + Clone {
+    just('"')
+        .ignore_then(filter(|c: &char| *c != '"').repeated().collect::<String>())
+        .then_ignore(just('"'))
+}
+
+/// A boolean/comparison expression — an `if` condition or a `for` iterable.
+/// Precedence, loosest to tightest: `||` < `&&` < comparison < unary `!` <
+/// atom (literal, dotted path, or a parenthesized sub-expression). A single
+/// comparison per level (`a < b < c` isn't chained) matches how most small
+/// expression languages avoid the ambiguity of what chained comparisons
+/// should even mean.
+fn expr() -> impl Parser<char, Expr, Error = Simple<char>> + Clone {
+    recursive(|expr| {
+        let atom = pad(choice((
+            expr.clone().delimited_by(pad(just('(')), pad(just(')'))),
+            just("true").to(Expr::Bool(true)),
+            just("false").to(Expr::Bool(false)),
+            number_literal().map(Expr::Number),
+            quoted_string().map(Expr::Str),
+            text::ident().separated_by(just('.')).at_least(1).map(Expr::Path),
+        )));
+
+        let unary = pad(just('!'))
+            .repeated()
+            .then(atom)
+            .map(|(bangs, a)| bangs.into_iter().fold(a, |acc, _| Expr::Not(Box::new(acc))));
+
+        let cmp_op = pad(choice((
+            just("==").to(CmpOp::Eq),
+            just("!=").to(CmpOp::Ne),
+            just("<=").to(CmpOp::Le),
+            just(">=").to(CmpOp::Ge),
+            just('<').to(CmpOp::Lt),
+            just('>').to(CmpOp::Gt),
+        )));
+
+        let cmp = unary
+            .clone()
+            .then(cmp_op.then(unary).or_not())
+            .map(|(l, rest)| match rest {
+                Some((op, r)) => Expr::Cmp(Box::new(l), op, Box::new(r)),
+                None => l,
+            });
+
+        let and = cmp
+            .clone()
+            .then(pad(just("&&")).ignore_then(cmp).repeated())
+            .map(|(first, rest)| rest.into_iter().fold(first, |acc, r| Expr::And(Box::new(acc), Box::new(r))));
+
+        and.clone()
+            .then(pad(just("||")).ignore_then(and).repeated())
+            .map(|(first, rest)| rest.into_iter().fold(first, |acc, r| Expr::Or(Box::new(acc), Box::new(r))))
+    })
 }
 
 /// A single `key-[value]` style token, or a bare `key` flag.
@@ -183,12 +246,22 @@ fn bindings() -> impl Parser<char, Vec<Binding>, Error = Simple<char>> + Clone {
         .delimited_by(pad(just('{')), pad(just('}')))
 }
 
-enum Trailer {
-    Bindings(Vec<Binding>),
-    Children(Vec<Node>),
+/// The tail of an `if`, after its first condition+block: zero or more
+/// `else if COND { ... }`, then an optional trailing `else { ... }`. Parsed
+/// as a flat `.repeated()` of "another else" rather than hand-rolling the
+/// stop condition, since each repetition either commits to `ElseIf` (having
+/// matched `else if`) or `Else` (having matched a bare `else` block) or
+/// fails outright (no more `else` at all) — `repeated()` naturally stops on
+/// that last case. Allows a nonsensical `else {} else if ... {}` ordering
+/// through un-warned (last `Else` wins) rather than adding a whole
+/// validation pass for it; the parser stays dumb per the project convention.
+enum ElseTail {
+    ElseIf(Expr, Vec<Node>),
+    Else(Vec<Node>),
 }
 
-/// A widget instance (recursive: may hold a `{ ... }` child block).
+/// A widget instance, or an `if`/`for` control-flow node (recursive: any of
+/// them may hold a `{ ... }` child block containing more of the same).
 fn node() -> impl Parser<char, Node, Error = Simple<char>> + Clone {
     recursive(|node| {
         let named_arg = text::ident()
@@ -201,26 +274,67 @@ fn node() -> impl Parser<char, Node, Error = Simple<char>> + Clone {
             .repeated()
             .delimited_by(pad(just('{')), pad(just('}')));
 
-        let trailer = choice((
-            bindings().map(Trailer::Bindings),
-            child_block.map(Trailer::Children),
-        ))
-        .or_not();
-
-        text::ident() // kind
+        // Bindings and children are two independent optional trailing `{ }`
+        // blocks, bindings first — *not* an either-or choice (that was the
+        // original design, but it can't express a widget like `Menu` that
+        // needs both: `{onClick: ...}` on itself *and* a real child list).
+        // Each slot's own `.or_not()` backtracks cleanly on a block that
+        // doesn't match its shape (a children block doesn't look like
+        // `ident ':' bind_value, ...`, so `bindings()` fails and un-consumes
+        // the `{` — same "content disambiguates, not order" resolution as
+        // the original `{ }` ambiguity gotcha in CLAUDE.md, just applied
+        // twice in sequence instead of once as a XOR).
+        let widget = text::ident() // kind
             .then(named_arg.repeated())
             .then(template_str().padded().repeated())
             .then(style().repeated())
-            .then(trailer)
-            .map(|((((kind, args), string_args), styles), trailer)| {
-                let (bindings, children) = match trailer {
-                    Some(Trailer::Bindings(b)) => (b, Vec::new()),
-                    Some(Trailer::Children(c)) => (Vec::new(), c),
-                    None => (Vec::new(), Vec::new()),
-                };
-                Node::Widget { kind, args, string_args, styles, bindings, children }
-            })
-            .padded()
+            .then(bindings().or_not())
+            .then(child_block.clone().or_not())
+            .map(|(((((kind, args), string_args), styles), bindings), children)| Node::Widget {
+                kind,
+                args,
+                string_args,
+                styles,
+                bindings: bindings.unwrap_or_default(),
+                children: children.unwrap_or_default(),
+            });
+
+        let else_tail = pad(just("else")).ignore_then(choice((
+            pad(just("if")).ignore_then(expr()).then(child_block.clone()).map(|(c, b)| ElseTail::ElseIf(c, b)),
+            child_block.clone().map(ElseTail::Else),
+        )));
+
+        let if_node = pad(just("if"))
+            .ignore_then(expr())
+            .then(child_block.clone())
+            .then(else_tail.repeated())
+            .map(|((cond, body), tail)| {
+                let mut branches = vec![(cond, body)];
+                let mut else_branch = Vec::new();
+                for t in tail {
+                    match t {
+                        ElseTail::ElseIf(c, b) => branches.push((c, b)),
+                        ElseTail::Else(b) => else_branch = b,
+                    }
+                }
+                Node::If { branches, else_branch }
+            });
+
+        let for_node = pad(just("for"))
+            .ignore_then(pad(text::ident()))
+            .then_ignore(pad(just("in")))
+            .then(expr())
+            .then(child_block)
+            .map(|((var, iter), body)| Node::For { var, iter, body });
+
+        // `if_node`/`for_node` tried first: both start with a `just(...)`
+        // keyword that fails immediately (and backtracks cleanly, no
+        // `delimited_by` involved yet — see the `{ }` ambiguity gotcha in
+        // CLAUDE.md) on anything but a literal `if`/`for`, so a widget kind
+        // that happens to start with those letters (`iffy`, `format`) falls
+        // through to `widget` unharmed — see `if_and_for_dont_swallow_a_
+        // similarly_named_widget_kind` below.
+        pad(choice((if_node, for_node, widget)))
     })
 }
 
