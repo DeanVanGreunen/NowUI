@@ -3,8 +3,9 @@
   "displayName": "NowUI",
   "description": "Syntax highlighting and diagnostics for .nowui files, via the nowui-lsp language server.",
   "version": "0.1.0",
-  "private": true,
-  "publisher": "nowui",
+  "publisher": "deanvangreunen",
+  "repository": "https://github.com/DeanVanGreunen/NowUI",
+  "icon": "images/icon.png",
   "engines": {
     "vscode": "^1.85.0"
   },
