@@ -19,7 +19,7 @@
 //! signatures with the docs for that version — the logic is unchanged.
 
 use std::num::NonZeroU32;
-use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nowui_core::{
@@ -27,6 +27,7 @@ use nowui_core::{
     NodeId, NodeKind, NowUiState, Point, Rect, Size, StateValue, TemplatePart, Ui,
 };
 use nowui_render::{present_to_softbuffer, SkiaPainter, TextContext};
+use nowui_render_gpu::{GpuFontCache, GpuPainter, GpuSurfaceState};
 use tiny_skia::Pixmap;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -35,6 +36,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
 use crate::transitions::Transitions;
+use crate::Backend;
 
 /// Background color painted before the tree each frame (opaque so premultiplied
 /// == straight for the softbuffer bridge).
@@ -52,8 +54,20 @@ pub struct App<S: NowUiState> {
     /// usually a `#[derive(NowUiState)]` struct; `nowui_core::NoState` for
     /// the plain CLI binary, which has no Rust-side state at all.
     state: S,
-    window: Option<Rc<Window>>,
-    surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    /// `Arc`, not `Rc` — `nowui-render-gpu`'s `wgpu::Surface` requires a
+    /// `Send + Sync` window handle (see `GpuSurfaceState`'s doc comment);
+    /// `softbuffer::Surface` (the CPU backend) is equally happy with either,
+    /// so `Arc` covers both backends uniformly.
+    window: Option<Arc<Window>>,
+    /// Only populated when `backend == Backend::Cpu`.
+    surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
+    /// Only populated when `backend == Backend::Gpu`.
+    gpu: Option<GpuSurfaceState>,
+    /// Resolved font *data* cache for the GPU text path — see
+    /// `GpuFontCache`'s own doc comment. Unused (but harmless to keep
+    /// around) on `Backend::Cpu`.
+    gpu_font_cache: GpuFontCache,
+    backend: Backend,
     cursor: Point,
     /// Font database + glyph cache. Built once (loading system fonts is slow)
     /// and reused across every redraw.
@@ -99,12 +113,15 @@ pub struct App<S: NowUiState> {
 }
 
 impl<S: NowUiState> App<S> {
-    pub fn new(ui: Ui, state: S, semantic: crate::semantic::Semantic) -> Self {
+    pub fn new(ui: Ui, state: S, semantic: crate::semantic::Semantic, backend: Backend) -> Self {
         App {
             ui,
             state,
             window: None,
             surface: None,
+            gpu: None,
+            gpu_font_cache: GpuFontCache::new(),
+            backend,
             cursor: Point::default(),
             text: TextContext::new(),
             hovered: None,
@@ -346,7 +363,11 @@ impl<S: NowUiState> App<S> {
 
     fn redraw(&mut self) {
         let Some(window) = self.window.clone() else { return };
-        if self.surface.is_none() {
+        let ready = match self.backend {
+            Backend::Cpu => self.surface.is_some(),
+            Backend::Gpu => self.gpu.is_some(),
+        };
+        if !ready {
             return;
         }
 
@@ -371,36 +392,26 @@ impl<S: NowUiState> App<S> {
         self.resolve_dynamic_styles();
         self.apply_dynamic_styles(w as f32);
 
-        let mut pixmap = Pixmap::new(w, h).expect("pixmap alloc");
-        pixmap.fill(tiny_skia::Color::from_rgba8(CLEAR.r, CLEAR.g, CLEAR.b, 255));
-
-        {
-            let mut painter = SkiaPainter::new(&mut pixmap, &mut self.text);
-            nowui_core::layout::solve(&mut self.ui, Size::new(w as f32, h as f32), &mut painter);
+        match self.backend {
+            Backend::Cpu => self.redraw_cpu(&window, w, h),
+            Backend::Gpu => self.redraw_gpu(&window, w, h),
         }
 
-        // Needs `computed` rects from the solve above (for each TextInput's
-        // own box width) but can't run inside that same block — it uses
-        // `self.measure_text_width`, a *separate* throwaway-pixmap
-        // `SkiaPainter` over `self.text`, which would conflict with the one
-        // already borrowing it above.
-        self.update_text_input_scroll();
+        self.ui.dirty = false;
 
-        {
-            let mut painter = SkiaPainter::new(&mut pixmap, &mut self.text);
-            nowui_core::paint::paint(&self.ui, &mut painter);
-        }
+        // Frame pacing (a fixed 60fps loop, not event-driven) is owned by
+        // `about_to_wait` — it schedules the next `WaitUntil` deadline and
+        // the next `request_redraw()` regardless of what happened this
+        // frame. Nothing to decide here.
+    }
 
-        let surface = self.surface.as_mut().expect("checked above");
-        surface
-            .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
-            .expect("surface resize");
-
-        // Only ask the OS for an IME composition window while a `TextInput`
-        // is actually focused — otherwise e.g. a focused `Button` would
-        // still pop up a candidate window on every keystroke. Idempotent,
-        // so just redoing this unconditionally every redraw is simplest;
-        // no need to hook every individual place focus can change.
+    /// Only ask the OS for an IME composition window while a `TextInput` is
+    /// actually focused — otherwise e.g. a focused `Button` would still pop
+    /// up a candidate window on every keystroke. Idempotent, so just redoing
+    /// this unconditionally every redraw is simplest; no need to hook every
+    /// individual place focus can change. Shared by both backends — reads
+    /// only `self.ui`, not pixels.
+    fn update_ime_cursor_area(&self, window: &Window) {
         let focused_text_input = self
             .ui
             .focus
@@ -413,16 +424,61 @@ impl<S: NowUiState> App<S> {
                 winit::dpi::PhysicalSize::new(rect.w.max(1.0) as u32, 1u32),
             );
         }
+    }
+
+    fn redraw_cpu(&mut self, window: &Window, w: u32, h: u32) {
+        let mut pixmap = Pixmap::new(w, h).expect("pixmap alloc");
+        pixmap.fill(tiny_skia::Color::from_rgba8(CLEAR.r, CLEAR.g, CLEAR.b, 255));
+
+        {
+            let mut painter = SkiaPainter::new(&mut pixmap, &mut self.text);
+            nowui_core::layout::solve(&mut self.ui, Size::new(w as f32, h as f32), &mut painter);
+        }
+
+        // Needs `computed` rects from the solve above (for each TextInput's
+        // own box width) but can't run inside that same block — it uses
+        // `self.measure_text_width`, which would conflict with the painter
+        // already borrowing `self.text` above.
+        self.update_text_input_scroll();
+
+        {
+            let mut painter = SkiaPainter::new(&mut pixmap, &mut self.text);
+            nowui_core::paint::paint(&self.ui, &mut painter);
+        }
+
+        self.update_ime_cursor_area(window);
+
+        let surface = self.surface.as_mut().expect("checked in redraw");
+        surface
+            .resize(NonZeroU32::new(w).unwrap(), NonZeroU32::new(h).unwrap())
+            .expect("surface resize");
 
         let mut buffer = surface.buffer_mut().expect("buffer");
         present_to_softbuffer(&pixmap, &mut buffer);
         buffer.present().expect("present");
-        self.ui.dirty = false;
+    }
 
-        // Frame pacing (a fixed 60fps loop, not event-driven) is owned by
-        // `about_to_wait` — it schedules the next `WaitUntil` deadline and
-        // the next `request_redraw()` regardless of what happened this
-        // frame. Nothing to decide here.
+    fn redraw_gpu(&mut self, window: &Window, w: u32, h: u32) {
+        let mut scene = vello::Scene::new();
+
+        {
+            let mut painter = GpuPainter::new(&mut scene, &mut self.text, &mut self.gpu_font_cache);
+            nowui_core::layout::solve(&mut self.ui, Size::new(w as f32, h as f32), &mut painter);
+        }
+
+        // See `redraw_cpu`'s matching comment — same borrow-conflict reason.
+        self.update_text_input_scroll();
+
+        {
+            let mut painter = GpuPainter::new(&mut scene, &mut self.text, &mut self.gpu_font_cache);
+            nowui_core::paint::paint(&self.ui, &mut painter);
+        }
+
+        self.update_ime_cursor_area(window);
+
+        let gpu = self.gpu.as_mut().expect("checked in redraw");
+        gpu.resize(w, h);
+        gpu.render_and_present(&scene, CLEAR);
     }
 
     fn request_redraw(&self) {
@@ -931,13 +987,21 @@ impl<S: NowUiState> ApplicationHandler for App<S> {
         let attrs = Window::default_attributes()
             .with_title("NowUI")
             .with_inner_size(winit::dpi::LogicalSize::new(1024.0, 640.0));
-        let window = Rc::new(event_loop.create_window(attrs).expect("create window"));
+        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        let size = window.inner_size();
 
-        let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
-        let surface = softbuffer::Surface::new(&context, window.clone()).expect("surface");
+        match self.backend {
+            Backend::Cpu => {
+                let context = softbuffer::Context::new(window.clone()).expect("softbuffer context");
+                let surface = softbuffer::Surface::new(&context, window.clone()).expect("surface");
+                self.surface = Some(surface);
+            }
+            Backend::Gpu => {
+                self.gpu = Some(GpuSurfaceState::new(window.clone(), size.width.max(1), size.height.max(1)));
+            }
+        }
 
         self.window = Some(window);
-        self.surface = Some(surface);
         self.ui.dirty = true;
         self.next_frame = Instant::now();
         self.request_redraw();
@@ -1183,7 +1247,7 @@ mod tests {
         let id = ui.push(Node::new(NodeKind::Container, style));
         ui.add_layer(id, "main");
 
-        let mut app = App::new(ui, DemoState { width: 250.0 }, crate::semantic::Semantic::new(&[]));
+        let mut app = App::new(ui, DemoState { width: 250.0 }, crate::semantic::Semantic::new(&[]), Backend::Cpu);
         app.resolve_dynamic_styles();
 
         assert_eq!(app.ui.get(id).base_style.width, Sizing::Fixed(250.0));
@@ -1197,7 +1261,7 @@ mod tests {
         let id = ui.push(Node::new(NodeKind::Container, style));
         ui.add_layer(id, "main");
 
-        let mut app = App::new(ui, DemoState::default(), crate::semantic::Semantic::new(&[]));
+        let mut app = App::new(ui, DemoState::default(), crate::semantic::Semantic::new(&[]), Backend::Cpu);
         app.resolve_dynamic_styles();
 
         assert_eq!(app.ui.get(id).base_style.width, Sizing::Hug, "left at its default");
@@ -1221,7 +1285,7 @@ mod tests {
         let mut sem = crate::semantic::Semantic::new(&ast);
         let ui = sem.build("T", &S::default()).unwrap();
 
-        let mut app = App::new(ui, S::default(), sem);
+        let mut app = App::new(ui, S::default(), sem, Backend::Cpu);
         app.dispatch_pending_on_load();
         assert_eq!(app.state.load_count, 0, "queued, not fired yet — the delay hasn't elapsed");
         assert_eq!(app.pending_on_load_timers.len(), 1);
@@ -1262,7 +1326,7 @@ mod tests {
         let state = S { page: "a".to_string() };
         let ui = sem.build("T", &state).unwrap();
 
-        let mut app = App::new(ui, state, sem);
+        let mut app = App::new(ui, state, sem, Backend::Cpu);
         app.dispatch_pending_on_load();
         assert_eq!(app.pending_on_load_timers.len(), 1, "queued, not fired — delay hasn't elapsed yet");
 
@@ -1295,7 +1359,7 @@ mod tests {
         let mut sem = crate::semantic::Semantic::new(&ast);
         let ui = sem.build("T", &S::default()).unwrap();
 
-        let mut app = App::new(ui, S::default(), sem);
+        let mut app = App::new(ui, S::default(), sem, Backend::Cpu);
         app.dispatch_pending_on_load();
         assert_eq!(app.state.load_count, 1);
         assert!(app.pending_on_load_timers.is_empty(), "never queued at all — no delay to wait out");
@@ -1321,7 +1385,7 @@ mod tests {
         let state = S { load_count: 0, rows: vec![1] };
         let ui = sem.build("T", &state).unwrap();
 
-        let mut app = App::new(ui, state, sem);
+        let mut app = App::new(ui, state, sem, Backend::Cpu);
         app.dispatch_pending_on_load();
         assert_eq!(app.state.load_count, 2, "the static Container plus the one initial row");
 
@@ -1338,7 +1402,7 @@ mod tests {
         let menu = ui.push(Node::new(NodeKind::Menu { label: "Preferences".to_string(), open: false }, Style::default()));
         ui.get_mut(menu).children = vec![item];
         ui.add_layer(menu, "main");
-        let mut app = App::new(ui, nowui_core::NoState, crate::semantic::Semantic::new(&[]));
+        let mut app = App::new(ui, nowui_core::NoState, crate::semantic::Semantic::new(&[]), Backend::Cpu);
 
         app.handle_click(menu);
         let NodeKind::Menu { open, .. } = &app.ui.get(menu).kind else { panic!() };
@@ -1374,7 +1438,7 @@ mod tests {
         // normal in-flow hit-testing — clicking it goes through
         // `select_menu_item`, mirroring `select_dropdown_option`.
         ui.get_mut(item).computed = Rect::new(0.0, 40.0, 100.0, 20.0);
-        let mut app = App::new(ui, S::default(), crate::semantic::Semantic::new(&[]));
+        let mut app = App::new(ui, S::default(), crate::semantic::Semantic::new(&[]), Backend::Cpu);
         app.select_menu_item(menu, Point::new(10.0, 50.0));
 
         assert!(app.state.item_clicked, "MenuItem's own onClick fired, not the parent Menu's");
@@ -1401,7 +1465,7 @@ mod tests {
             Style::default(),
         ));
         ui.add_layer(id, "main");
-        (App::new(ui, nowui_core::NoState, crate::semantic::Semantic::new(&[])), id)
+        (App::new(ui, nowui_core::NoState, crate::semantic::Semantic::new(&[]), Backend::Cpu), id)
     }
 
     fn text_input_state(app: &App<nowui_core::NoState>, id: NodeId) -> (String, usize, Option<usize>) {

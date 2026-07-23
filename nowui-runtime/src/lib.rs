@@ -31,11 +31,24 @@ use winit::event_loop::{ControlFlow, EventLoop};
 
 pub use app::App;
 
+/// Which rendering backend `App` uses. `Gpu` (`vello`/`wgpu`, via
+/// `nowui-render-gpu`) is the default for `run`/`run_path`. `Cpu` (tiny-skia/
+/// softbuffer, via `nowui-render`) remains fully supported and is reachable
+/// via `run_with_backend`/`run_path_with_backend` — useful on a headless/
+/// no-GPU machine, or as a visual regression reference against the GPU path.
+/// See README.md's architecture section for the fidelity differences between
+/// the two (e.g. text rotates with its node's transform on `Gpu`, not `Cpu`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Backend {
+    Cpu,
+    Gpu,
+}
+
 /// Build the `entry` layout from `ast` and run the winit event loop against
 /// `state` until the window closes — the shared tail end of `run`/
 /// `run_path`, once each has produced an AST by whatever means (bundled
 /// string vs. on-disk file + import resolution).
-fn run_ast<S: NowUiState + 'static>(ast: Vec<Node>, entry: &str, state: S) -> ExitCode {
+fn run_ast<S: NowUiState + 'static>(ast: Vec<Node>, entry: &str, state: S, backend: Backend) -> ExitCode {
     let mut sem = semantic::Semantic::new(&ast);
     let ui = match sem.build(entry, &state) {
         Some(ui) => ui,
@@ -61,7 +74,7 @@ fn run_ast<S: NowUiState + 'static>(ast: Vec<Node>, entry: &str, state: S) -> Ex
     // the app's whole lifetime — an `if`/`for`'s live re-expansion each
     // redraw needs the AST it came from, not just the one-time `Ui` it
     // originally produced.
-    let mut app = App::new(ui, state, sem);
+    let mut app = App::new(ui, state, sem, backend);
     app.dispatch_pending_on_load();
     match event_loop.run_app(&mut app) {
         Ok(()) => ExitCode::SUCCESS,
@@ -86,7 +99,15 @@ fn run_ast<S: NowUiState + 'static>(ast: Vec<Node>, entry: &str, state: S) -> Ex
 /// Fails with a clear error (rather than compiling a working binary that
 /// panics) if `S` has no `#[nowui(view(...))]` — use `run_path` instead for
 /// a state type that isn't backed by a bundled view.
+///
+/// Renders via `Backend::Gpu` — use `run_with_backend` to pick `Backend::Cpu`
+/// instead (e.g. on a headless/no-GPU machine).
 pub fn run<S: NowUiState + 'static>(entry: &str, state: S) -> ExitCode {
+    run_with_backend(entry, state, Backend::Gpu)
+}
+
+/// Same as `run`, with an explicit `backend` choice instead of the `Gpu` default.
+pub fn run_with_backend<S: NowUiState + 'static>(entry: &str, state: S, backend: Backend) -> ExitCode {
     let Some(source) = S::nowui_view() else {
         eprintln!(
             "error: `{}` has no `#[nowui(view(\"/path.nowui\"))]` — add one, or call \
@@ -110,7 +131,7 @@ pub fn run<S: NowUiState + 'static>(entry: &str, state: S) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    run_ast(ast, entry, state)
+    run_ast(ast, entry, state, backend)
 }
 
 /// Load `path` from disk, resolve its `#` imports, build the `entry` layout,
@@ -118,7 +139,15 @@ pub fn run<S: NowUiState + 'static>(entry: &str, state: S) -> ExitCode {
 /// the original (pre-bundling) entry point; still the right choice for an
 /// arbitrary/dev-time `.nowui` file (e.g. the `nowui` CLI binary), or for
 /// iterating on a file without a rebuild.
+///
+/// Renders via `Backend::Gpu` — use `run_path_with_backend` to pick
+/// `Backend::Cpu` instead (e.g. on a headless/no-GPU machine).
 pub fn run_path<S: NowUiState + 'static>(path: &str, entry: &str, state: S) -> ExitCode {
+    run_path_with_backend(path, entry, state, Backend::Gpu)
+}
+
+/// Same as `run_path`, with an explicit `backend` choice instead of the `Gpu` default.
+pub fn run_path_with_backend<S: NowUiState + 'static>(path: &str, entry: &str, state: S, backend: Backend) -> ExitCode {
     let ast = match loader::load_and_resolve(Path::new(path)) {
         Ok(ast) => ast,
         Err(e) => {
@@ -126,7 +155,7 @@ pub fn run_path<S: NowUiState + 'static>(path: &str, entry: &str, state: S) -> E
             return ExitCode::FAILURE;
         }
     };
-    run_ast(ast, entry, state)
+    run_ast(ast, entry, state, backend)
 }
 
 fn available(ast: &[nowui_syntax::ast::Node]) -> Vec<String> {
