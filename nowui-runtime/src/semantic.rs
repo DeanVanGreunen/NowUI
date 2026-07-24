@@ -379,19 +379,30 @@ impl Semantic {
             // `paint.rs`.
             "Menu" => Some(NodeKind::Menu { label: arg(0), open: false }),
             "MenuItem" => Some(NodeKind::MenuItem { label: arg(0) }),
-            // `Date`/`DateTime` start browsing the calendar popup on the
-            // system clock's current month (`view_year`/`view_month`) —
-            // re-synced to the bound value's own month whenever the popup is
-            // (re)opened, see `nowui-runtime`'s `App::handle_click`.
-            "Date" => {
-                let (y, m, ..) = nowui_core::datetime::now();
-                Some(NodeKind::Date { value: String::new(), placeholder: arg(0), open: false, view_year: y, view_month: m })
-            }
-            "Time" => Some(NodeKind::Time { value: String::new(), placeholder: arg(0), open: false }),
-            "DateTime" => {
-                let (y, m, ..) = nowui_core::datetime::now();
-                Some(NodeKind::DateTime { value: String::new(), placeholder: arg(0), open: false, view_year: y, view_month: m })
-            }
+            // `picker`/`date_picker`/`time_picker` start seeded from an empty
+            // `value` (i.e. the system clock's current date/time) — they're
+            // re-seeded from whatever `value` actually is every time the
+            // popup opens, see `nowui-runtime`'s `App::handle_click`.
+            "Date" => Some(NodeKind::Date {
+                value: String::new(),
+                placeholder: arg(0),
+                open: false,
+                picker: nowui_core::datetime::DatePickerState::from_value_or_now(""),
+            }),
+            "Time" => Some(NodeKind::Time {
+                value: String::new(),
+                placeholder: arg(0),
+                open: false,
+                picker: nowui_core::datetime::TimePickerState::from_value_or_now(""),
+            }),
+            "DateTime" => Some(NodeKind::DateTime {
+                value: String::new(),
+                placeholder: arg(0),
+                open: false,
+                date_picker: nowui_core::datetime::DatePickerState::from_value_or_now(""),
+                time_picker: nowui_core::datetime::TimePickerState::from_value_or_now(""),
+                active_tab: nowui_core::datetime::DateTimeTab::Calendar,
+            }),
             // Bare containers used directly in a body (e.g. `Card`, `Row`).
             "Card" | "Container" | "Row" | "Column" | "Bar" | "Grid" | "List" => Some(NodeKind::Container),
             other => {
@@ -1002,8 +1013,11 @@ fn compact_sizing(token: &str) -> Sizing {
 /// `Node::value_path` — read by `Text`/`TextInput`/`Checkbox`/`Dropdown`/
 /// `Slider`/`ProgressBar`, ignored by anything else), any of
 /// `EVENT_BINDING_KEYS` (stored on `Node::events`, keyed by the binding
-/// name), and `{onLoadDelay: 1.0}` (a literal number of seconds, stored on
-/// `Node::on_load_delay_secs` — see that field's doc comment).
+/// name), `{onLoadDelay: 1.0}` (a literal number of seconds, stored on
+/// `Node::on_load_delay_secs` — see that field's doc comment), and
+/// `{minYear: state.path}`/`{maxYear: state.path}` (`Date`/`DateTime`'s year
+/// dropdown bounds, stored on `Node::min_year_path`/`max_year_path` —
+/// harmlessly unused by every other widget kind).
 fn apply_generic_bindings(ui: &mut Ui, id: NodeId, bindings: &[nowui_syntax::ast::Binding], scope: &Scope) {
     for b in bindings {
         if b.key == "onLoadDelay" {
@@ -1016,6 +1030,10 @@ fn apply_generic_bindings(ui: &mut Ui, id: NodeId, bindings: &[nowui_syntax::ast
         let path = resolve_scoped_path(path, scope);
         if b.key == "value" {
             ui.get_mut(id).value_path = path;
+        } else if b.key == "minYear" {
+            ui.get_mut(id).min_year_path = path;
+        } else if b.key == "maxYear" {
+            ui.get_mut(id).max_year_path = path;
         } else if EVENT_BINDING_KEYS.contains(&b.key.as_str()) {
             ui.get_mut(id).events.insert(b.key.clone(), path);
         }
@@ -1307,14 +1325,25 @@ mod tests {
         assert_eq!(time_node.events.get("onSelect"), Some(&vec!["state".to_string(), "onTime".to_string()]));
 
         let datetime_node = ui.get(root.children[2]);
-        let nowui_core::NodeKind::DateTime { placeholder, view_year, view_month, .. } = &datetime_node.kind else {
+        let nowui_core::NodeKind::DateTime { placeholder, date_picker, .. } = &datetime_node.kind else {
             panic!("expected a DateTime node");
         };
         assert_eq!(placeholder, "Pick both");
-        // `view_year`/`view_month` start on the system clock's current month.
+        // The staged calendar starts browsing the system clock's current month.
         let (now_y, now_m, ..) = nowui_core::datetime::now();
-        assert_eq!((*view_year, *view_month), (now_y, now_m));
+        assert_eq!((date_picker.staged_year, date_picker.staged_month), (now_y, now_m));
         assert_eq!(datetime_node.events.get("onSelect"), Some(&vec!["state".to_string(), "onBoth".to_string()]));
+    }
+
+    #[test]
+    fn resolves_min_year_and_max_year_bindings_on_date() {
+        let ast = nowui_syntax::parse("layout: T { Date `Pick` {value: state.d, minYear: state.minYear, maxYear: state.maxYear} }").unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let node = ui.get(root.children[0]);
+        assert_eq!(node.min_year_path, vec!["state".to_string(), "minYear".to_string()]);
+        assert_eq!(node.max_year_path, vec!["state".to_string(), "maxYear".to_string()]);
     }
 
     #[test]

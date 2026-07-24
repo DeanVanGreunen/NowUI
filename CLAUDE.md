@@ -75,6 +75,11 @@ nowui-runtime/examples/counter.rs + counter.nowui   a smaller `#[derive(NowUiSta
                                  end-to-end example (increment/decrement counter), loaded from
                                  disk via `run_path` — `cargo run -p nowui-runtime --example
                                  counter`.
+nowui-runtime/examples/datetime_demo.rs + datetime_demo.nowui   a showcase of `Date`/`Time`/
+                                 `DateTime` (staged Confirm/Cancel popups, the draggable analog
+                                 clock, `minYear`/`maxYear`-bounded year dropdown, the DateTime
+                                 Calendar/Clock tab toggle), loaded from disk via `run_path` —
+                                 `cargo run -p nowui-runtime --example datetime_demo`.
 ```
 
 ### Workspace members (`Cargo.toml`)
@@ -105,6 +110,7 @@ cargo test --workspace                                        # everything
 cargo run -p nowui-runtime -- examples/counter-app/src/login.nowui App   # opens a window, no Rust state
 cargo run -p nowui-login-app                                             # opens a window, bundled .nowui + real state
 cargo run -p nowui-runtime --example counter                             # opens a window, on-disk .nowui + real state
+cargo run -p nowui-runtime --example datetime_demo                       # opens a window, Date/Time/DateTime showcase
 
 cargo build -p nowui-lsp                                       # builds target/debug/nowui-lsp[.exe]
 cd nowui-extension && npm install && npm run compile            # then F5 in VS Code — see its README.md
@@ -251,9 +257,11 @@ Slider {value: state.volume}
 Any widget can carry a `{value: state.path}` binding (read by `Text`/`Checkbox`/`Dropdown`/
 `Slider`/`ProgressBar`/`TextInput`/`Date`/`Time`/`DateTime`) plus any of the event keys: `onClick`,
 `onMouseMove`, `onMouseDown`, `onMouseUp`, `onKeyPress`, `onKeyDown`, `onKeyUp`, `onResize`,
-`onSelect` (`Date`/`Time`/`DateTime` only — fires when their popup changes the value). Bindings
-are rooted at the literal `state` segment (`state.counter.increment`) — stripped before crossing
-into the Rust-side `NowUiState` reflection boundary.
+`onSelect` (`Date`/`Time`/`DateTime` only — fires when their popup's Confirm button commits a new
+value). `Date`/`DateTime` also accept `{minYear: state.path}`/`{maxYear: state.path}`, bounding
+their year dropdown (see the widget section below). Bindings are rooted at the literal `state`
+segment (`state.counter.increment`) — stripped before crossing into the Rust-side `NowUiState`
+reflection boundary.
 
 ### `if`/`else if`/`else` and `for` — dynamic regions
 
@@ -371,36 +379,60 @@ live. `text-color` is the track-fill/thumb color, `border-color` is the empty-tr
 ProgressBar w-full text-emerald-500 border-gray-200 {value: 82}
 ```
 
-**`Date`/`Time`/`DateTime`** — a `Dropdown`-shaped closed box (bordered, showing `value` or a
-placeholder while empty) plus a floating picker popup, opened/closed by clicking the box like
-`Dropdown`/`Checkbox`:
+**`Date`/`Time`/`DateTime`** — a closed box holding `value` (or a placeholder while empty) plus a
+floating picker popup, opened/closed by clicking the box like `Dropdown`/`Checkbox`. Styled
+**exactly like `TextInput`** — no built-in box border/background of its own; `bg-*`/`border-*`/
+`rounded-*`/`p-*`/`h-*` etc. are the *only* thing drawing the closed box (see `paint_picker_box`),
+same as a plain `TextInput`:
 
 ```nowui
-Date `Choose a date` {value: state.birthday, onSelect: state.onBirthdayPicked}
-Time `Choose a time` with-seconds {value: state.alarm, onSelect: state.onAlarmPicked}
-DateTime `Choose both` with-seconds {value: state.meeting, onSelect: state.onMeetingPicked}
+Date `Choose a date` w-full bg-white border rounded p-[10px] {
+  value: state.birthday, minYear: state.minYear, maxYear: state.maxYear, onSelect: state.onBirthdayPicked
+}
+Time `Choose a time` with-seconds w-full bg-white border rounded p-[10px] {value: state.alarm, onSelect: state.onAlarmPicked}
+DateTime `Choose both` w-full bg-white border rounded p-[10px] {
+  value: state.meeting, minYear: state.minYear, maxYear: state.maxYear, onSelect: state.onMeetingPicked
+}
 ```
 
 - Value formats: `Date` is `DD/MM/YYYY`; `Time` is `HH:MM`, or `HH:MM:SS` with the `with-seconds`
-  bare style flag; `DateTime` is the two joined by one space (`DD/MM/YYYY HH:MM[:SS]`). All
-  parsing/formatting lives in `nowui-core`'s `datetime` module — no external date/time crate
-  (`datetime::now()` reads the system clock as **UTC**, not the OS's local timezone; no timezone
-  database is linked in, matching the "don't half-implement it" convention below).
-- `onSelect` (a new `EVENT_BINDING_KEYS` entry) fires every time the popup actually changes the
-  value — once per day-cell click for `Date`, once per spinner arrow click for `Time`/`DateTime`.
-- `Date`'s popup is a month-grid calendar (fixed 6x7 cells, `<`/`>` nav arrows to browse other
-  months) rendered on the system clock's current month at first open, and re-synced to the bound
-  value's own month every time it's reopened. Picking a day is **terminal** — like `Dropdown`
-  selecting an option, it writes the value, dispatches `onSelect`, and closes the popup.
-- `Time`'s popup is a compact spinner: one `+`/value/`-` column per unit (hour/minute, plus
-  seconds with `with-seconds`) — a click steps that unit by one, wrapping at its bound. Unlike
-  `Date`, a pick **never** auto-closes the popup, since dialing in a time takes more than one click.
-- `DateTime`'s popup stacks a calendar directly above a spinner in one floating popup. Clicking
-  either half updates only that half of the combined value (via `datetime::split_datetime`/
-  `join_datetime`) and, like `Time`, never auto-closes the popup on its own — only clicking the
-  box again, or clicking elsewhere, closes it.
-- All three are styled the same way as `Dropdown`'s box (`border-color`/`rounded`/`radius`,
-  `bg`/`text-color` on both the box and the popup panel).
+  bare style flag; `DateTime` is the two joined by one space (`DD/MM/YYYY HH:MM[:SS]`). All date
+  math/formatting/parsing/popup geometry lives in `nowui-core`'s `datetime` module — no external
+  date/time crate (`datetime::now()` reads the system clock as **UTC**, not the OS's local
+  timezone; no timezone database is linked in, matching the "don't half-implement it" convention
+  below).
+- **Staged vs. committed**: every popup edits a *staged* copy of the value (`NodeKind::Date`'s
+  `picker: DatePickerState`, `Time`'s `picker: TimePickerState`, `DateTime`'s `date_picker`/
+  `time_picker`) — clicking a day, dragging the clock hand, paging the year list, none of that
+  touches `value` itself. **Confirm** commits the staged state into `value` and dispatches
+  `onSelect`; **Cancel**, or clicking outside the popup, discards it and closes without saving.
+  Every popup carries a Cancel/Confirm footer. Reopening the popup re-seeds the staged copy from
+  `value` — or, if `value` is still empty, from the system clock's current date/time (so the
+  calendar/clock always shows *something* concrete, without ever writing that default into
+  `value` on its own).
+- **`Date`'s popup**: a two-row header — a month row (`<`/`>` steps the month by one, wrapping the
+  year at Dec/Jan) and a year row (`<`/`>` steps *only* the year, never the month; a `YYYY ▾`
+  dropdown toggles a paged 12-year grid in place of the day grid, bounded by `minYear`/`maxYear` —
+  default `now year ± 100` if unbound). Below that, weekday labels and a fixed 6x7 day grid; the
+  staged day shows as a filled indigo circle.
+- **`Time`'s popup**: a draggable analog dial. A header row of clickable hour/minute/[second
+  with `with-seconds`] segments switches which ring the dial edits; dragging the hand (or clicking
+  anywhere on the face) jumps the active ring's staged value to the angle under the cursor — the
+  hour ring snaps to its 12 tick positions, the minute/second ring is continuous (any exact
+  minute/second, not just 5-unit ticks). A two-way AM/PM toggle sits below the dial.
+- **`DateTime`'s popup**: a two-button **CALENDAR**/**CLOCK** tab row switches which single
+  sub-view is shown — never both at once. Picking a date on the Calendar tab or dragging the dial
+  on the Clock tab only ever updates its own half of the staged state; one shared Cancel/Confirm
+  footer commits (`datetime::join_datetime`) or discards *both* halves together, regardless of
+  which tab was last active.
+- **Popup placement**: every popup opens directly below its box, flipping above instead if it
+  would overflow the bottom of the window (`datetime::place_popup`, driven by `Ui::viewport` —
+  kept in sync by `layout::solve` every frame).
+- **Theme**: every popup's own internals (not the closed box, which follows the widget's own
+  style) are a fixed white background / near-black text / indigo (Tailwind indigo-500/600/100)
+  accent palette — hover shows a light-indigo highlight, a held mouse-button shows a darker one,
+  computed live each redraw from `Ui::cursor`/`Ui::mouse_down` (these hand-drawn controls aren't
+  real per-control arena nodes, so they can't carry their own `hover:`/`active:` style variants).
 
 **`scroll-h`/`scroll-v`** — clips overflow along that axis, mouse wheel pans it:
 

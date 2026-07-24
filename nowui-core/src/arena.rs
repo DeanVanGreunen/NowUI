@@ -4,7 +4,8 @@
 
 use std::collections::HashMap;
 
-use crate::geometry::Rect;
+use crate::datetime::{DatePickerState, DateTimeTab, TimePickerState};
+use crate::geometry::{Point, Rect, Size};
 use crate::style::Style;
 
 /// The event/binding names the semantic pass recognizes generically on *any*
@@ -122,41 +123,47 @@ pub enum NodeKind {
     MenuItem {
         label: String,
     },
-    /// A `DD/MM/YYYY` closed box + a floating month-calendar popup, same
-    /// "occupies no in-flow space, floats above everything, open" shape as
-    /// `Dropdown` (see `NodeKind::Dropdown`'s doc comment). `view_year`/
-    /// `view_month` are pure UI-navigation state (which month the popup is
-    /// currently browsing) — independent of `value`, which only ever
-    /// changes when a day cell is actually clicked. Re-synced to `value`'s
-    /// own month whenever the popup is opened (see `nowui-runtime`'s
-    /// `handle_click`), so reopening always starts on the picked date.
+    /// A `DD/MM/YYYY` closed box + a floating calendar popup with a
+    /// Cancel/Confirm footer, same "occupies no in-flow space, floats above
+    /// everything, open" shape as `Dropdown` (see `NodeKind::Dropdown`'s doc
+    /// comment). `picker` holds everything the popup edits *live* — it's
+    /// seeded from `value` (or the system clock's current date, if `value`
+    /// is empty) via `DatePickerState::from_value_or_now` every time the
+    /// popup opens, and discarded again on Cancel/click-outside. Only
+    /// Confirm writes `picker`'s staged day back into `value` — see
+    /// `nowui-runtime`'s `select_date_popup`/`confirm_date_popup`.
     Date {
         value: String,
         placeholder: String,
         open: bool,
-        view_year: i32,
-        view_month: u32,
+        picker: DatePickerState,
     },
     /// An `HH:MM` (or `HH:MM:SS`, with the `with-seconds` style flag — see
-    /// `Style::with_seconds`) closed box + a floating spinner popup (one
-    /// up-arrow/value/down-arrow column per unit). Unlike `Date`/`Dropdown`,
-    /// picking a value never auto-closes the popup — dialing in a time
-    /// takes more than one click (see `nowui-runtime`'s `select_time_popup`).
+    /// `Style::with_seconds`) closed box + a floating popup: a draggable
+    /// analog dial (hour ring, then minute, then second) with an AM/PM
+    /// toggle and a Cancel/Confirm footer. Same staged-vs-committed
+    /// relationship between `picker` and `value` as `Date`'s `picker` —
+    /// dragging the hand only ever edits `picker`; only Confirm commits it.
     Time {
         value: String,
         placeholder: String,
         open: bool,
+        picker: TimePickerState,
     },
-    /// `Date` and `Time` combined into one popup (a calendar stacked above a
-    /// spinner) writing into one `"DD/MM/YYYY HH:MM[:SS]"` value — see
-    /// `datetime::join_datetime`/`split_datetime`. Like `Time`, never
-    /// auto-closes on a single pick.
+    /// `Date` and `Time` combined into one popup writing into one
+    /// `"DD/MM/YYYY HH:MM[:SS]"` value (see `datetime::join_datetime`/
+    /// `split_datetime`) — a two-button Calendar/Clock tab row switches
+    /// which single sub-view (`date_picker`'s calendar, or `time_picker`'s
+    /// dial) is shown at a time; never both stacked together. One shared
+    /// Cancel/Confirm footer commits (or discards) both staged halves at
+    /// once, regardless of which tab is currently active.
     DateTime {
         value: String,
         placeholder: String,
         open: bool,
-        view_year: i32,
-        view_month: u32,
+        date_picker: DatePickerState,
+        time_picker: TimePickerState,
+        active_tab: DateTimeTab,
     },
 }
 
@@ -193,6 +200,13 @@ pub struct Node {
     /// writes the result into the widget (and, on interaction, writes back
     /// the other direction — see `App::write_back_value`).
     pub value_path: Vec<String>,
+    /// `{minYear: state.path}`/`{maxYear: state.path}` on `Date`/`DateTime` —
+    /// bounds the year dropdown's paged year-grid. Resolved each redraw by
+    /// `nowui-runtime`'s `App::resolve_year_bounds` into `DatePickerState`'s
+    /// `min_year`/`max_year`, same read-half-of-reactivity shape as
+    /// `value_path`. Empty (unbound) on every other widget kind.
+    pub min_year_path: Vec<String>,
+    pub max_year_path: Vec<String>,
     /// `{onClick: ..., onMouseMove: ..., ...}` — see `EVENT_BINDING_KEYS`.
     /// Parsed and stored generically on every widget by the semantic pass;
     /// dispatched each frame by `nowui-runtime`'s `App::dispatch_event` to
@@ -242,6 +256,8 @@ impl Node {
             content_size: crate::geometry::Size::default(),
             scroll_offset: crate::geometry::Point::default(),
             value_path: Vec::new(),
+            min_year_path: Vec::new(),
+            max_year_path: Vec::new(),
             events: HashMap::new(),
             templates: Vec::new(),
             dirty: true,
@@ -266,6 +282,21 @@ pub struct Ui {
     pub focus: Option<NodeId>,
     /// Coarse dirty flag; when set, the next redraw re-solves and repaints.
     pub dirty: bool,
+    /// The window size the last `layout::solve` ran against — set at the top
+    /// of `solve` itself. Read by `paint`'s `Date`/`Time`/`DateTime` popup
+    /// drawing (and `nowui-runtime`'s matching click hit-testing) to decide
+    /// whether a popup should open above or below its box, via
+    /// `datetime::place_popup`.
+    pub viewport: Size,
+    /// The live cursor position and whether the left mouse button is
+    /// currently held down — kept in sync by `nowui-runtime`'s `App` each
+    /// input event, read by `paint`'s hand-drawn `Date`/`Time`/`DateTime`
+    /// popup controls (Confirm/Cancel/nav arrows/day cells/...) to render
+    /// their own hover/press highlight, since those controls are drawn
+    /// directly rather than being real per-control arena nodes with their
+    /// own `hover:`/`active:` style variants.
+    pub cursor: Point,
+    pub mouse_down: bool,
 }
 
 impl Ui {

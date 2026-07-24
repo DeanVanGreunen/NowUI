@@ -355,14 +355,14 @@ fn paint_menu_popup(ui: &Ui, id: NodeId, painter: &mut dyn Painter) {
 /// `value` (or `placeholder` while empty) plus a small icon glyph — the same
 /// shape as `Dropdown`'s own box (see `paint_node`'s `Dropdown` arm), just
 /// without an options-list caret since there's no fixed option set here.
+/// Draws a `Date`/`Time`/`DateTime`'s closed box: `value` (or `placeholder`
+/// while empty) plus a small icon glyph — deliberately styled exactly like
+/// `TextInput` (see `paint_text_input`): no border/bg of its own here, the
+/// generic top-of-`paint_node` `bg`/`border-color`/`radius` block (already
+/// run before this match arm) is the *only* thing drawing the box, so every
+/// `p-*`/`h-*`/`bg-*`/`border-*`/`rounded-*` class works exactly as it would
+/// on a `TextInput`.
 fn paint_picker_box(painter: &mut dyn Painter, content_rect: Rect, style: &crate::style::Style, value: &str, placeholder: &str) {
-    let (box_h, _) = crate::style::dropdown_metrics(style.font_size);
-    let box_border = style.border_color.unwrap_or(Color::rgb(209, 213, 219));
-
-    let mut box_rect = content_rect;
-    box_rect.h = box_h;
-    painter.stroke_rect(box_rect, box_border, 1.0, style.radius);
-
     let label = if value.is_empty() { placeholder } else { value };
     let label_style = TextStyle {
         color: style.text_color,
@@ -371,137 +371,320 @@ fn paint_picker_box(painter: &mut dyn Painter, content_rect: Rect, style: &crate
         weight: style.font_weight,
         letter_spacing: style.letter_spacing,
     };
-    let mut label_rect = box_rect.inset(Edges::all(8.0));
-    label_rect.w -= 14.0; // leave room for the icon glyph
-    painter.draw_text(label, label_rect, &label_style);
+    let mut label_rect = content_rect;
+    label_rect.w -= 20.0; // leave room for the icon glyph
+    painter.draw_text(label, vcenter_text(label_rect, style.font_size), &label_style);
 
     // Icon glyph: a small filled square (no path primitive for a real
     // calendar/clock icon — same crude-box convention as Dropdown's caret).
     let icon_size = (style.font_size * 0.4).max(4.0);
-    let icon = Rect::new(box_rect.x + box_rect.w - icon_size - 8.0, box_rect.y + (box_rect.h - icon_size) / 2.0, icon_size, icon_size);
+    let icon =
+        Rect::new(content_rect.x + content_rect.w - icon_size, content_rect.y + (content_rect.h - icon_size) / 2.0, icon_size, icon_size);
     painter.fill_rect(icon, style.text_color, Edges::default());
+}
+
+// ---------------------------------------------------------------------
+// Popup theme: fixed white/black/indigo regardless of the widget's own
+// style (the closed box above still respects the widget's own styling —
+// only the popup's own internals use this fixed palette, per the design).
+// ---------------------------------------------------------------------
+
+const POPUP_BG: Color = Color { r: 255, g: 255, b: 255, a: 255 };
+const POPUP_TEXT: Color = Color { r: 20, g: 20, b: 20, a: 255 };
+const POPUP_MUTED: Color = Color { r: 130, g: 130, b: 130, a: 255 };
+const POPUP_BORDER: Color = Color { r: 224, g: 224, b: 228, a: 255 };
+const INDIGO: Color = Color { r: 0x63, g: 0x66, b: 0xf1, a: 255 }; // indigo-500
+const INDIGO_DARK: Color = Color { r: 0x4f, g: 0x46, b: 0xe5, a: 255 }; // indigo-600, pressed
+const INDIGO_LIGHT: Color = Color { r: 0xe0, g: 0xe7, b: 0xff, a: 255 }; // indigo-100, hovered
+const WHITE: Color = Color { r: 255, g: 255, b: 255, a: 255 };
+
+/// `rect`'s current interaction state against the live cursor/mouse-down
+/// flags `paint`'s hand-drawn popup controls key their hover/press
+/// highlight off (see `Ui::cursor`/`Ui::mouse_down`'s doc comment) — these
+/// controls are drawn directly, not real per-control arena nodes with their
+/// own `hover:`/`active:` variants.
+fn button_highlight(rect: Rect, ui: &Ui) -> Option<Color> {
+    if !rect.contains(ui.cursor) {
+        return None;
+    }
+    Some(if ui.mouse_down { INDIGO_DARK } else { INDIGO_LIGHT })
+}
+
+/// `Painter::draw_text` always anchors a single line to `bounds.y` (see
+/// `nowui-render`'s `draw_text`) rather than centering it — using
+/// `nowui-text`'s own `size * 1.3` line-height convention
+/// (`shape_text`/`measure`'s `Metrics::new(size, size * 1.3)`). Every
+/// hand-drawn popup control below draws one line of text into a rect
+/// that's deliberately taller than that (a whole grid cell, a footer/tab
+/// row, ...), so it must center that line manually or it visibly drifts
+/// toward the rect's top — most obviously wherever a separate "true
+/// center" shape (a selected day/hour bubble, the clock hand's tip) is
+/// positioned from that same rect's *geometric* center and needs to
+/// actually line up with the glyph drawn over it.
+fn vcenter_text(rect: Rect, font_size: f32) -> Rect {
+    let line_h = font_size * 1.3;
+    Rect::new(rect.x, rect.y + (rect.h - line_h) / 2.0, rect.w, line_h)
+}
+
+fn draw_text_button(painter: &mut dyn Painter, rect: Rect, label: &str, font_size: f32, ui: &Ui, selected: bool) {
+    if let Some(hi) = button_highlight(rect, ui) {
+        painter.fill_rect(rect, hi, Edges::all((rect.h.min(rect.w) / 6.0).min(8.0)));
+    }
+    let color = if selected { INDIGO } else { POPUP_TEXT };
+    let style = TextStyle { color, size: font_size, align: TextAlign::Center, weight: if selected { 600 } else { 400 }, letter_spacing: 0.0 };
+    painter.draw_text(label, vcenter_text(rect, font_size), &style);
+}
+
+/// Draws the Cancel/Confirm footer row shared by every picker popup.
+fn paint_footer(painter: &mut dyn Painter, cancel_rect: Rect, confirm_rect: Rect, font_size: f32, ui: &Ui) {
+    let divider = Rect::new(cancel_rect.x + cancel_rect.w - 0.5, cancel_rect.y + 8.0, 1.0, cancel_rect.h - 16.0);
+    painter.fill_rect(divider, POPUP_BORDER, Edges::default());
+    draw_text_button(painter, cancel_rect, "CANCEL", font_size, ui, false);
+    draw_text_button(painter, confirm_rect, "CONFIRM", font_size, ui, true);
 }
 
 const MONTH_NAMES: [&str; 12] =
     ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const WEEKDAY_LABELS: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
 
-/// Draws a calendar popup's nav header, weekday-label row, and day grid —
-/// shared by `paint_date_popup` and `paint_datetime_popup`. `selected`
-/// highlights one day cell if it falls within the currently-browsed
-/// `year`/`month`.
-fn paint_calendar(
-    painter: &mut dyn Painter,
-    style: &crate::style::Style,
-    layout: &crate::datetime::CalendarLayout,
-    year: i32,
-    month: u32,
-    selected: Option<(i32, u32, u32)>,
-) {
-    let bg = style.bg.unwrap_or(Color::WHITE);
-    let border = style.border_color.unwrap_or(Color::rgb(209, 213, 219));
-    painter.fill_rect(layout.popup_rect, bg, style.radius);
-    painter.stroke_rect(layout.popup_rect, border, 1.0, style.radius);
+/// Draws a calendar popup: month stepper, year stepper/dropdown (or, while
+/// open, the paged year-grid overlay in the same area), weekday labels, day
+/// grid, and the Cancel/Confirm footer — shared by `paint_date_popup` and
+/// `paint_datetime_popup`.
+fn paint_calendar(painter: &mut dyn Painter, ui: &Ui, font_size: f32, layout: &crate::datetime::CalendarLayout, year: i32, month: u32, staged_day: u32) {
+    painter.fill_rect(layout.popup_rect, POPUP_BG, Edges::all(8.0));
+    painter.stroke_rect(layout.popup_rect, POPUP_BORDER, 1.0, Edges::all(8.0));
 
-    let centered = TextStyle {
-        color: style.text_color,
-        size: style.font_size,
-        align: TextAlign::Center,
-        weight: style.font_weight,
-        letter_spacing: style.letter_spacing,
-    };
+    draw_text_button(painter, layout.month_prev_rect, "<", font_size, ui, false);
+    draw_text_button(painter, layout.month_next_rect, ">", font_size, ui, false);
+    let month_style = TextStyle { color: POPUP_TEXT, size: font_size, align: TextAlign::Center, weight: 600, letter_spacing: 0.0 };
+    painter.draw_text(MONTH_NAMES[(month - 1) as usize], vcenter_text(layout.month_label_rect, font_size), &month_style);
 
-    painter.draw_text("<", layout.prev_rect, &centered);
-    painter.draw_text(">", layout.next_rect, &centered);
-    let header_rect = Rect::new(
-        layout.prev_rect.x + layout.prev_rect.w,
-        layout.popup_rect.y,
-        layout.popup_rect.w - layout.prev_rect.w - layout.next_rect.w,
-        layout.prev_rect.h,
-    );
-    painter.draw_text(&format!("{} {year}", MONTH_NAMES[(month - 1) as usize]), header_rect, &centered);
+    if let Some(hi) = button_highlight(layout.year_dropdown_rect, ui) {
+        painter.fill_rect(layout.year_dropdown_rect, hi, Edges::all(6.0));
+    }
+    painter.draw_text(&format!("{year} \u{25be}"), vcenter_text(layout.year_dropdown_rect, font_size), &month_style);
+    draw_text_button(painter, layout.year_prev_rect, "<", font_size, ui, false);
+    draw_text_button(painter, layout.year_next_rect, ">", font_size, ui, false);
 
-    let (header_h, cell_h) = crate::datetime::calendar_metrics(style.font_size);
-    let cell_w = layout.popup_rect.w / 7.0;
-    let weekday_row_y = layout.popup_rect.y + header_h;
+    let muted = TextStyle { color: POPUP_MUTED, size: font_size * 0.85, align: TextAlign::Center, weight: 500, letter_spacing: 0.0 };
+    let weekday_cell_w = layout.weekday_row.w / 7.0;
     for (i, label) in WEEKDAY_LABELS.iter().enumerate() {
-        let rect = Rect::new(layout.popup_rect.x + i as f32 * cell_w, weekday_row_y, cell_w, cell_h);
-        painter.draw_text(label, rect, &centered);
+        let rect = Rect::new(layout.weekday_row.x + i as f32 * weekday_cell_w, layout.weekday_row.y, weekday_cell_w, layout.weekday_row.h);
+        painter.draw_text(label, vcenter_text(rect, font_size * 0.85), &muted);
     }
 
+    if let Some(year_list) = &layout.year_list {
+        draw_text_button(painter, year_list.prev_page_rect, "<", font_size, ui, false);
+        draw_text_button(painter, year_list.next_page_rect, ">", font_size, ui, false);
+        if let (Some((_, first)), Some((_, last))) = (year_list.year_cells.first(), year_list.year_cells.last()) {
+            painter.draw_text(&format!("{first} \u{2013} {last}"), vcenter_text(year_list.range_label_rect, font_size), &month_style);
+        }
+        let cell_style = TextStyle { color: POPUP_TEXT, size: font_size, align: TextAlign::Center, weight: 400, letter_spacing: 0.0 };
+        for (rect, y) in &year_list.year_cells {
+            if *y == year {
+                let d = rect.h.min(rect.w) * 0.7;
+                let bubble = Rect::new(rect.x + (rect.w - d) / 2.0, rect.y + (rect.h - d) / 2.0, d, d);
+                painter.fill_rect(bubble, INDIGO, Edges::all(d / 2.0));
+                let sel = TextStyle { color: WHITE, ..cell_style };
+                painter.draw_text(&y.to_string(), vcenter_text(*rect, font_size), &sel);
+            } else {
+                if let Some(hi) = button_highlight(*rect, ui) {
+                    painter.fill_rect(*rect, hi, Edges::all(6.0));
+                }
+                painter.draw_text(&y.to_string(), vcenter_text(*rect, font_size), &cell_style);
+            }
+        }
+        return;
+    }
+
+    let cell_style = TextStyle { color: POPUP_TEXT, size: font_size, align: TextAlign::Center, weight: 400, letter_spacing: 0.0 };
     for (rect, day) in &layout.day_cells {
         let Some(day) = day else { continue };
-        if selected == Some((year, month, *day)) {
-            painter.fill_rect(*rect, Color::rgb(219, 234, 254), Edges::default());
+        if *day == staged_day {
+            let d = rect.h.min(rect.w) * 0.72;
+            let bubble = Rect::new(rect.x + (rect.w - d) / 2.0, rect.y + (rect.h - d) / 2.0, d, d);
+            painter.fill_rect(bubble, INDIGO, Edges::all(d / 2.0));
+            let sel = TextStyle { color: WHITE, ..cell_style };
+            painter.draw_text(&day.to_string(), vcenter_text(*rect, font_size), &sel);
+        } else {
+            if let Some(hi) = button_highlight(*rect, ui) {
+                let d = rect.h.min(rect.w) * 0.72;
+                let bubble = Rect::new(rect.x + (rect.w - d) / 2.0, rect.y + (rect.h - d) / 2.0, d, d);
+                painter.fill_rect(bubble, hi, Edges::all(d / 2.0));
+            }
+            painter.draw_text(&day.to_string(), vcenter_text(*rect, font_size), &cell_style);
         }
-        painter.draw_text(&day.to_string(), *rect, &centered);
     }
+    paint_footer(painter, layout.cancel_rect, layout.confirm_rect, font_size, ui);
 }
 
-/// Draws a spinner-style clock popup: one `+`/value/`-` column per unit (2
-/// columns, or 3 with `with-seconds`) — shared by `paint_time_popup` and
-/// `paint_datetime_popup`.
-fn paint_clock(painter: &mut dyn Painter, style: &crate::style::Style, layout: &crate::datetime::ClockLayout, h: u32, m: u32, s: u32) {
-    let bg = style.bg.unwrap_or(Color::WHITE);
-    let border = style.border_color.unwrap_or(Color::rgb(209, 213, 219));
-    painter.fill_rect(layout.popup_rect, bg, style.radius);
-    painter.stroke_rect(layout.popup_rect, border, 1.0, style.radius);
+/// Draws a draggable analog clock popup: hour/minute/[second] mode
+/// segments, the dial face with a hand pointing at the active mode's
+/// staged value, an AM/PM toggle, and the Cancel/Confirm footer — shared by
+/// `paint_time_popup` and `paint_datetime_popup`.
+fn paint_clock(painter: &mut dyn Painter, ui: &Ui, font_size: f32, layout: &crate::datetime::ClockLayout, picker: &crate::datetime::TimePickerState) {
+    use crate::datetime::ClockMode;
 
-    let centered = TextStyle {
-        color: style.text_color,
-        size: style.font_size,
-        align: TextAlign::Center,
-        weight: style.font_weight,
-        letter_spacing: style.letter_spacing,
+    painter.fill_rect(layout.popup_rect, POPUP_BG, Edges::all(8.0));
+    painter.stroke_rect(layout.popup_rect, POPUP_BORDER, 1.0, Edges::all(8.0));
+
+    let (h12, is_pm) = crate::datetime::to_12_hour(picker.staged_hour);
+    let segments: &[(Rect, ClockMode, String)] = &{
+        let mut v = vec![
+            (layout.hour_segment_rect, ClockMode::Hour, format!("{h12:02}")),
+            (layout.minute_segment_rect, ClockMode::Minute, format!("{:02}", picker.staged_minute)),
+        ];
+        if let Some(r) = layout.second_segment_rect {
+            v.push((r, ClockMode::Second, format!("{:02}", picker.staged_second)));
+        }
+        v
     };
-    let values = [h, m, s];
-    for (i, (up, val, down)) in layout.columns.iter().enumerate() {
-        painter.draw_text("+", *up, &centered);
-        painter.draw_text(&format!("{:02}", values[i]), *val, &centered);
-        painter.draw_text("-", *down, &centered);
+    for (rect, mode, label) in segments {
+        let inset = rect.inset(Edges::all(4.0));
+        let active = picker.mode == *mode;
+        if active {
+            painter.fill_rect(inset, INDIGO_LIGHT, Edges::all(8.0));
+        } else if let Some(hi) = button_highlight(inset, ui) {
+            painter.fill_rect(inset, hi, Edges::all(8.0));
+        }
+        let style =
+            TextStyle { color: if active { INDIGO } else { POPUP_TEXT }, size: font_size * 1.4, align: TextAlign::Center, weight: 600, letter_spacing: 0.0 };
+        painter.draw_text(label, vcenter_text(*rect, font_size * 1.4), &style);
     }
+
+    // Dial face.
+    painter.fill_rect(layout.dial_area, Color { r: 244, g: 244, b: 247, a: 255 }, Edges::all(layout.dial_area.w / 2.0));
+
+    let tick_style = TextStyle { color: POPUP_MUTED, size: font_size * 0.9, align: TextAlign::Center, weight: 500, letter_spacing: 0.0 };
+    let label_r = 18.0_f32.max(font_size);
+    match picker.mode {
+        ClockMode::Hour => {
+            for hour in 1..=12u32 {
+                let p = crate::datetime::point_for_hour_12(layout.dial_center, layout.dial_radius, hour);
+                let rect = Rect::new(p.x - label_r, p.y - label_r, label_r * 2.0, label_r * 2.0);
+                let selected = hour == h12;
+                if selected {
+                    painter.fill_rect(rect.inset(Edges::all(2.0)), INDIGO, Edges::all(label_r));
+                }
+                let style = TextStyle { color: if selected { WHITE } else { POPUP_TEXT }, ..tick_style };
+                painter.draw_text(&hour.to_string(), vcenter_text(rect, tick_style.size), &style);
+            }
+        }
+        ClockMode::Minute | ClockMode::Second => {
+            let active_val = if picker.mode == ClockMode::Minute { picker.staged_minute } else { picker.staged_second };
+            // Highlight whichever 5-unit tick is nearest the actual (possibly
+            // in-between-ticks) dragged value, wrapping 55 -> 0.
+            let nearest_tick = (((active_val as f32 / 5.0).round() as u32) % 12) * 5;
+            for tick in 0..12u32 {
+                let minute_val = tick * 5;
+                let p = crate::datetime::point_for_60_tick(layout.dial_center, layout.dial_radius, tick);
+                let rect = Rect::new(p.x - label_r, p.y - label_r, label_r * 2.0, label_r * 2.0);
+                let selected = minute_val == nearest_tick;
+                if selected {
+                    painter.fill_rect(rect.inset(Edges::all(2.0)), INDIGO, Edges::all(label_r));
+                }
+                let style = TextStyle { color: if selected { WHITE } else { POPUP_TEXT }, ..tick_style };
+                painter.draw_text(&format!("{minute_val:02}"), vcenter_text(rect, tick_style.size), &style);
+            }
+        }
+    }
+
+    // Hand: a thin rect drawn pointing straight up from the center, then
+    // rotated clockwise by the active mode's angle — see `hand_angle`.
+    let hand_deg = crate::datetime::hand_angle(picker, picker.mode);
+    let thickness = 3.0;
+    let hand_rect = Rect::new(layout.dial_center.x - thickness / 2.0, layout.dial_center.y - layout.dial_radius, thickness, layout.dial_radius);
+    painter.push_transform(crate::style::Transform2D { rotate_deg: hand_deg, ..Default::default() }, layout.dial_center);
+    painter.fill_rect(hand_rect, INDIGO, Edges::all(thickness / 2.0));
+    painter.pop_transform();
+    let dot_d = 8.0;
+    painter.fill_rect(
+        Rect::new(layout.dial_center.x - dot_d / 2.0, layout.dial_center.y - dot_d / 2.0, dot_d, dot_d),
+        INDIGO,
+        Edges::all(dot_d / 2.0),
+    );
+
+    // AM/PM toggle: two halves, the active one filled.
+    let half_w = layout.ampm_rect.w / 2.0;
+    let am_rect = Rect::new(layout.ampm_rect.x, layout.ampm_rect.y, half_w, layout.ampm_rect.h);
+    let pm_rect = Rect::new(layout.ampm_rect.x + half_w, layout.ampm_rect.y, half_w, layout.ampm_rect.h);
+    for (rect, label, active) in [(am_rect, "AM", !is_pm), (pm_rect, "PM", is_pm)] {
+        if active {
+            painter.fill_rect(rect.inset(Edges::all(2.0)), INDIGO, Edges::all(rect.h / 2.0));
+        } else if let Some(hi) = button_highlight(rect, ui) {
+            painter.fill_rect(rect.inset(Edges::all(2.0)), hi, Edges::all(rect.h / 2.0));
+        }
+        let style = TextStyle { color: if active { WHITE } else { POPUP_TEXT }, size: font_size * 0.85, align: TextAlign::Center, weight: 600, letter_spacing: 0.0 };
+        painter.draw_text(label, vcenter_text(rect, font_size * 0.85), &style);
+    }
+
+    paint_footer(painter, layout.cancel_rect, layout.confirm_rect, font_size, ui);
 }
 
-/// Draws an open `Date`'s month-calendar popup below its box — called after
+/// Draws an open `Date`'s calendar popup below/above its box — called after
 /// the whole tree has painted (see `paint`), same floating convention as
 /// `paint_dropdown_popup`.
 fn paint_date_popup(ui: &Ui, id: NodeId, painter: &mut dyn Painter) {
     let node = ui.get(id);
-    let style = &node.style;
-    let NodeKind::Date { value, view_year, view_month, .. } = &node.kind else { return };
-    let layout = crate::datetime::layout_calendar(node.computed, style.font_size, *view_year, *view_month);
-    let selected = crate::datetime::parse_date(value);
-    paint_calendar(painter, style, &layout, *view_year, *view_month, selected);
+    let font_size = node.style.font_size;
+    let NodeKind::Date { picker, .. } = &node.kind else { return };
+    let layout = crate::datetime::layout_calendar(
+        node.computed,
+        ui.viewport,
+        font_size,
+        picker.staged_year,
+        picker.staged_month,
+        picker.year_list_open,
+        picker.year_list_page_start,
+        picker.min_year,
+        picker.max_year,
+    );
+    paint_calendar(painter, ui, font_size, &layout, picker.staged_year, picker.staged_month, picker.staged_day);
 }
 
-/// Draws an open `Time`'s spinner popup below its box.
+/// Draws an open `Time`'s dial popup below/above its box.
 fn paint_time_popup(ui: &Ui, id: NodeId, painter: &mut dyn Painter) {
     let node = ui.get(id);
-    let style = &node.style;
-    let NodeKind::Time { value, .. } = &node.kind else { return };
-    let (h, m, s) = crate::datetime::parse_time(value).unwrap_or_else(|| {
-        let (_, _, _, h, m, s) = crate::datetime::now();
-        (h, m, s)
-    });
-    let layout = crate::datetime::layout_clock(node.computed, style.font_size, style.with_seconds);
-    paint_clock(painter, style, &layout, h, m, s);
+    let font_size = node.style.font_size;
+    let with_seconds = node.style.with_seconds;
+    let NodeKind::Time { picker, .. } = &node.kind else { return };
+    let layout = crate::datetime::layout_clock(node.computed, ui.viewport, font_size, with_seconds);
+    paint_clock(painter, ui, font_size, &layout, picker);
 }
 
-/// Draws an open `DateTime`'s combined calendar + spinner popup below its
-/// box (see `datetime::layout_datetime`).
+/// Draws an open `DateTime`'s combined popup (a Calendar/Clock tab row plus
+/// whichever one sub-view is active) below/above its box.
 fn paint_datetime_popup(ui: &Ui, id: NodeId, painter: &mut dyn Painter) {
     let node = ui.get(id);
-    let style = &node.style;
-    let NodeKind::DateTime { value, view_year, view_month, .. } = &node.kind else { return };
-    let layout = crate::datetime::layout_datetime(node.computed, style.font_size, style.with_seconds, *view_year, *view_month);
-    let (date_part, time_part) = crate::datetime::split_datetime(value);
-    let selected = crate::datetime::parse_date(date_part);
-    paint_calendar(painter, style, &layout.calendar, *view_year, *view_month, selected);
-    let (h, m, s) = crate::datetime::parse_time(time_part).unwrap_or_else(|| {
-        let (_, _, _, h, m, s) = crate::datetime::now();
-        (h, m, s)
-    });
-    paint_clock(painter, style, &layout.clock, h, m, s);
+    let font_size = node.style.font_size;
+    let with_seconds = node.style.with_seconds;
+    let NodeKind::DateTime { date_picker, time_picker, active_tab, .. } = &node.kind else { return };
+    let layout = crate::datetime::layout_datetime(
+        node.computed,
+        ui.viewport,
+        font_size,
+        with_seconds,
+        *active_tab,
+        date_picker.staged_year,
+        date_picker.staged_month,
+        date_picker.year_list_open,
+        date_picker.year_list_page_start,
+        date_picker.min_year,
+        date_picker.max_year,
+    );
+
+    painter.fill_rect(layout.popup_rect, POPUP_BG, Edges::all(8.0));
+    painter.stroke_rect(layout.popup_rect, POPUP_BORDER, 1.0, Edges::all(8.0));
+    draw_text_button(painter, layout.tab_calendar_rect, "CALENDAR", font_size, ui, *active_tab == crate::datetime::DateTimeTab::Calendar);
+    draw_text_button(painter, layout.tab_clock_rect, "CLOCK", font_size, ui, *active_tab == crate::datetime::DateTimeTab::Clock);
+
+    if let Some(cal) = &layout.calendar {
+        paint_calendar(painter, ui, font_size, cal, date_picker.staged_year, date_picker.staged_month, date_picker.staged_day);
+    }
+    if let Some(clock) = &layout.clock {
+        paint_clock(painter, ui, font_size, clock, time_picker);
+    }
 }
 
 /// Width, in pixels, of the first `char_count` chars of `shown` — the shared

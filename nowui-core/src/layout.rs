@@ -20,6 +20,7 @@ use crate::style::{Align, Direction, Display, GridTrack, Position, Sizing, Style
 
 /// Solve every layer against the given viewport size.
 pub fn solve(ui: &mut Ui, viewport: Size, painter: &mut dyn Painter) {
+    ui.viewport = viewport;
     let roots: Vec<NodeId> = ui.layers.iter().map(|l| l.root).collect();
     for root in roots {
         let mut sizes = HashMap::new();
@@ -130,16 +131,18 @@ fn measure(ui: &mut Ui, id: NodeId, painter: &mut dyn Painter, sizes: &mut HashM
             let m = painter.measure_text(label, style.font_size);
             Size::new(m.x, m.y)
         }
-        // `Date`/`Time`/`DateTime`: same "closed box only, the popup never
-        // contributes to intrinsic size" convention as `Dropdown` above —
-        // the calendar/spinner popup is floating, out-of-flow content.
+        // `Date`/`Time`/`DateTime`: intrinsic size from `value`/`placeholder`
+        // text alone, same convention as `TextInput` above (not a fixed
+        // `Dropdown`-style box height) — these widgets are meant to be
+        // stylable exactly like a `TextInput` (`p-*`/`h-*`/etc. fully
+        // control the box). The popup itself never contributes to intrinsic
+        // size either way — floating, out-of-flow content.
         crate::arena::NodeKind::Date { value, placeholder, .. }
         | crate::arena::NodeKind::Time { value, placeholder, .. }
         | crate::arena::NodeKind::DateTime { value, placeholder, .. } => {
-            let (box_h, _) = crate::style::dropdown_metrics(style.font_size);
             let label = if value.is_empty() { placeholder } else { value };
             let m = painter.measure_text(label, style.font_size);
-            Size::new(m.x + 24.0, box_h)
+            Size::new(m.x, m.y)
         }
         crate::arena::NodeKind::Container => Size::default(),
     };

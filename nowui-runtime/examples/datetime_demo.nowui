@@ -1,0 +1,35 @@
+// Demo for the Date/Time/DateTime widgets — backs nowui-runtime/examples/datetime_demo.rs.
+// Run:  cargo run -p nowui-runtime --example datetime_demo
+
+layout: App w-[fill] h-[fill] items-center justify-center gap-6 bg-gray-100 p-8 {
+
+  Container w-[360px] gap-2 {
+    Text `Birthday` text-sm font-medium text-gray-700
+    // Styled exactly like a TextInput: bg/border/radius/padding all come
+    // from these classes, not a built-in box style.
+    Date `Choose your birthday` w-full bg-white border rounded p-[10px] {
+      value: state.birthday,
+      minYear: state.min_year,
+      maxYear: state.max_year,
+      onSelect: state.on_birthday_picked
+    }
+  }
+
+  Container w-[360px] gap-2 {
+    Text `Daily alarm` text-sm font-medium text-gray-700
+    Time `Choose a time` with-seconds w-full bg-white border rounded p-[10px] {
+      value: state.alarm,
+      onSelect: state.on_alarm_picked
+    }
+  }
+
+  Container w-[360px] gap-2 {
+    Text `Meeting` text-sm font-medium text-gray-700
+    DateTime `Choose date and time` w-full bg-white border rounded p-[10px] {
+      value: state.meeting,
+      minYear: state.min_year,
+      maxYear: state.max_year,
+      onSelect: state.on_meeting_picked
+    }
+  }
+}

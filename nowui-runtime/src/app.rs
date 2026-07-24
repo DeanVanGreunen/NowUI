@@ -96,6 +96,13 @@ pub struct App<S: NowUiState + 'static> {
     /// to remember *which* node is being dragged so `CursorMoved` knows to
     /// keep extending its `cursor`.
     dragging_text_input: Option<NodeId>,
+    /// Set while an open `Time`/`DateTime`'s clock hand is being dragged —
+    /// mirrors `dragging_slider`'s shape exactly (mouse-down on the dial
+    /// jumps the active-mode value there and starts the drag; `CursorMoved`
+    /// keeps updating it via `update_clock_drag`; `MouseInput::Released`
+    /// clears it). Only ever mutates the widget's *staged* picker state —
+    /// see `NodeKind::Date`'s doc comment — never `value` itself.
+    dragging_clock: Option<NodeId>,
     /// Tracked from `WindowEvent::ModifiersChanged` — needed for Shift
     /// (extend a `TextInput` selection) and Ctrl (select-all). Nothing else
     /// in this engine currently reads a modifier key, so this exists purely
@@ -139,6 +146,7 @@ impl<S: NowUiState + 'static> App<S> {
             pressed: None,
             dragging_slider: None,
             dragging_text_input: None,
+            dragging_clock: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
             semantic,
             transitions: Transitions::new(),
@@ -413,9 +421,15 @@ impl<S: NowUiState + 'static> App<S> {
         self.dispatch_pending_on_load();
 
         self.resolve_values();
+        self.resolve_year_bounds();
         self.resolve_templates();
         self.resolve_dynamic_styles();
         self.apply_dynamic_styles(w as f32);
+
+        // Kept in sync here (rather than on every input event) since these
+        // only ever matter to `paint`'s hand-drawn popup-control hover/press
+        // highlighting, which only ever runs once per redraw anyway.
+        self.ui.cursor = self.cursor;
 
         match self.backend {
             Backend::Cpu => self.redraw_cpu(&window, w, h),
@@ -530,28 +544,41 @@ impl<S: NowUiState + 'static> App<S> {
             // "selected" value a `Menu` has; it's one-way bound (`onClick`
             // only), not two-way.
             NodeKind::Menu { open, .. } => *open = !*open,
-            // Re-sync the calendar's browsed month to whatever date is
-            // already picked every time the popup opens, so reopening always
-            // starts on the picked date rather than wherever it was last
-            // left browsing.
-            NodeKind::Date { open, value, view_year, view_month, .. } => {
+            // Re-seed the staged picker state from `value` (or the system
+            // clock's current date/time, if `value` is empty) every time the
+            // popup opens — see `DatePickerState`/`TimePickerState::
+            // from_value_or_now`. Toggling `open` closed this way (clicking
+            // the box again while the popup is already open) discards
+            // whatever was staged, same as Cancel — only Confirm commits.
+            // `min_year`/`max_year` are preserved across the reseed since
+            // they come from `{minYear/maxYear: state.path}` bindings
+            // resolved independently by `resolve_year_bounds`, not from
+            // `value` at all.
+            NodeKind::Date { open, value, picker, .. } => {
                 *open = !*open;
                 if *open {
-                    if let Some((y, m, _)) = nowui_core::datetime::parse_date(value) {
-                        *view_year = y;
-                        *view_month = m;
-                    }
+                    let (min_year, max_year) = (picker.min_year, picker.max_year);
+                    *picker = nowui_core::datetime::DatePickerState::from_value_or_now(value);
+                    picker.min_year = min_year;
+                    picker.max_year = max_year;
                 }
             }
-            NodeKind::Time { open, .. } => *open = !*open,
-            NodeKind::DateTime { open, value, view_year, view_month, .. } => {
+            NodeKind::Time { open, value, picker, .. } => {
                 *open = !*open;
                 if *open {
-                    let (date_part, _) = nowui_core::datetime::split_datetime(value);
-                    if let Some((y, m, _)) = nowui_core::datetime::parse_date(date_part) {
-                        *view_year = y;
-                        *view_month = m;
-                    }
+                    *picker = nowui_core::datetime::TimePickerState::from_value_or_now(value);
+                }
+            }
+            NodeKind::DateTime { open, value, date_picker, time_picker, active_tab, .. } => {
+                *open = !*open;
+                if *open {
+                    let (date_part, time_part) = nowui_core::datetime::split_datetime(value);
+                    let (min_year, max_year) = (date_picker.min_year, date_picker.max_year);
+                    *date_picker = nowui_core::datetime::DatePickerState::from_value_or_now(date_part);
+                    date_picker.min_year = min_year;
+                    date_picker.max_year = max_year;
+                    *time_picker = nowui_core::datetime::TimePickerState::from_value_or_now(time_part);
+                    *active_tab = nowui_core::datetime::DateTimeTab::Calendar;
                 }
             }
             _ => {}
@@ -674,20 +701,48 @@ impl<S: NowUiState + 'static> App<S> {
     /// The screen-space rect an open `Date`/`Time`/`DateTime`'s popup
     /// occupies — must match `paint`'s `paint_date_popup`/`paint_time_popup`/
     /// `paint_datetime_popup` exactly (all built from the same
-    /// `nowui_core::datetime` layout functions), or clicks and pixels
+    /// `nowui_core::datetime` layout functions, including the live
+    /// `Ui::viewport` used for the above/below flip), or clicks and pixels
     /// disagree about where the popup is.
     fn picker_popup_rect(&self, id: NodeId) -> Option<Rect> {
         let node = self.ui.get(id);
         let font_size = node.style.font_size;
         let with_seconds = node.style.with_seconds;
+        let viewport = self.ui.viewport;
         match &node.kind {
-            NodeKind::Date { open, view_year, view_month, .. } if *open => {
-                Some(nowui_core::datetime::layout_calendar(node.computed, font_size, *view_year, *view_month).popup_rect)
+            NodeKind::Date { open, picker, .. } if *open => Some(
+                nowui_core::datetime::layout_calendar(
+                    node.computed,
+                    viewport,
+                    font_size,
+                    picker.staged_year,
+                    picker.staged_month,
+                    picker.year_list_open,
+                    picker.year_list_page_start,
+                    picker.min_year,
+                    picker.max_year,
+                )
+                .popup_rect,
+            ),
+            NodeKind::Time { open, .. } if *open => {
+                Some(nowui_core::datetime::layout_clock(node.computed, viewport, font_size, with_seconds).popup_rect)
             }
-            NodeKind::Time { open, .. } if *open => Some(nowui_core::datetime::layout_clock(node.computed, font_size, with_seconds).popup_rect),
-            NodeKind::DateTime { open, view_year, view_month, .. } if *open => {
-                Some(nowui_core::datetime::layout_datetime(node.computed, font_size, with_seconds, *view_year, *view_month).popup_rect)
-            }
+            NodeKind::DateTime { open, date_picker, active_tab, .. } if *open => Some(
+                nowui_core::datetime::layout_datetime(
+                    node.computed,
+                    viewport,
+                    font_size,
+                    with_seconds,
+                    *active_tab,
+                    date_picker.staged_year,
+                    date_picker.staged_month,
+                    date_picker.year_list_open,
+                    date_picker.year_list_page_start,
+                    date_picker.min_year,
+                    date_picker.max_year,
+                )
+                .popup_rect,
+            ),
             _ => None,
         }
     }
@@ -699,96 +754,200 @@ impl<S: NowUiState + 'static> App<S> {
         (0..self.ui.nodes.len()).map(|i| NodeId(i as u32)).find(|&id| self.picker_popup_rect(id).is_some_and(|r| r.contains(p)))
     }
 
-    /// A click landed inside an open `Date`'s calendar popup: nav
-    /// arrow, or a day cell. Picking a day is a single, terminal action
-    /// (like `Dropdown` selecting an option) — it writes the value back,
-    /// dispatches `onSelect`, and closes the popup.
-    fn select_date_popup(&mut self, id: NodeId, p: Point) {
+    /// A mouse-down landed inside an open `Date`'s calendar popup. Every nav/
+    /// pick action (`handle_calendar_body_click`) only ever mutates the
+    /// staged `picker` — `value` is untouched, and the popup stays open,
+    /// until Confirm (commit + `onSelect` + close) or Cancel (discard +
+    /// close).
+    fn date_popup_mouse_down(&mut self, id: NodeId, p: Point) {
+        let viewport = self.ui.viewport;
         let node = self.ui.get_mut(id);
         let font_size = node.style.font_size;
         let rect = node.computed;
-        let NodeKind::Date { value, open, view_year, view_month, .. } = &mut node.kind else { return };
-        let layout = nowui_core::datetime::layout_calendar(rect, font_size, *view_year, *view_month);
-        if layout.prev_rect.contains(p) {
-            step_view_month(view_year, view_month, -1);
-            return;
+        let NodeKind::Date { value, open, picker, .. } = &mut node.kind else { return };
+        let layout = nowui_core::datetime::layout_calendar(
+            rect,
+            viewport,
+            font_size,
+            picker.staged_year,
+            picker.staged_month,
+            picker.year_list_open,
+            picker.year_list_page_start,
+            picker.min_year,
+            picker.max_year,
+        );
+        match handle_calendar_body_click(picker, &layout, p) {
+            PopupAction::Confirm => {
+                *value = nowui_core::datetime::format_date(picker.staged_year, picker.staged_month, picker.staged_day);
+                *open = false;
+                let v = value.clone();
+                self.write_back_value(id, StateValue::Str(v));
+                self.dispatch_event(id, "onSelect", EventKind::Click, None);
+            }
+            PopupAction::Cancel => *open = false,
+            PopupAction::Other => {}
         }
-        if layout.next_rect.contains(p) {
-            step_view_month(view_year, view_month, 1);
-            return;
-        }
-        let Some(day) = layout.day_cells.iter().find(|(r, _)| r.contains(p)).and_then(|(_, d)| *d) else { return };
-        *value = nowui_core::datetime::format_date(*view_year, *view_month, day);
-        *open = false;
-        let new_value = value.clone();
-        self.write_back_value(id, StateValue::Str(new_value));
-        self.close_other_pickers(Some(id));
-        self.dispatch_event(id, "onSelect", EventKind::Click, None);
     }
 
-    /// A click landed inside an open `Time`'s spinner popup: a `+`/`-`
-    /// column arrow. Unlike `Date`, this never closes the popup — dialing in
-    /// a time takes more than one click.
-    fn select_time_popup(&mut self, id: NodeId, p: Point) {
+    /// A mouse-down landed inside an open `Time`'s clock popup: a mode
+    /// segment, the AM/PM toggle, Cancel/Confirm, or the dial itself (which
+    /// starts a drag — see `App::dragging_clock`/`update_clock_drag`).
+    fn time_popup_mouse_down(&mut self, id: NodeId, p: Point) {
+        let viewport = self.ui.viewport;
         let node = self.ui.get_mut(id);
         let font_size = node.style.font_size;
         let with_seconds = node.style.with_seconds;
         let rect = node.computed;
-        let NodeKind::Time { value, .. } = &mut node.kind else { return };
-        let (h, m, s) = nowui_core::datetime::parse_time(value).unwrap_or_else(|| {
-            let (_, _, _, h, m, s) = nowui_core::datetime::now();
-            (h, m, s)
-        });
-        let layout = nowui_core::datetime::layout_clock(rect, font_size, with_seconds);
-        let Some((h, m, s)) = step_from_clock_columns(&layout, p, h, m, s) else { return };
-        *value = nowui_core::datetime::format_time(h, m, s, with_seconds);
-        let new_value = value.clone();
-        self.write_back_value(id, StateValue::Str(new_value));
-        self.dispatch_event(id, "onSelect", EventKind::Click, None);
+        let NodeKind::Time { value, open, picker, .. } = &mut node.kind else { return };
+        let layout = nowui_core::datetime::layout_clock(rect, viewport, font_size, with_seconds);
+        let outcome = handle_clock_body_mousedown(picker, &layout, p);
+        match outcome {
+            ClockClickOutcome::Confirm => {
+                *value = nowui_core::datetime::format_time(picker.staged_hour, picker.staged_minute, picker.staged_second, with_seconds);
+                *open = false;
+                let v = value.clone();
+                self.write_back_value(id, StateValue::Str(v));
+                self.dispatch_event(id, "onSelect", EventKind::Click, None);
+            }
+            ClockClickOutcome::Cancel => *open = false,
+            ClockClickOutcome::DragStart => self.dragging_clock = Some(id),
+            ClockClickOutcome::Other => {}
+        }
     }
 
-    /// A click landed inside an open `DateTime`'s combined popup: dispatch
-    /// to the calendar half or the clock half depending on where `p` falls.
-    /// Neither half closes the popup on its own (see `NodeKind::DateTime`'s
-    /// doc comment) — only clicking the box again, or elsewhere, does.
-    fn select_datetime_popup(&mut self, id: NodeId, p: Point) {
+    /// A mouse-down landed inside an open `DateTime`'s combined popup: the
+    /// tab row switches `active_tab`; anything else dispatches into whichever
+    /// sub-view (calendar or clock) is currently showing, exactly like
+    /// `date_popup_mouse_down`/`time_popup_mouse_down` — Confirm commits
+    /// *both* staged halves into one joined value at once (see
+    /// `datetime::join_datetime`), regardless of which tab is active.
+    fn datetime_popup_mouse_down(&mut self, id: NodeId, p: Point) {
+        let viewport = self.ui.viewport;
         let node = self.ui.get_mut(id);
         let font_size = node.style.font_size;
         let with_seconds = node.style.with_seconds;
         let rect = node.computed;
-        let NodeKind::DateTime { value, view_year, view_month, .. } = &mut node.kind else { return };
-        let layout = nowui_core::datetime::layout_datetime(rect, font_size, with_seconds, *view_year, *view_month);
-        let (date_part, time_part) = nowui_core::datetime::split_datetime(value);
-        let (date_part, time_part) = (date_part.to_string(), time_part.to_string());
+        let NodeKind::DateTime { value, open, date_picker, time_picker, active_tab, .. } = &mut node.kind else { return };
+        let layout = nowui_core::datetime::layout_datetime(
+            rect,
+            viewport,
+            font_size,
+            with_seconds,
+            *active_tab,
+            date_picker.staged_year,
+            date_picker.staged_month,
+            date_picker.year_list_open,
+            date_picker.year_list_page_start,
+            date_picker.min_year,
+            date_picker.max_year,
+        );
 
-        if layout.calendar.popup_rect.contains(p) {
-            if layout.calendar.prev_rect.contains(p) {
-                step_view_month(view_year, view_month, -1);
-                return;
+        if layout.tab_calendar_rect.contains(p) {
+            *active_tab = nowui_core::datetime::DateTimeTab::Calendar;
+            return;
+        }
+        if layout.tab_clock_rect.contains(p) {
+            *active_tab = nowui_core::datetime::DateTimeTab::Clock;
+            return;
+        }
+
+        let mut confirm = false;
+        let mut cancel = false;
+        let mut start_drag = false;
+        if let Some(cal) = &layout.calendar {
+            match handle_calendar_body_click(date_picker, cal, p) {
+                PopupAction::Confirm => confirm = true,
+                PopupAction::Cancel => cancel = true,
+                PopupAction::Other => {}
             }
-            if layout.calendar.next_rect.contains(p) {
-                step_view_month(view_year, view_month, 1);
-                return;
+        } else if let Some(clock) = &layout.clock {
+            match handle_clock_body_mousedown(time_picker, clock, p) {
+                ClockClickOutcome::Confirm => confirm = true,
+                ClockClickOutcome::Cancel => cancel = true,
+                ClockClickOutcome::DragStart => start_drag = true,
+                ClockClickOutcome::Other => {}
             }
-            let Some(day) = layout.calendar.day_cells.iter().find(|(r, _)| r.contains(p)).and_then(|(_, d)| *d) else {
-                return;
+        }
+
+        if confirm {
+            let date_part = nowui_core::datetime::format_date(date_picker.staged_year, date_picker.staged_month, date_picker.staged_day);
+            let time_part =
+                nowui_core::datetime::format_time(time_picker.staged_hour, time_picker.staged_minute, time_picker.staged_second, with_seconds);
+            *value = nowui_core::datetime::join_datetime(&date_part, &time_part);
+            *open = false;
+            let v = value.clone();
+            self.write_back_value(id, StateValue::Str(v));
+            self.dispatch_event(id, "onSelect", EventKind::Click, None);
+        } else if cancel {
+            *open = false;
+        } else if start_drag {
+            self.dragging_clock = Some(id);
+        }
+    }
+
+    /// Continue an in-progress clock-hand drag (see `ClockClickOutcome::
+    /// DragStart`) as the cursor moves to `p` — only ever mutates the
+    /// staged picker, same as a click; `value` still isn't touched until
+    /// Confirm.
+    fn update_clock_drag(&mut self, id: NodeId, p: Point) {
+        let viewport = self.ui.viewport;
+        let node = self.ui.get_mut(id);
+        let font_size = node.style.font_size;
+        let with_seconds = node.style.with_seconds;
+        let rect = node.computed;
+        match &mut node.kind {
+            NodeKind::Time { picker, .. } => {
+                let layout = nowui_core::datetime::layout_clock(rect, viewport, font_size, with_seconds);
+                apply_dial_point(picker, &layout, p);
+            }
+            NodeKind::DateTime { date_picker, time_picker, active_tab, .. } if *active_tab == nowui_core::datetime::DateTimeTab::Clock => {
+                let layout = nowui_core::datetime::layout_datetime(
+                    rect,
+                    viewport,
+                    font_size,
+                    with_seconds,
+                    *active_tab,
+                    date_picker.staged_year,
+                    date_picker.staged_month,
+                    date_picker.year_list_open,
+                    date_picker.year_list_page_start,
+                    date_picker.min_year,
+                    date_picker.max_year,
+                );
+                if let Some(clock) = &layout.clock {
+                    apply_dial_point(time_picker, clock, p);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Resolve `{minYear: state.path}`/`{maxYear: state.path}` against live
+    /// state into `DatePickerState::min_year`/`max_year` — the read-half of
+    /// reactivity for the year dropdown's bounds, same shape as
+    /// `resolve_values`. A no-op for a node with neither binding.
+    fn resolve_year_bounds(&mut self) {
+        for i in 0..self.ui.nodes.len() {
+            let id = NodeId(i as u32);
+            let min_path = self.ui.get(id).min_year_path.clone();
+            let max_path = self.ui.get(id).max_year_path.clone();
+            if min_path.is_empty() && max_path.is_empty() {
+                continue;
+            }
+            let min_year = if min_path.is_empty() { None } else { self.state.get(&state_subpath(&min_path)).and_then(|v| v.as_i64()) };
+            let max_year = if max_path.is_empty() { None } else { self.state.get(&state_subpath(&max_path)).and_then(|v| v.as_i64()) };
+            let picker = match &mut self.ui.get_mut(id).kind {
+                NodeKind::Date { picker, .. } => picker,
+                NodeKind::DateTime { date_picker, .. } => date_picker,
+                _ => continue,
             };
-            let new_date = nowui_core::datetime::format_date(*view_year, *view_month, day);
-            *value = nowui_core::datetime::join_datetime(&new_date, &time_part);
-        } else if layout.clock.popup_rect.contains(p) {
-            let (h, m, s) = nowui_core::datetime::parse_time(&time_part).unwrap_or_else(|| {
-                let (_, _, _, h, m, s) = nowui_core::datetime::now();
-                (h, m, s)
-            });
-            let Some((h, m, s)) = step_from_clock_columns(&layout.clock, p, h, m, s) else { return };
-            let new_time = nowui_core::datetime::format_time(h, m, s, with_seconds);
-            *value = nowui_core::datetime::join_datetime(&date_part, &new_time);
-        } else {
-            return;
+            if let Some(v) = min_year {
+                picker.min_year = v as i32;
+            }
+            if let Some(v) = max_year {
+                picker.max_year = v as i32;
+            }
         }
-        let new_value = value.clone();
-        self.write_back_value(id, StateValue::Str(new_value));
-        self.dispatch_event(id, "onSelect", EventKind::Click, None);
     }
 
     fn close_other_pickers(&mut self, keep: Option<NodeId>) {
@@ -1136,25 +1295,138 @@ fn cursor_icon_for(icon: CursorIcon) -> (bool, winit::window::CursorIcon) {
 
 /// Step a calendar popup's browsed month by `delta` (+/-1), wrapping the year
 /// at the Dec/Jan boundary — pure UI-navigation state, never touches `value`.
-fn step_view_month(view_year: &mut i32, view_month: &mut u32, delta: i32) {
-    let zero_based = *view_month as i32 - 1 + delta;
-    *view_year += zero_based.div_euclid(12);
-    *view_month = (zero_based.rem_euclid(12) + 1) as u32;
+/// What a click inside an open `Date`/`DateTime` calendar body did — every
+/// nav/pick action only ever mutates the passed-in `DatePickerState` (never
+/// `value` itself); only `Confirm`/`Cancel` are the caller's cue to actually
+/// commit (or discard) it and close the popup.
+enum PopupAction {
+    Confirm,
+    Cancel,
+    /// Handled (a nav/pick action mutated `picker`), or the click landed on
+    /// non-interactive popup chrome — either way, nothing further to do.
+    Other,
 }
 
-/// Find which clock-popup column (if any) `p` landed an up/down arrow of,
-/// and return the `(h, m, s)` that arrow click steps toward — `None` if `p`
-/// missed every arrow (e.g. landed on a value display or blank popup area).
-fn step_from_clock_columns(layout: &nowui_core::datetime::ClockLayout, p: Point, h: u32, m: u32, s: u32) -> Option<(u32, u32, u32)> {
-    for (col, (up, _value, down)) in layout.columns.iter().enumerate() {
-        if up.contains(p) {
-            return Some(nowui_core::datetime::step_hms(h, m, s, col, 1));
-        }
-        if down.contains(p) {
-            return Some(nowui_core::datetime::step_hms(h, m, s, col, -1));
-        }
+/// Dispatch a click at `p` (already known to be within the calendar's own
+/// `layout.popup_rect`) to whichever control it landed on, mutating
+/// `picker` in place. Shared by `Date` and `DateTime`'s calendar tab.
+fn handle_calendar_body_click(picker: &mut nowui_core::datetime::DatePickerState, layout: &nowui_core::datetime::CalendarLayout, p: Point) -> PopupAction {
+    if layout.cancel_rect.contains(p) {
+        return PopupAction::Cancel;
     }
-    None
+    if layout.confirm_rect.contains(p) {
+        return PopupAction::Confirm;
+    }
+    if layout.month_prev_rect.contains(p) {
+        let (y, m) = nowui_core::datetime::step_month(picker.staged_year, picker.staged_month, -1);
+        (picker.staged_year, picker.staged_month) = (y, m);
+        return PopupAction::Other;
+    }
+    if layout.month_next_rect.contains(p) {
+        let (y, m) = nowui_core::datetime::step_month(picker.staged_year, picker.staged_month, 1);
+        (picker.staged_year, picker.staged_month) = (y, m);
+        return PopupAction::Other;
+    }
+    if layout.year_prev_rect.contains(p) {
+        picker.staged_year -= 1;
+        return PopupAction::Other;
+    }
+    if layout.year_next_rect.contains(p) {
+        picker.staged_year += 1;
+        return PopupAction::Other;
+    }
+    if layout.year_dropdown_rect.contains(p) {
+        picker.year_list_open = !picker.year_list_open;
+        if picker.year_list_open {
+            picker.year_list_page_start = picker.staged_year;
+        }
+        return PopupAction::Other;
+    }
+    if let Some(year_list) = &layout.year_list {
+        if year_list.prev_page_rect.contains(p) {
+            picker.year_list_page_start = (picker.year_list_page_start - 12).max(picker.min_year);
+        } else if year_list.next_page_rect.contains(p) {
+            picker.year_list_page_start = (picker.year_list_page_start + 12).min(picker.max_year);
+        } else if let Some((_, y)) = year_list.year_cells.iter().find(|(r, _)| r.contains(p)) {
+            picker.staged_year = *y;
+            picker.year_list_open = false;
+        }
+        // Every other point inside the year-list area is blank chrome —
+        // swallow it rather than falling through to the (absent) day grid.
+        return PopupAction::Other;
+    }
+    if let Some((_, Some(day))) = layout.day_cells.iter().find(|(r, _)| r.contains(p)) {
+        picker.staged_day = *day;
+    }
+    PopupAction::Other
+}
+
+/// What a mouse-down inside an open `Time`/`DateTime` clock body did.
+enum ClockClickOutcome {
+    Confirm,
+    Cancel,
+    /// The dial itself was pressed: `picker`'s active-mode value has already
+    /// been jumped to the press point (same "click track jumps thumb, then
+    /// drag" convention as `Slider`) — the caller should start tracking a
+    /// drag (`App::dragging_clock`) so `CursorMoved` keeps updating it.
+    DragStart,
+    Other,
+}
+
+/// Dispatch a mouse-down at `p` (already known to be within the clock's own
+/// `layout.popup_rect`) to whichever control it landed on, mutating
+/// `picker` in place. Shared by `Time` and `DateTime`'s clock tab.
+fn handle_clock_body_mousedown(picker: &mut nowui_core::datetime::TimePickerState, layout: &nowui_core::datetime::ClockLayout, p: Point) -> ClockClickOutcome {
+    use nowui_core::datetime::ClockMode;
+
+    if layout.cancel_rect.contains(p) {
+        return ClockClickOutcome::Cancel;
+    }
+    if layout.confirm_rect.contains(p) {
+        return ClockClickOutcome::Confirm;
+    }
+    if layout.hour_segment_rect.contains(p) {
+        picker.mode = ClockMode::Hour;
+        return ClockClickOutcome::Other;
+    }
+    if layout.minute_segment_rect.contains(p) {
+        picker.mode = ClockMode::Minute;
+        return ClockClickOutcome::Other;
+    }
+    if layout.second_segment_rect.is_some_and(|r| r.contains(p)) {
+        picker.mode = ClockMode::Second;
+        return ClockClickOutcome::Other;
+    }
+    let half_w = layout.ampm_rect.w / 2.0;
+    let am_rect = Rect::new(layout.ampm_rect.x, layout.ampm_rect.y, half_w, layout.ampm_rect.h);
+    let pm_rect = Rect::new(layout.ampm_rect.x + half_w, layout.ampm_rect.y, half_w, layout.ampm_rect.h);
+    if am_rect.contains(p) || pm_rect.contains(p) {
+        let (h12, _) = nowui_core::datetime::to_12_hour(picker.staged_hour);
+        picker.staged_hour = nowui_core::datetime::from_12_hour(h12, pm_rect.contains(p));
+        return ClockClickOutcome::Other;
+    }
+    if layout.dial_area.contains(p) {
+        apply_dial_point(picker, layout, p);
+        return ClockClickOutcome::DragStart;
+    }
+    ClockClickOutcome::Other
+}
+
+/// Jump `picker`'s active-mode value (hour/minute/second) to whatever the
+/// dial angle at `p` implies — the shared math behind both starting a drag
+/// (`handle_clock_body_mousedown`) and continuing one (`App::update_clock_drag`).
+fn apply_dial_point(picker: &mut nowui_core::datetime::TimePickerState, layout: &nowui_core::datetime::ClockLayout, p: Point) {
+    use nowui_core::datetime::ClockMode;
+    let angle = nowui_core::datetime::angle_from_center(layout.dial_center, p);
+    match picker.mode {
+        ClockMode::Hour => {
+            let h12 = nowui_core::datetime::angle_to_hour_12(angle);
+            let (_, is_pm) = nowui_core::datetime::to_12_hour(picker.staged_hour);
+            picker.staged_hour = nowui_core::datetime::from_12_hour(h12, is_pm);
+        }
+        ClockMode::Minute => picker.staged_minute = nowui_core::datetime::angle_to_60(angle),
+        ClockMode::Second => picker.staged_second = nowui_core::datetime::angle_to_60(angle),
+    }
 }
 
 /// Write `values` (one per original backtick, same order/count as
@@ -1289,6 +1561,12 @@ impl<S: NowUiState + 'static> ApplicationHandler for App<S> {
                     self.request_redraw();
                 }
 
+                if let Some(id) = self.dragging_clock {
+                    self.update_clock_drag(id, self.cursor);
+                    self.ui.dirty = true;
+                    self.request_redraw();
+                }
+
                 let hit = self.ui.hit_test(self.cursor);
                 if let Some(id) = hit {
                     self.dispatch_event(id, "onMouseMove", EventKind::MouseMove, None);
@@ -1332,6 +1610,7 @@ impl<S: NowUiState + 'static> ApplicationHandler for App<S> {
                 }
                 match state {
                     ElementState::Pressed => {
+                        self.ui.mouse_down = true;
                         // Floating dropdown/menu popups sit on top of
                         // everything pixel-wise but outside every node's own
                         // `computed` rect, so they're checked before falling
@@ -1342,9 +1621,9 @@ impl<S: NowUiState + 'static> ApplicationHandler for App<S> {
                             self.select_menu_item(menu, self.cursor);
                         } else if let Some(picker) = self.find_open_picker_popup_at(self.cursor) {
                             match &self.ui.get(picker).kind {
-                                NodeKind::Date { .. } => self.select_date_popup(picker, self.cursor),
-                                NodeKind::Time { .. } => self.select_time_popup(picker, self.cursor),
-                                NodeKind::DateTime { .. } => self.select_datetime_popup(picker, self.cursor),
+                                NodeKind::Date { .. } => self.date_popup_mouse_down(picker, self.cursor),
+                                NodeKind::Time { .. } => self.time_popup_mouse_down(picker, self.cursor),
+                                NodeKind::DateTime { .. } => self.datetime_popup_mouse_down(picker, self.cursor),
                                 _ => {}
                             }
                         } else {
@@ -1376,7 +1655,9 @@ impl<S: NowUiState + 'static> ApplicationHandler for App<S> {
                         self.request_redraw();
                     }
                     ElementState::Released => {
+                        self.ui.mouse_down = false;
                         self.dragging_slider = None;
+                        self.dragging_clock = None;
                         if let Some(id) = self.dragging_text_input.take() {
                             // A plain click (never dragged) leaves a zero-
                             // width "selection" sitting at the caret —
@@ -1716,120 +1997,226 @@ mod tests {
     fn date_app(value: &str) -> (App<nowui_core::NoState>, NodeId) {
         let mut ui = Ui::new();
         let id = ui.push(Node::new(
-            NodeKind::Date { value: value.to_string(), placeholder: String::new(), open: true, view_year: 2024, view_month: 3 },
+            NodeKind::Date { value: value.to_string(), placeholder: String::new(), open: true, picker: nowui_core::datetime::DatePickerState::from_value_or_now(value) },
             Style { font_size: 16.0, ..Style::default() },
         ));
-        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 280.0, 41.0); // matches dropdown_metrics(16.0)'s box_h
+        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 280.0, 41.0);
         ui.add_layer(id, "main");
-        let app = App::new("test".to_string(), ui, nowui_core::NoState, crate::semantic::Semantic::new(&[]), Backend::Cpu);
+        let mut app = App::new("test".to_string(), ui, nowui_core::NoState, crate::semantic::Semantic::new(&[]), Backend::Cpu);
+        app.ui.viewport = nowui_core::geometry::Size::new(800.0, 2000.0); // tall enough that every popup fits below
         (app, id)
     }
 
+    /// Force a `Date`'s staged year/month to a known value (bypassing
+    /// `from_value_or_now`'s "seed from the system clock" default, which
+    /// would make these tests depend on the real calendar date).
+    fn set_staged_month(app: &mut App<nowui_core::NoState>, id: NodeId, year: i32, month: u32) {
+        let NodeKind::Date { picker, .. } = &mut app.ui.get_mut(id).kind else { panic!() };
+        picker.staged_year = year;
+        picker.staged_month = month;
+    }
+
     #[test]
-    fn clicking_a_day_cell_writes_the_date_back_and_closes_the_popup() {
+    fn clicking_a_day_cell_only_stages_it_confirm_writes_it_back_and_closes() {
         let (mut app, id) = date_app("");
-        let layout = nowui_core::datetime::layout_calendar(app.ui.get(id).computed, 16.0, 2024, 3);
+        set_staged_month(&mut app, id, 2024, 3);
+        let layout = nowui_core::datetime::layout_calendar(app.ui.get(id).computed, app.ui.viewport, 16.0, 2024, 3, false, 2024, 1900, 2100);
         // March 2024: day 1 is the 6th cell (index 5) — see datetime.rs's own test.
         let (day_one_rect, day) = layout.day_cells[5];
         assert_eq!(day, Some(1));
         let p = Point::new(day_one_rect.x + 1.0, day_one_rect.y + 1.0);
 
-        app.select_date_popup(id, p);
+        app.date_popup_mouse_down(id, p);
+        {
+            let NodeKind::Date { value, open, picker, .. } = &app.ui.get(id).kind else { panic!() };
+            assert_eq!(value, "", "a day click only stages it — value is untouched until Confirm");
+            assert_eq!(picker.staged_day, 1);
+            assert!(open, "staging a pick never closes the popup");
+        }
 
+        let confirm = layout.confirm_rect;
+        app.date_popup_mouse_down(id, Point::new(confirm.x + 1.0, confirm.y + 1.0));
         let NodeKind::Date { value, open, .. } = &app.ui.get(id).kind else { panic!() };
         assert_eq!(value, "01/03/2024");
-        assert!(!open, "picking a day is terminal — closes the popup");
+        assert!(!open, "Confirm commits and closes");
     }
 
     #[test]
-    fn clicking_the_next_arrow_advances_the_browsed_month_without_touching_the_value() {
+    fn clicking_cancel_discards_the_staged_pick_and_closes_without_writing_the_value() {
         let (mut app, id) = date_app("");
-        let layout = nowui_core::datetime::layout_calendar(app.ui.get(id).computed, 16.0, 2024, 3);
-        let next_click = Point::new(layout.next_rect.x + 1.0, layout.next_rect.y + 1.0);
+        set_staged_month(&mut app, id, 2024, 3);
+        let layout = nowui_core::datetime::layout_calendar(app.ui.get(id).computed, app.ui.viewport, 16.0, 2024, 3, false, 2024, 1900, 2100);
+        let (day_one_rect, _) = layout.day_cells[5];
+        app.date_popup_mouse_down(id, Point::new(day_one_rect.x + 1.0, day_one_rect.y + 1.0));
 
-        app.select_date_popup(id, next_click);
+        let cancel = layout.cancel_rect;
+        app.date_popup_mouse_down(id, Point::new(cancel.x + 1.0, cancel.y + 1.0));
 
-        let NodeKind::Date { value, open, view_year, view_month, .. } = &app.ui.get(id).kind else { panic!() };
-        assert_eq!((*view_year, *view_month), (2024, 4), "March -> April");
+        let NodeKind::Date { value, open, .. } = &app.ui.get(id).kind else { panic!() };
+        assert_eq!(value, "", "Cancel discards the staged day — value stays untouched");
+        assert!(!open);
+    }
+
+    #[test]
+    fn clicking_the_month_next_arrow_advances_the_browsed_month_without_touching_the_value() {
+        let (mut app, id) = date_app("");
+        set_staged_month(&mut app, id, 2024, 3);
+        let layout = nowui_core::datetime::layout_calendar(app.ui.get(id).computed, app.ui.viewport, 16.0, 2024, 3, false, 2024, 1900, 2100);
+        let next_click = Point::new(layout.month_next_rect.x + 1.0, layout.month_next_rect.y + 1.0);
+
+        app.date_popup_mouse_down(id, next_click);
+
+        let NodeKind::Date { value, open, picker, .. } = &app.ui.get(id).kind else { panic!() };
+        assert_eq!((picker.staged_year, picker.staged_month), (2024, 4), "March -> April");
         assert_eq!(value, "", "browsing months never touches the picked value");
         assert!(open, "browsing doesn't close the popup");
     }
 
     #[test]
-    fn clicking_the_prev_arrow_in_january_wraps_back_to_december_of_the_prior_year() {
-        let mut ui = Ui::new();
-        let id = ui.push(Node::new(
-            NodeKind::Date { value: String::new(), placeholder: String::new(), open: true, view_year: 2024, view_month: 1 },
-            Style { font_size: 16.0, ..Style::default() },
-        ));
-        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 280.0, 41.0);
-        ui.add_layer(id, "main");
-        let mut app = App::new("test".to_string(), ui, nowui_core::NoState, crate::semantic::Semantic::new(&[]), Backend::Cpu);
-        let layout = nowui_core::datetime::layout_calendar(app.ui.get(id).computed, 16.0, 2024, 1);
-        let prev_click = Point::new(layout.prev_rect.x + 1.0, layout.prev_rect.y + 1.0);
+    fn clicking_the_month_prev_arrow_in_january_wraps_back_to_december_of_the_prior_year() {
+        let (mut app, id) = date_app("");
+        set_staged_month(&mut app, id, 2024, 1);
+        let layout = nowui_core::datetime::layout_calendar(app.ui.get(id).computed, app.ui.viewport, 16.0, 2024, 1, false, 2024, 1900, 2100);
+        let prev_click = Point::new(layout.month_prev_rect.x + 1.0, layout.month_prev_rect.y + 1.0);
 
-        app.select_date_popup(id, prev_click);
+        app.date_popup_mouse_down(id, prev_click);
 
-        let NodeKind::Date { view_year, view_month, .. } = &app.ui.get(id).kind else { panic!() };
-        assert_eq!((*view_year, *view_month), (2023, 12));
+        let NodeKind::Date { picker, .. } = &app.ui.get(id).kind else { panic!() };
+        assert_eq!((picker.staged_year, picker.staged_month), (2023, 12));
     }
 
     #[test]
-    fn clicking_a_spinner_up_arrow_increments_that_unit_and_keeps_the_popup_open() {
+    fn clicking_the_year_next_arrow_only_steps_the_year_never_the_month() {
+        let (mut app, id) = date_app("");
+        set_staged_month(&mut app, id, 2024, 6);
+        let layout = nowui_core::datetime::layout_calendar(app.ui.get(id).computed, app.ui.viewport, 16.0, 2024, 6, false, 2024, 1900, 2100);
+        let next_click = Point::new(layout.year_next_rect.x + 1.0, layout.year_next_rect.y + 1.0);
+
+        app.date_popup_mouse_down(id, next_click);
+
+        let NodeKind::Date { picker, .. } = &app.ui.get(id).kind else { panic!() };
+        assert_eq!((picker.staged_year, picker.staged_month), (2025, 6));
+    }
+
+    #[test]
+    fn opening_and_picking_a_year_from_the_dropdown_list_updates_the_staged_year() {
+        let (mut app, id) = date_app("");
+        set_staged_month(&mut app, id, 2024, 6);
+        let layout = nowui_core::datetime::layout_calendar(app.ui.get(id).computed, app.ui.viewport, 16.0, 2024, 6, false, 2024, 1900, 2100);
+        app.date_popup_mouse_down(id, Point::new(layout.year_dropdown_rect.x + 1.0, layout.year_dropdown_rect.y + 1.0));
+        {
+            let NodeKind::Date { picker, .. } = &app.ui.get(id).kind else { panic!() };
+            assert!(picker.year_list_open);
+        }
+
+        let layout = nowui_core::datetime::layout_calendar(app.ui.get(id).computed, app.ui.viewport, 16.0, 2024, 6, true, 2024, 1900, 2100);
+        let year_list = layout.year_list.as_ref().unwrap();
+        let (rect, picked_year) = year_list.year_cells[3];
+        app.date_popup_mouse_down(id, Point::new(rect.x + 1.0, rect.y + 1.0));
+
+        let NodeKind::Date { picker, .. } = &app.ui.get(id).kind else { panic!() };
+        assert_eq!(picker.staged_year, picked_year);
+        assert!(!picker.year_list_open, "picking a year returns to the day grid");
+    }
+
+    #[test]
+    fn clicking_a_dial_number_stages_the_hour_and_starts_a_drag() {
         let mut ui = Ui::new();
         let id = ui.push(Node::new(
-            NodeKind::Time { value: "09:30".to_string(), placeholder: String::new(), open: true },
+            NodeKind::Time { value: "09:30".to_string(), placeholder: String::new(), open: true, picker: nowui_core::datetime::TimePickerState::from_value_or_now("09:30") },
             Style { font_size: 16.0, ..Style::default() },
         ));
         ui.get_mut(id).computed = Rect::new(0.0, 0.0, 280.0, 41.0);
         ui.add_layer(id, "main");
         let mut app = App::new("test".to_string(), ui, nowui_core::NoState, crate::semantic::Semantic::new(&[]), Backend::Cpu);
-        let layout = nowui_core::datetime::layout_clock(app.ui.get(id).computed, 16.0, false);
-        let (hour_up, ..) = layout.columns[0];
-        let p = Point::new(hour_up.x + 1.0, hour_up.y + 1.0);
+        app.ui.viewport = nowui_core::geometry::Size::new(800.0, 2000.0);
 
-        app.select_time_popup(id, p);
+        let layout = nowui_core::datetime::layout_clock(app.ui.get(id).computed, app.ui.viewport, 16.0, false);
+        // The "3" tick on the hour ring sits directly to the dial's right.
+        let p = nowui_core::datetime::point_for_hour_12(layout.dial_center, layout.dial_radius, 3);
+
+        app.time_popup_mouse_down(id, p);
+
+        assert_eq!(app.dragging_clock, Some(id), "pressing the dial starts a drag");
+        let NodeKind::Time { value, open, picker, .. } = &app.ui.get(id).kind else { panic!() };
+        assert_eq!(picker.staged_hour, 3, "hour tick 3, with AM preserved from the original 09:30 -> 3");
+        assert_eq!(value, "09:30", "a dial press only stages — value untouched until Confirm");
+        assert!(open);
+    }
+
+    #[test]
+    fn confirming_the_time_popup_writes_the_staged_value_and_dispatches_onselect() {
+        let mut ui = Ui::new();
+        let id = ui.push(Node::new(
+            NodeKind::Time { value: String::new(), placeholder: String::new(), open: true, picker: nowui_core::datetime::TimePickerState { staged_hour: 14, staged_minute: 45, staged_second: 0, mode: nowui_core::datetime::ClockMode::Hour } },
+            Style { font_size: 16.0, ..Style::default() },
+        ));
+        ui.get_mut(id).events.insert("onSelect".to_string(), vec!["state".to_string(), "picked".to_string()]);
+        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 280.0, 41.0);
+        ui.add_layer(id, "main");
+
+        #[derive(Default, Clone, nowui_core::NowUiState)]
+        #[nowui(methods(picked))]
+        struct S {
+            picked: bool,
+        }
+        impl S {
+            fn picked(&mut self, _app: &mut S, _event: &mut nowui_core::Event) {
+                self.picked = true;
+            }
+        }
+
+        let mut app = App::new("test".to_string(), ui, S::default(), crate::semantic::Semantic::new(&[]), Backend::Cpu);
+        app.ui.viewport = nowui_core::geometry::Size::new(800.0, 2000.0);
+        let layout = nowui_core::datetime::layout_clock(app.ui.get(id).computed, app.ui.viewport, 16.0, false);
+
+        app.time_popup_mouse_down(id, Point::new(layout.confirm_rect.x + 1.0, layout.confirm_rect.y + 1.0));
 
         let NodeKind::Time { value, open, .. } = &app.ui.get(id).kind else { panic!() };
-        assert_eq!(value, "10:30");
-        assert!(open, "dialing in a time takes more than one click — never auto-closes");
+        assert_eq!(value, "14:45");
+        assert!(!open);
+        assert!(app.state.picked, "onSelect fired on Confirm");
     }
 
     #[test]
-    fn datetime_popup_updates_only_the_half_that_was_clicked() {
+    fn datetime_tabs_switch_the_active_subview_and_confirm_joins_both_staged_halves() {
         let mut ui = Ui::new();
         let id = ui.push(Node::new(
             NodeKind::DateTime {
-                value: "15/03/2024 09:30".to_string(),
+                value: String::new(),
                 placeholder: String::new(),
                 open: true,
-                view_year: 2024,
-                view_month: 3,
+                date_picker: nowui_core::datetime::DatePickerState { staged_year: 2024, staged_month: 3, staged_day: 20, year_list_open: false, year_list_page_start: 2024, min_year: 1900, max_year: 2100 },
+                time_picker: nowui_core::datetime::TimePickerState { staged_hour: 9, staged_minute: 30, staged_second: 0, mode: nowui_core::datetime::ClockMode::Hour },
+                active_tab: nowui_core::datetime::DateTimeTab::Calendar,
             },
             Style { font_size: 16.0, ..Style::default() },
         ));
         ui.get_mut(id).computed = Rect::new(0.0, 0.0, 280.0, 41.0);
         ui.add_layer(id, "main");
         let mut app = App::new("test".to_string(), ui, nowui_core::NoState, crate::semantic::Semantic::new(&[]), Backend::Cpu);
-        let layout = nowui_core::datetime::layout_datetime(app.ui.get(id).computed, 16.0, false, 2024, 3);
+        app.ui.viewport = nowui_core::geometry::Size::new(800.0, 2000.0);
 
-        // Click day 20 in the calendar half — only the date part changes.
-        let (day_20_rect, day) = layout.calendar.day_cells.iter().find(|(_, d)| *d == Some(20)).copied().unwrap();
-        assert_eq!(day, Some(20));
-        app.select_datetime_popup(id, Point::new(day_20_rect.x + 1.0, day_20_rect.y + 1.0));
+        let layout = nowui_core::datetime::layout_datetime(
+            app.ui.get(id).computed, app.ui.viewport, 16.0, false,
+            nowui_core::datetime::DateTimeTab::Calendar, 2024, 3, false, 2024, 1900, 2100,
+        );
+        app.datetime_popup_mouse_down(id, Point::new(layout.tab_clock_rect.x + 1.0, layout.tab_clock_rect.y + 1.0));
         {
-            let NodeKind::DateTime { value, open, .. } = &app.ui.get(id).kind else { panic!() };
-            assert_eq!(value, "20/03/2024 09:30");
-            assert!(open, "picking the date half never closes a DateTime popup");
+            let NodeKind::DateTime { active_tab, .. } = &app.ui.get(id).kind else { panic!() };
+            assert_eq!(*active_tab, nowui_core::datetime::DateTimeTab::Clock);
         }
 
-        // Now click the minute column's down arrow — only the time part changes.
-        let layout = nowui_core::datetime::layout_datetime(app.ui.get(id).computed, 16.0, false, 2024, 3);
-        let (_, _, minute_down) = layout.clock.columns[1];
-        app.select_datetime_popup(id, Point::new(minute_down.x + 1.0, minute_down.y + 1.0));
+        let layout = nowui_core::datetime::layout_datetime(
+            app.ui.get(id).computed, app.ui.viewport, 16.0, false,
+            nowui_core::datetime::DateTimeTab::Clock, 2024, 3, false, 2024, 1900, 2100,
+        );
+        let clock = layout.clock.unwrap();
+        app.datetime_popup_mouse_down(id, Point::new(clock.confirm_rect.x + 1.0, clock.confirm_rect.y + 1.0));
+
         let NodeKind::DateTime { value, open, .. } = &app.ui.get(id).kind else { panic!() };
-        assert_eq!(value, "20/03/2024 09:29");
-        assert!(open);
+        assert_eq!(value, "20/03/2024 09:30", "Confirm joins both staged halves regardless of which tab was last active");
+        assert!(!open);
     }
 
     /// A one-node `Ui` (a `TextInput` seeded with `label`, cursor at the
