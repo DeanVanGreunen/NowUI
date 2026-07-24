@@ -297,6 +297,32 @@ pub struct Ui {
     /// own `hover:`/`active:` style variants.
     pub cursor: Point,
     pub mouse_down: bool,
+    /// A whole-window pan applied to every layer's root before `layout::
+    /// arrange` (see `layout::solve`) — the same convention as a `scroll-x`/
+    /// `scroll-y` container's own `Node::scroll_offset` (increasing it
+    /// shifts content up/left), just applied globally instead of to one
+    /// container's children. Exists purely so an open `Date`/`Time`/
+    /// `DateTime` popup that still doesn't fully fit on screen even after
+    /// `datetime::place_popup`'s flip/clamp (e.g. the box sits somewhere
+    /// that leaves no fully-clear placement) can be brought fully into view
+    /// by panning the whole page instead, with some breathing room past its
+    /// edge — see `nowui-runtime`'s `App::update_auto_scroll` and
+    /// `datetime::reveal_scroll_delta`. Reset to `(0, 0)` whenever no picker
+    /// popup is open.
+    pub auto_scroll: Point,
+    /// The valid `[min, max]` range `auto_scroll` can currently take on each
+    /// axis — set once, alongside `auto_scroll` itself, when a picker popup
+    /// is first revealed (see `App::update_auto_scroll`), and left alone
+    /// while it stays open. Deliberately tracked *separately* from
+    /// `auto_scroll`'s own current value: inferring the range from whether
+    /// `auto_scroll` is currently non-zero collapses to nothing the moment a
+    /// user's own `MouseWheel` scrolls it back to exactly `0` (a perfectly
+    /// valid position *within* the range, not the end of it) — which would
+    /// both hide the scrollbar (`paint::paint_page_scrollbars`) and disable
+    /// the wheel handler that's supposed to let them scroll back down again.
+    /// Reset to `((0,0), (0,0))` whenever no picker popup is open.
+    pub page_scroll_min: Point,
+    pub page_scroll_max: Point,
 }
 
 impl Ui {

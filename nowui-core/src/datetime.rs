@@ -355,6 +355,33 @@ pub fn place_popup(box_rect: Rect, popup_h: f32, viewport: Size) -> Rect {
     Rect::new(x, y, box_rect.w, popup_h)
 }
 
+/// How much extra to pan the whole page (added to `Ui::auto_scroll`, same
+/// sign convention: positive shifts content up/left) so `popup_rect` —
+/// already placed by `place_popup`'s own flip/clamp — ends up fully within
+/// the physical `viewport` window, with `padding` of breathing room past
+/// whichever edge(s) it still overflows. `place_popup` alone can't always
+/// guarantee full containment (e.g. a box positioned such that neither
+/// "below" nor "above" has enough clear room for the popup's own height);
+/// this is the page-panning fallback for exactly that residual case.
+/// Returns `(0, 0)` if `popup_rect` already fits.
+pub fn reveal_scroll_delta(popup_rect: Rect, viewport: Size, padding: f32) -> Point {
+    let dx = if popup_rect.x < 0.0 {
+        popup_rect.x - padding
+    } else if popup_rect.x + popup_rect.w > viewport.w {
+        (popup_rect.x + popup_rect.w) - viewport.w + padding
+    } else {
+        0.0
+    };
+    let dy = if popup_rect.y < 0.0 {
+        popup_rect.y - padding
+    } else if popup_rect.y + popup_rect.h > viewport.h {
+        (popup_rect.y + popup_rect.h) - viewport.h + padding
+    } else {
+        0.0
+    };
+    Point::new(dx, dy)
+}
+
 pub struct YearListLayout {
     pub prev_page_rect: Rect,
     pub next_page_rect: Rect,
@@ -736,6 +763,27 @@ mod tests {
         let box_rect = Rect::new(-50.0, 100.0, 200.0, 40.0);
         let placed = place_popup(box_rect, 300.0, Size::new(800.0, 800.0));
         assert_eq!(placed.x, 0.0);
+    }
+
+    #[test]
+    fn reveal_scroll_delta_is_zero_when_the_popup_already_fits() {
+        let popup = Rect::new(10.0, 10.0, 200.0, 200.0);
+        assert_eq!(reveal_scroll_delta(popup, Size::new(800.0, 800.0), 16.0), Point::new(0.0, 0.0));
+    }
+
+    #[test]
+    fn reveal_scroll_delta_scrolls_down_and_right_to_reveal_bottom_right_overflow() {
+        // Popup's bottom-right corner sticks out 20px past an 800x800 viewport.
+        let popup = Rect::new(700.0, 700.0, 120.0, 120.0);
+        let delta = reveal_scroll_delta(popup, Size::new(800.0, 800.0), 16.0);
+        assert_eq!(delta, Point::new(20.0 + 16.0, 20.0 + 16.0));
+    }
+
+    #[test]
+    fn reveal_scroll_delta_scrolls_up_and_left_to_reveal_top_left_overflow() {
+        let popup = Rect::new(-30.0, -10.0, 120.0, 120.0);
+        let delta = reveal_scroll_delta(popup, Size::new(800.0, 800.0), 16.0);
+        assert_eq!(delta, Point::new(-30.0 - 16.0, -10.0 - 16.0));
     }
 
     #[test]

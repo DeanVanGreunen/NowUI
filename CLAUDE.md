@@ -426,8 +426,33 @@ DateTime `Choose both` w-full bg-white border rounded p-[10px] {
   footer commits (`datetime::join_datetime`) or discards *both* halves together, regardless of
   which tab was last active.
 - **Popup placement**: every popup opens directly below its box, flipping above instead if it
-  would overflow the bottom of the window (`datetime::place_popup`, driven by `Ui::viewport` —
-  kept in sync by `layout::solve` every frame).
+  would overflow the bottom of the window, and clamped horizontally so it never runs off the
+  left/right edge either (`datetime::place_popup`, driven by `Ui::viewport` — kept in sync by
+  `layout::solve` every frame).
+- **Page auto-scroll**: if a popup still doesn't fully fit even after `place_popup`'s own
+  flip/clamp (e.g. the box sits somewhere with no fully-clear placement on either axis), the whole
+  page pans via `Ui::auto_scroll` — the same sign convention as a `scroll-x`/`scroll-y`
+  container's own `scroll_offset`, just applied to every layer's root in `layout::solve` instead of
+  one container's children — so the popup ends up fully visible with 16px of breathing room past
+  whichever edge(s) it overflowed (`datetime::reveal_scroll_delta`, `nowui-runtime`'s `App::
+  update_auto_scroll`). This only ever fires once, on the rising edge of the popup opening — not
+  every frame it stays open — so it doesn't fight a user's own `MouseWheel` scrolling away from an
+  already-revealed popup; wheel input past that point pans further within `Ui::page_scroll_min`/
+  `max` — the valid range, persisted **separately** from `auto_scroll`'s own current value the
+  moment the popup is revealed, and left alone while it stays open. That separation matters:
+  inferring the range from whether `auto_scroll` is currently non-zero collapses to nothing the
+  instant the user scrolls back to exactly `0` (an ordinary position *within* the range, not the
+  end of it) — which used to both hide the scrollbar and permanently disable scrolling back down
+  again, a real regression this pair of fields exists to fix. Both reset to `(0, 0)` the moment no
+  picker popup is open. While `page_scroll_min != page_scroll_max` on an axis, a thin translucent
+  browser-style scrollbar (track + thumb, sized/positioned off that persisted range, not the
+  current value) is drawn along the window's right/bottom edge (`paint::paint_page_scrollbars`) —
+  visual only, not itself draggable.
+  Since `auto_scroll` shifts every layer's root *origin* away from `(0, 0)`, the root's own
+  background fill no longer covers the whole physical window on its own — `paint::paint` covers
+  the entire `Ui::viewport` with the first layer's root's own `bg` color before painting anything
+  else, so the strip of window `auto_scroll` reveals matches the app's actual background instead
+  of showing raw clear-color.
 - **Theme**: every popup's own internals (not the closed box, which follows the widget's own
   style) are a fixed white background / near-black text / indigo (Tailwind indigo-500/600/100)
   accent palette — hover shows a light-indigo highlight, a held mouse-button shows a darker one,

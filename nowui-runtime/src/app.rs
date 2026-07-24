@@ -103,6 +103,14 @@ pub struct App<S: NowUiState + 'static> {
     /// clears it). Only ever mutates the widget's *staged* picker state —
     /// see `NodeKind::Date`'s doc comment — never `value` itself.
     dragging_clock: Option<NodeId>,
+    /// The picker `update_auto_scroll` last revealed (i.e. panned the page
+    /// for) — used to fire the reveal-into-view pan only on the rising edge
+    /// of a popup opening, not every single frame it stays open. Without
+    /// this, a user's own `MouseWheel` scrolling away from an already-
+    /// revealed popup would get fought right back into place on the very
+    /// next redraw. Cleared (along with `Ui::auto_scroll` itself) once no
+    /// picker is open.
+    revealed_picker: Option<NodeId>,
     /// Tracked from `WindowEvent::ModifiersChanged` — needed for Shift
     /// (extend a `TextInput` selection) and Ctrl (select-all). Nothing else
     /// in this engine currently reads a modifier key, so this exists purely
@@ -147,6 +155,7 @@ impl<S: NowUiState + 'static> App<S> {
             dragging_slider: None,
             dragging_text_input: None,
             dragging_clock: None,
+            revealed_picker: None,
             modifiers: winit::keyboard::ModifiersState::empty(),
             semantic,
             transitions: Transitions::new(),
@@ -479,6 +488,7 @@ impl<S: NowUiState + 'static> App<S> {
         // `self.measure_text_width`, which would conflict with the painter
         // already borrowing `self.text` above.
         self.update_text_input_scroll();
+        self.update_auto_scroll();
 
         {
             let mut painter = SkiaPainter::new(&mut pixmap, &mut self.text);
@@ -507,6 +517,7 @@ impl<S: NowUiState + 'static> App<S> {
 
         // See `redraw_cpu`'s matching comment — same borrow-conflict reason.
         self.update_text_input_scroll();
+        self.update_auto_scroll();
 
         {
             let mut painter = GpuPainter::new(&mut scene, &mut self.text, &mut self.gpu_font_cache);
@@ -1063,6 +1074,52 @@ impl<S: NowUiState + 'static> App<S> {
 
             self.ui.get_mut(id).scroll_offset.x = x;
         }
+    }
+
+    /// Pan the whole page (`Ui::auto_scroll`) so an open `Date`/`Time`/
+    /// `DateTime` popup that still doesn't fully fit on screen — even after
+    /// `datetime::place_popup`'s own flip/clamp — ends up fully visible with
+    /// 16px of breathing room past whichever edge(s) it overflows. Reset to
+    /// `(0, 0)` when no picker popup is open. Called once per redraw, after
+    /// `layout::solve` (needs the box's fresh `computed` position) and
+    /// before painting — same slot as `update_text_input_scroll`. Takes
+    /// effect starting *next* frame's `solve` (the same one-frame-later
+    /// convergence every other reactive adjustment in this engine uses),
+    /// imperceptible at a steady 60fps.
+    ///
+    /// Only fires on the *rising edge* of a popup opening (tracked via
+    /// `revealed_picker`), not every frame it stays open — otherwise a
+    /// user's own `MouseWheel` scrolling (see that handler) away from an
+    /// already-revealed popup would get fought right back into place on the
+    /// very next redraw, defeating the point of letting them scroll at all.
+    fn update_auto_scroll(&mut self) {
+        let open_picker = (0..self.ui.nodes.len()).map(|i| NodeId(i as u32)).find(|&id| {
+            matches!(
+                &self.ui.get(id).kind,
+                NodeKind::Date { open: true, .. } | NodeKind::Time { open: true, .. } | NodeKind::DateTime { open: true, .. }
+            )
+        });
+        let Some(id) = open_picker else {
+            self.ui.auto_scroll = Point::default();
+            self.ui.page_scroll_min = Point::default();
+            self.ui.page_scroll_max = Point::default();
+            self.revealed_picker = None;
+            return;
+        };
+        if self.revealed_picker == Some(id) {
+            return; // Already revealed this open session — leave the user's own scroll position alone.
+        }
+        self.revealed_picker = Some(id);
+        if let Some(popup_rect) = self.picker_popup_rect(id) {
+            let delta = nowui_core::datetime::reveal_scroll_delta(popup_rect, self.ui.viewport, 16.0);
+            self.ui.auto_scroll.x += delta.x;
+            self.ui.auto_scroll.y += delta.y;
+        }
+        // Persist the resulting range separately from `auto_scroll`'s own
+        // current value — see `Ui::page_scroll_min`/`max`'s doc comment for
+        // why (scrolling back to exactly `0` must not erase the range).
+        self.ui.page_scroll_min = Point::new(self.ui.auto_scroll.x.min(0.0), self.ui.auto_scroll.y.min(0.0));
+        self.ui.page_scroll_max = Point::new(self.ui.auto_scroll.x.max(0.0), self.ui.auto_scroll.y.max(0.0));
     }
 
     /// Which char index in `id`'s `TextInput` a click at `cursor` (screen
@@ -1737,12 +1794,14 @@ impl<S: NowUiState + 'static> ApplicationHandler for App<S> {
                 };
                 // Nearest-to-cursor (deepest) scrollable ancestor wins.
                 let chain = self.ui.hit_test_chain(self.cursor);
+                let mut claimed = false;
                 for &id in chain.iter().rev() {
                     let style = &self.ui.get(id).style;
                     let (scroll_x, scroll_y) = (style.scroll_x, style.scroll_y);
                     if !scroll_x && !scroll_y {
                         continue;
                     }
+                    claimed = true;
                     let content = self.ui.get(id).content_size;
                     let rect = self.ui.get(id).computed;
                     let node = self.ui.get_mut(id);
@@ -1760,6 +1819,27 @@ impl<S: NowUiState + 'static> ApplicationHandler for App<S> {
                     self.ui.dirty = true;
                     self.request_redraw();
                     break;
+                }
+
+                // No `scroll-h`/`scroll-v` container claimed it: if a picker
+                // popup currently has the page panned to reveal it (see
+                // `update_auto_scroll`), let the wheel pan further within
+                // exactly the range that popup's own reveal defined — same
+                // "browser scrolls the page once nothing narrower claims the
+                // wheel" behavior as the DOM, just bounded to the one known
+                // overflowing element instead of a general document height.
+                // Keyed off the *persisted* `page_scroll_min`/`max` range,
+                // not whether `auto_scroll`'s current value happens to be
+                // non-zero — otherwise scrolling back to exactly `0` (an
+                // ordinary position *within* the range) would look
+                // indistinguishable from "no range at all" and permanently
+                // disable scrolling back down again.
+                let has_page_range = self.ui.page_scroll_min != self.ui.page_scroll_max;
+                if !claimed && has_page_range {
+                    self.ui.auto_scroll.y = (self.ui.auto_scroll.y - dy).clamp(self.ui.page_scroll_min.y, self.ui.page_scroll_max.y);
+                    self.ui.auto_scroll.x = (self.ui.auto_scroll.x - dx).clamp(self.ui.page_scroll_min.x, self.ui.page_scroll_max.x);
+                    self.ui.dirty = true;
+                    self.request_redraw();
                 }
             }
 
@@ -2217,6 +2297,100 @@ mod tests {
         let NodeKind::DateTime { value, open, .. } = &app.ui.get(id).kind else { panic!() };
         assert_eq!(value, "20/03/2024 09:30", "Confirm joins both staged halves regardless of which tab was last active");
         assert!(!open);
+    }
+
+    #[test]
+    fn opening_a_picker_whose_popup_overflows_a_short_viewport_reveals_it_via_auto_scroll() {
+        let mut ui = Ui::new();
+        let id = ui.push(Node::new(
+            NodeKind::Date {
+                value: String::new(),
+                placeholder: String::new(),
+                open: false,
+                picker: nowui_core::datetime::DatePickerState::from_value_or_now(""),
+            },
+            Style { font_size: 16.0, ..Style::default() },
+        ));
+        // Box near the bottom of a short (220px) viewport: the calendar
+        // popup (~390px tall) fits neither below nor above.
+        ui.get_mut(id).computed = Rect::new(0.0, 180.0, 280.0, 41.0);
+        ui.add_layer(id, "main");
+        let mut app = App::new("test".to_string(), ui, nowui_core::NoState, crate::semantic::Semantic::new(&[]), Backend::Cpu);
+        app.ui.viewport = nowui_core::geometry::Size::new(800.0, 220.0);
+
+        assert_eq!(app.ui.auto_scroll, Point::default(), "nothing open yet — no pan");
+
+        if let NodeKind::Date { open, .. } = &mut app.ui.get_mut(id).kind {
+            *open = true;
+        }
+        app.update_auto_scroll();
+        assert_ne!(app.ui.auto_scroll, Point::default(), "popup still overflows even after place_popup's own flip — page pans to reveal it");
+        assert_eq!(app.revealed_picker, Some(id));
+        let revealed_y = app.ui.auto_scroll.y;
+        assert_eq!(app.ui.page_scroll_min.y, revealed_y.min(0.0));
+        assert_eq!(app.ui.page_scroll_max.y, revealed_y.max(0.0));
+
+        // A user's own `MouseWheel` scroll away from the just-revealed
+        // position must not get fought back into place next frame.
+        let user_scroll = Point::new(app.ui.auto_scroll.x, app.ui.auto_scroll.y - 5.0);
+        app.ui.auto_scroll = user_scroll;
+        app.update_auto_scroll();
+        assert_eq!(app.ui.auto_scroll, user_scroll, "already revealed this open session — leave the user's scroll alone");
+        assert_eq!(app.ui.page_scroll_max.y, revealed_y.max(0.0), "the persisted range itself must not shrink as the user scrolls within it");
+
+        // Closing the popup resets the pan.
+        if let NodeKind::Date { open, .. } = &mut app.ui.get_mut(id).kind {
+            *open = false;
+        }
+        app.update_auto_scroll();
+        assert_eq!(app.ui.auto_scroll, Point::default());
+        assert_eq!(app.ui.page_scroll_min, Point::default());
+        assert_eq!(app.ui.page_scroll_max, Point::default());
+        assert_eq!(app.revealed_picker, None);
+    }
+
+    #[test]
+    fn scrolling_all_the_way_back_to_zero_does_not_strand_the_page_or_hide_the_scrollbar_range() {
+        // Regression test for a real bug: the wheel handler (and the
+        // scrollbar) used to infer the scrollable range from whether
+        // `auto_scroll`'s *current* value was non-zero — which collapses to
+        // nothing the instant a user scrolls all the way back to exactly
+        // `0`, permanently disabling further scrolling and hiding the
+        // scrollbar even though the popup was still panned open. The fix:
+        // `page_scroll_min`/`max` persist the real range independently.
+        let mut ui = Ui::new();
+        let id = ui.push(Node::new(
+            NodeKind::Date {
+                value: String::new(),
+                placeholder: String::new(),
+                open: true,
+                picker: nowui_core::datetime::DatePickerState::from_value_or_now(""),
+            },
+            Style { font_size: 16.0, ..Style::default() },
+        ));
+        ui.get_mut(id).computed = Rect::new(0.0, 180.0, 280.0, 41.0);
+        ui.add_layer(id, "main");
+        let mut app = App::new("test".to_string(), ui, nowui_core::NoState, crate::semantic::Semantic::new(&[]), Backend::Cpu);
+        app.ui.viewport = nowui_core::geometry::Size::new(800.0, 220.0);
+
+        app.update_auto_scroll();
+        let revealed_y = app.ui.auto_scroll.y;
+        assert_ne!(revealed_y, 0.0);
+
+        // Simulate the user wheel-scrolling all the way back to 0 (as the
+        // real `MouseWheel` handler would, clamped to `page_scroll_min/max`).
+        app.ui.auto_scroll.y = (revealed_y - revealed_y).clamp(app.ui.page_scroll_min.y, app.ui.page_scroll_max.y);
+        assert_eq!(app.ui.auto_scroll.y, 0.0);
+
+        // The persisted range must still be there — nothing about scrolling
+        // back to 0 should have erased it.
+        assert_ne!(app.ui.page_scroll_min, app.ui.page_scroll_max, "a real scrollable range must still exist");
+
+        // And the user must still be able to scroll back down within it
+        // (current value 0, wheel delta of `-revealed_y`, same `current -
+        // dy` convention the real handler uses).
+        let back_down = (0.0 - (-revealed_y)).clamp(app.ui.page_scroll_min.y, app.ui.page_scroll_max.y);
+        assert_eq!(back_down, revealed_y, "scrolling back down within the persisted range must reach the fully-revealed position again");
     }
 
     /// A one-node `Ui` (a `TextInput` seeded with `label`, cursor at the

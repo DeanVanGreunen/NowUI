@@ -8,6 +8,22 @@ use crate::painter::{Painter, TextStyle};
 use crate::style::{Position, TextAlign};
 
 pub fn paint(ui: &Ui, painter: &mut dyn Painter) {
+    // `Ui::auto_scroll` (see its doc comment) shifts every layer's root
+    // origin away from `(0, 0)` to keep an offscreen picker popup in view —
+    // the root's own background fill moves right along with it, no longer
+    // covering the whole physical window, so an "overflow" strip at
+    // whichever edge got revealed would otherwise show raw clear-color
+    // instead of the app's actual background. Painting the first layer's
+    // root's own background across the *entire* viewport first, before
+    // anything else, fixes that seam regardless of whether `auto_scroll` is
+    // currently active — harmless (and skipped) if that root has no `bg` at
+    // all.
+    if let Some(first_root) = ui.layers.first().map(|l| l.root) {
+        if let Some(bg) = ui.get(first_root).style.bg {
+            painter.fill_rect(Rect::new(0.0, 0.0, ui.viewport.w, ui.viewport.h), bg, Edges::default());
+        }
+    }
+
     // Open `Dropdown`s/`Menu`s are collected here instead of drawn inline, so
     // their popup floats on top of *everything* (drawn after every layer,
     // once no ancestor clip is active) instead of being clipped by whatever
@@ -24,6 +40,51 @@ pub fn paint(ui: &Ui, painter: &mut dyn Painter) {
         paint_date_popup(ui, id, painter);
         paint_time_popup(ui, id, painter);
         paint_datetime_popup(ui, id, painter);
+    }
+    paint_page_scrollbars(ui, painter);
+}
+
+/// Browser-style page scrollbars: a thin translucent track + thumb along
+/// the right/bottom edge of the window, shown only on whichever axis
+/// `Ui::page_scroll_min`/`page_scroll_max` currently define a real range on
+/// (i.e. only while a `Date`/`Time`/`DateTime` popup has panned the page to
+/// stay in view — see `nowui-runtime`'s `App::update_auto_scroll`/
+/// `MouseWheel` handler). Deliberately keyed off that *persisted* range, not
+/// whether `Ui::auto_scroll`'s current value happens to be non-zero right
+/// now — the latter collapses to nothing (hiding the scrollbar entirely)
+/// the instant the user scrolls back to exactly `0`, which is just an
+/// ordinary position *within* the range, not the end of it.
+fn paint_page_scrollbars(ui: &Ui, painter: &mut dyn Painter) {
+    const THICKNESS: f32 = 10.0;
+    const MIN_THUMB: f32 = 24.0;
+    const TRACK: Color = Color { r: 0, g: 0, b: 0, a: 24 };
+    const THUMB: Color = Color { r: 0, g: 0, b: 0, a: 110 };
+
+    let vp = ui.viewport;
+    let scroll = ui.auto_scroll;
+
+    if ui.page_scroll_min.y != ui.page_scroll_max.y {
+        let doc_start = ui.page_scroll_min.y;
+        let extent = vp.h + (ui.page_scroll_max.y - ui.page_scroll_min.y);
+        let track = Rect::new(vp.w - THICKNESS, 0.0, THICKNESS, vp.h);
+        painter.fill_rect(track, TRACK, Edges::default());
+        let thumb_h = (vp.h * vp.h / extent).clamp(MIN_THUMB.min(vp.h), vp.h);
+        let view_start = scroll.y - doc_start;
+        let thumb_y = (vp.h * (view_start / extent)).clamp(0.0, vp.h - thumb_h);
+        let thumb = Rect::new(vp.w - THICKNESS + 2.0, thumb_y, THICKNESS - 4.0, thumb_h);
+        painter.fill_rect(thumb, THUMB, Edges::all((THICKNESS - 4.0) / 2.0));
+    }
+
+    if ui.page_scroll_min.x != ui.page_scroll_max.x {
+        let doc_start = ui.page_scroll_min.x;
+        let extent = vp.w + (ui.page_scroll_max.x - ui.page_scroll_min.x);
+        let track = Rect::new(0.0, vp.h - THICKNESS, vp.w, THICKNESS);
+        painter.fill_rect(track, TRACK, Edges::default());
+        let thumb_w = (vp.w * vp.w / extent).clamp(MIN_THUMB.min(vp.w), vp.w);
+        let view_start = scroll.x - doc_start;
+        let thumb_x = (vp.w * (view_start / extent)).clamp(0.0, vp.w - thumb_w);
+        let thumb = Rect::new(thumb_x, vp.h - THICKNESS + 2.0, thumb_w, THICKNESS - 4.0);
+        painter.fill_rect(thumb, THUMB, Edges::all((THICKNESS - 4.0) / 2.0));
     }
 }
 
@@ -1390,5 +1451,25 @@ mod tests {
             "absolute child's fill must fall outside its parent's own push_clip/pop_clip pair, got trace {:?}",
             painter.0
         );
+    }
+
+    #[test]
+    fn root_background_prefills_the_whole_viewport_even_when_auto_scroll_shifts_its_origin() {
+        let mut ui = Ui::new();
+        let bg = Color::rgb(240, 240, 240);
+        let root = ui.push(Node::new(NodeKind::Container, Style { bg: Some(bg), ..Default::default() }));
+        // Simulate `Ui::auto_scroll` having shifted the root's own computed
+        // rect away from `(0, 0)` — its own fill no longer covers the whole
+        // window, which is exactly the seam this pre-fill exists to hide.
+        ui.get_mut(root).computed = Rect::new(0.0, -50.0, 800.0, 600.0);
+        ui.add_layer(root, "main");
+        ui.viewport = Size::new(800.0, 600.0);
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        let (first_rect, first_color) = painter.fills[0];
+        assert_eq!(first_color, bg);
+        assert_eq!(first_rect, Rect::new(0.0, 0.0, 800.0, 600.0), "prefilled across the entire physical window, not just the shifted root rect");
     }
 }

@@ -25,8 +25,12 @@ pub fn solve(ui: &mut Ui, viewport: Size, painter: &mut dyn Painter) {
     for root in roots {
         let mut sizes = HashMap::new();
         measure(ui, root, painter, &mut sizes);
-        // Root fills the viewport unless it has an explicit fixed size.
-        let root_rect = Rect::new(0.0, 0.0, viewport.w, viewport.h);
+        // Root fills the viewport unless it has an explicit fixed size. The
+        // whole tree is shifted by `-auto_scroll` (same sign convention as a
+        // `scroll-x`/`scroll-y` container's own pan) — see `Ui::auto_scroll`'s
+        // doc comment for why: bringing an open picker popup that still
+        // doesn't fully fit on screen into view by panning the whole page.
+        let root_rect = Rect::new(-ui.auto_scroll.x, -ui.auto_scroll.y, viewport.w, viewport.h);
         arrange(ui, root, root_rect, &sizes, root_rect);
         // After the normal pass, so every `Menu`'s own `computed` rect
         // (which anchors its popup) is final.
