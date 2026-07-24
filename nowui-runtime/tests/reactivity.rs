@@ -41,7 +41,7 @@ fn click(node: &mut Node) -> Event<'_> {
 /// doc comment on why that's the necessary, if not fully sound, shape) — this
 /// mirrors exactly what `nowui-runtime`'s `App::dispatch_event` does to
 /// construct it, just at test scope.
-fn call_with_self_as_root<S: NowUiState>(state: &mut S, path: &[&str], event: &mut Event) -> bool {
+fn call_with_self_as_root<S: NowUiState + 'static>(state: &mut S, path: &[&str], event: &mut Event) -> bool {
     let root_ptr: *mut S = state;
     state.call(path, event, unsafe { &mut *root_ptr })
 }

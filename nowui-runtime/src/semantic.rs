@@ -379,6 +379,19 @@ impl Semantic {
             // `paint.rs`.
             "Menu" => Some(NodeKind::Menu { label: arg(0), open: false }),
             "MenuItem" => Some(NodeKind::MenuItem { label: arg(0) }),
+            // `Date`/`DateTime` start browsing the calendar popup on the
+            // system clock's current month (`view_year`/`view_month`) —
+            // re-synced to the bound value's own month whenever the popup is
+            // (re)opened, see `nowui-runtime`'s `App::handle_click`.
+            "Date" => {
+                let (y, m, ..) = nowui_core::datetime::now();
+                Some(NodeKind::Date { value: String::new(), placeholder: arg(0), open: false, view_year: y, view_month: m })
+            }
+            "Time" => Some(NodeKind::Time { value: String::new(), placeholder: arg(0), open: false }),
+            "DateTime" => {
+                let (y, m, ..) = nowui_core::datetime::now();
+                Some(NodeKind::DateTime { value: String::new(), placeholder: arg(0), open: false, view_year: y, view_month: m })
+            }
             // Bare containers used directly in a body (e.g. `Card`, `Row`).
             "Card" | "Container" | "Row" | "Column" | "Bar" | "Grid" | "List" => Some(NodeKind::Container),
             other => {
@@ -545,6 +558,10 @@ pub(crate) fn apply_exact(s: &mut Style, key: &str, v: &str) -> bool {
         // Enter as a literal newline instead of the single-line,
         // horizontally-scrolling default. Harmlessly unused on anything else.
         "multi" | "multiline" => s.multiline = true,
+        // `Time`/`DateTime with-seconds { ... }` — include `:SS` in the
+        // displayed/parsed value and the spinner popup's third column.
+        // Harmlessly unused on anything else.
+        "with-seconds" => s.with_seconds = true,
 
         "w" => s.width = parse_sizing(v),
         "h" => s.height = parse_sizing(v),
@@ -1255,6 +1272,49 @@ mod tests {
         assert_eq!(node.value_path, vec!["state".to_string(), "role".to_string()]);
         assert_eq!(*selected, None);
         assert!(!*open);
+    }
+
+    #[test]
+    fn resolves_date_time_datetime_placeholder_value_and_onselect_binding() {
+        let ast = nowui_syntax::parse(
+            "layout: T { \
+                Date `Pick a date` {value: state.birthday, onSelect: state.onDate} \
+                Time `Pick a time` with-seconds {value: state.alarm, onSelect: state.onTime} \
+                DateTime `Pick both` {value: state.meeting, onSelect: state.onBoth} \
+            }",
+        )
+        .unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+
+        let date_node = ui.get(root.children[0]);
+        let nowui_core::NodeKind::Date { placeholder, value, open, .. } = &date_node.kind else {
+            panic!("expected a Date node");
+        };
+        assert_eq!(placeholder, "Pick a date");
+        assert_eq!(value, "");
+        assert!(!*open);
+        assert_eq!(date_node.value_path, vec!["state".to_string(), "birthday".to_string()]);
+        assert_eq!(date_node.events.get("onSelect"), Some(&vec!["state".to_string(), "onDate".to_string()]));
+
+        let time_node = ui.get(root.children[1]);
+        assert!(time_node.style.with_seconds, "the `with-seconds` bare flag resolved onto Style");
+        let nowui_core::NodeKind::Time { placeholder, .. } = &time_node.kind else {
+            panic!("expected a Time node");
+        };
+        assert_eq!(placeholder, "Pick a time");
+        assert_eq!(time_node.events.get("onSelect"), Some(&vec!["state".to_string(), "onTime".to_string()]));
+
+        let datetime_node = ui.get(root.children[2]);
+        let nowui_core::NodeKind::DateTime { placeholder, view_year, view_month, .. } = &datetime_node.kind else {
+            panic!("expected a DateTime node");
+        };
+        assert_eq!(placeholder, "Pick both");
+        // `view_year`/`view_month` start on the system clock's current month.
+        let (now_y, now_m, ..) = nowui_core::datetime::now();
+        assert_eq!((*view_year, *view_month), (now_y, now_m));
+        assert_eq!(datetime_node.events.get("onSelect"), Some(&vec!["state".to_string(), "onBoth".to_string()]));
     }
 
     #[test]

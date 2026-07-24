@@ -2,6 +2,7 @@
 //! solver, and the paint walk. Free of both the parser and the renderer.
 
 pub mod arena;
+pub mod datetime;
 pub mod geometry;
 pub mod layout;
 pub mod paint;
@@ -194,6 +195,47 @@ mod tests {
         assert_eq!(ui.get(normal).computed, Rect::new(0.0, 0.0, 200.0, 20.0));
         // Positioned via top/right against the root's content box.
         assert_eq!(ui.get(absolute).computed, Rect::new(200.0 - 5.0 - 30.0, 5.0, 30.0, 10.0));
+    }
+
+    #[test]
+    fn absolute_child_skips_an_unpositioned_parent_to_reach_the_nearest_positioned_ancestor() {
+        // root (position-relative, padding 10)
+        //   `-- middle (plain Container, NOT positioned, padding 20)
+        //         `-- absolute (position-absolute, top/right: 5)
+        //
+        // Real CSS: `absolute`'s containing block is `root`'s content box
+        // (the nearest positioned ancestor), not `middle`'s — `middle` is
+        // just a plain box in between and must be skipped over.
+        let mut ui = Ui::new();
+        let absolute = ui.push(Node::new(
+            NodeKind::Container,
+            Style {
+                position: Position::Absolute,
+                width: Sizing::Fixed(30.0),
+                height: Sizing::Fixed(10.0),
+                top: Some(5.0),
+                right: Some(5.0),
+                ..Default::default()
+            },
+        ));
+        let middle = ui.push(Node::new(
+            NodeKind::Container,
+            Style { padding: Edges::all(20.0), width: Sizing::Fill(1.0), height: Sizing::Fill(1.0), ..Default::default() },
+        ));
+        ui.get_mut(middle).children = vec![absolute];
+        let root = ui.push(Node::new(
+            NodeKind::Container,
+            Style { position: Position::Relative, padding: Edges::all(10.0), ..Default::default() },
+        ));
+        ui.get_mut(root).children = vec![middle];
+        ui.add_layer(root, "main");
+
+        layout::solve(&mut ui, Size::new(200.0, 100.0), &mut NullPainter);
+
+        // Root's content box (after its own 10px padding): x in [10, 190], y in [10, 90].
+        // Positioned via top/right against THAT box, not `middle`'s (which
+        // would additionally subtract its own 20px padding).
+        assert_eq!(ui.get(absolute).computed, Rect::new(190.0 - 5.0 - 30.0, 10.0 + 5.0, 30.0, 10.0));
     }
 
     #[test]

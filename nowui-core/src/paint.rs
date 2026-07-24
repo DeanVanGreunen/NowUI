@@ -21,6 +21,9 @@ pub fn paint(ui: &Ui, painter: &mut dyn Painter) {
     for id in popups {
         paint_dropdown_popup(ui, id, painter);
         paint_menu_popup(ui, id, painter);
+        paint_date_popup(ui, id, painter);
+        paint_time_popup(ui, id, painter);
+        paint_datetime_popup(ui, id, painter);
     }
 }
 
@@ -206,6 +209,17 @@ fn paint_node(ui: &Ui, id: NodeId, painter: &mut dyn Painter, popups: &mut Vec<N
         NodeKind::MenuItem { label } => {
             painter.draw_text(label, content_rect, &text_style);
         }
+        NodeKind::Date { value, placeholder, open, .. }
+        | NodeKind::Time { value, placeholder, open, .. }
+        | NodeKind::DateTime { value, placeholder, open, .. } => {
+            paint_picker_box(painter, content_rect, style, value, placeholder);
+            // Deferred: see `paint_date_popup`/`paint_time_popup`/
+            // `paint_datetime_popup` — floats on top of everything once the
+            // whole tree has painted, same as `Dropdown`'s popup.
+            if *open {
+                popups.push(id);
+            }
+        }
         NodeKind::Container => {}
     }
 
@@ -331,7 +345,163 @@ fn paint_menu_popup(ui: &Ui, id: NodeId, painter: &mut dyn Painter) {
     for nested in nested_popups {
         paint_dropdown_popup(ui, nested, painter);
         paint_menu_popup(ui, nested, painter);
+        paint_date_popup(ui, nested, painter);
+        paint_time_popup(ui, nested, painter);
+        paint_datetime_popup(ui, nested, painter);
     }
+}
+
+/// Draws a `Date`/`Time`/`DateTime`'s closed box: a bordered rect holding
+/// `value` (or `placeholder` while empty) plus a small icon glyph — the same
+/// shape as `Dropdown`'s own box (see `paint_node`'s `Dropdown` arm), just
+/// without an options-list caret since there's no fixed option set here.
+fn paint_picker_box(painter: &mut dyn Painter, content_rect: Rect, style: &crate::style::Style, value: &str, placeholder: &str) {
+    let (box_h, _) = crate::style::dropdown_metrics(style.font_size);
+    let box_border = style.border_color.unwrap_or(Color::rgb(209, 213, 219));
+
+    let mut box_rect = content_rect;
+    box_rect.h = box_h;
+    painter.stroke_rect(box_rect, box_border, 1.0, style.radius);
+
+    let label = if value.is_empty() { placeholder } else { value };
+    let label_style = TextStyle {
+        color: style.text_color,
+        size: style.font_size,
+        align: TextAlign::Left,
+        weight: style.font_weight,
+        letter_spacing: style.letter_spacing,
+    };
+    let mut label_rect = box_rect.inset(Edges::all(8.0));
+    label_rect.w -= 14.0; // leave room for the icon glyph
+    painter.draw_text(label, label_rect, &label_style);
+
+    // Icon glyph: a small filled square (no path primitive for a real
+    // calendar/clock icon — same crude-box convention as Dropdown's caret).
+    let icon_size = (style.font_size * 0.4).max(4.0);
+    let icon = Rect::new(box_rect.x + box_rect.w - icon_size - 8.0, box_rect.y + (box_rect.h - icon_size) / 2.0, icon_size, icon_size);
+    painter.fill_rect(icon, style.text_color, Edges::default());
+}
+
+const MONTH_NAMES: [&str; 12] =
+    ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const WEEKDAY_LABELS: [&str; 7] = ["Su", "Mo", "Tu", "We", "Th", "Fr", "Sa"];
+
+/// Draws a calendar popup's nav header, weekday-label row, and day grid —
+/// shared by `paint_date_popup` and `paint_datetime_popup`. `selected`
+/// highlights one day cell if it falls within the currently-browsed
+/// `year`/`month`.
+fn paint_calendar(
+    painter: &mut dyn Painter,
+    style: &crate::style::Style,
+    layout: &crate::datetime::CalendarLayout,
+    year: i32,
+    month: u32,
+    selected: Option<(i32, u32, u32)>,
+) {
+    let bg = style.bg.unwrap_or(Color::WHITE);
+    let border = style.border_color.unwrap_or(Color::rgb(209, 213, 219));
+    painter.fill_rect(layout.popup_rect, bg, style.radius);
+    painter.stroke_rect(layout.popup_rect, border, 1.0, style.radius);
+
+    let centered = TextStyle {
+        color: style.text_color,
+        size: style.font_size,
+        align: TextAlign::Center,
+        weight: style.font_weight,
+        letter_spacing: style.letter_spacing,
+    };
+
+    painter.draw_text("<", layout.prev_rect, &centered);
+    painter.draw_text(">", layout.next_rect, &centered);
+    let header_rect = Rect::new(
+        layout.prev_rect.x + layout.prev_rect.w,
+        layout.popup_rect.y,
+        layout.popup_rect.w - layout.prev_rect.w - layout.next_rect.w,
+        layout.prev_rect.h,
+    );
+    painter.draw_text(&format!("{} {year}", MONTH_NAMES[(month - 1) as usize]), header_rect, &centered);
+
+    let (header_h, cell_h) = crate::datetime::calendar_metrics(style.font_size);
+    let cell_w = layout.popup_rect.w / 7.0;
+    let weekday_row_y = layout.popup_rect.y + header_h;
+    for (i, label) in WEEKDAY_LABELS.iter().enumerate() {
+        let rect = Rect::new(layout.popup_rect.x + i as f32 * cell_w, weekday_row_y, cell_w, cell_h);
+        painter.draw_text(label, rect, &centered);
+    }
+
+    for (rect, day) in &layout.day_cells {
+        let Some(day) = day else { continue };
+        if selected == Some((year, month, *day)) {
+            painter.fill_rect(*rect, Color::rgb(219, 234, 254), Edges::default());
+        }
+        painter.draw_text(&day.to_string(), *rect, &centered);
+    }
+}
+
+/// Draws a spinner-style clock popup: one `+`/value/`-` column per unit (2
+/// columns, or 3 with `with-seconds`) — shared by `paint_time_popup` and
+/// `paint_datetime_popup`.
+fn paint_clock(painter: &mut dyn Painter, style: &crate::style::Style, layout: &crate::datetime::ClockLayout, h: u32, m: u32, s: u32) {
+    let bg = style.bg.unwrap_or(Color::WHITE);
+    let border = style.border_color.unwrap_or(Color::rgb(209, 213, 219));
+    painter.fill_rect(layout.popup_rect, bg, style.radius);
+    painter.stroke_rect(layout.popup_rect, border, 1.0, style.radius);
+
+    let centered = TextStyle {
+        color: style.text_color,
+        size: style.font_size,
+        align: TextAlign::Center,
+        weight: style.font_weight,
+        letter_spacing: style.letter_spacing,
+    };
+    let values = [h, m, s];
+    for (i, (up, val, down)) in layout.columns.iter().enumerate() {
+        painter.draw_text("+", *up, &centered);
+        painter.draw_text(&format!("{:02}", values[i]), *val, &centered);
+        painter.draw_text("-", *down, &centered);
+    }
+}
+
+/// Draws an open `Date`'s month-calendar popup below its box — called after
+/// the whole tree has painted (see `paint`), same floating convention as
+/// `paint_dropdown_popup`.
+fn paint_date_popup(ui: &Ui, id: NodeId, painter: &mut dyn Painter) {
+    let node = ui.get(id);
+    let style = &node.style;
+    let NodeKind::Date { value, view_year, view_month, .. } = &node.kind else { return };
+    let layout = crate::datetime::layout_calendar(node.computed, style.font_size, *view_year, *view_month);
+    let selected = crate::datetime::parse_date(value);
+    paint_calendar(painter, style, &layout, *view_year, *view_month, selected);
+}
+
+/// Draws an open `Time`'s spinner popup below its box.
+fn paint_time_popup(ui: &Ui, id: NodeId, painter: &mut dyn Painter) {
+    let node = ui.get(id);
+    let style = &node.style;
+    let NodeKind::Time { value, .. } = &node.kind else { return };
+    let (h, m, s) = crate::datetime::parse_time(value).unwrap_or_else(|| {
+        let (_, _, _, h, m, s) = crate::datetime::now();
+        (h, m, s)
+    });
+    let layout = crate::datetime::layout_clock(node.computed, style.font_size, style.with_seconds);
+    paint_clock(painter, style, &layout, h, m, s);
+}
+
+/// Draws an open `DateTime`'s combined calendar + spinner popup below its
+/// box (see `datetime::layout_datetime`).
+fn paint_datetime_popup(ui: &Ui, id: NodeId, painter: &mut dyn Painter) {
+    let node = ui.get(id);
+    let style = &node.style;
+    let NodeKind::DateTime { value, view_year, view_month, .. } = &node.kind else { return };
+    let layout = crate::datetime::layout_datetime(node.computed, style.font_size, style.with_seconds, *view_year, *view_month);
+    let (date_part, time_part) = crate::datetime::split_datetime(value);
+    let selected = crate::datetime::parse_date(date_part);
+    paint_calendar(painter, style, &layout.calendar, *view_year, *view_month, selected);
+    let (h, m, s) = crate::datetime::parse_time(time_part).unwrap_or_else(|| {
+        let (_, _, _, h, m, s) = crate::datetime::now();
+        (h, m, s)
+    });
+    paint_clock(painter, style, &layout.clock, h, m, s);
 }
 
 /// Width, in pixels, of the first `char_count` chars of `shown` — the shared

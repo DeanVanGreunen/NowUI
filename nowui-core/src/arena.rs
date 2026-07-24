@@ -29,6 +29,11 @@ pub const EVENT_BINDING_KEYS: &[&str] = &[
     "onClick",
     "onResize",
     "onLoad",
+    // `Date`/`Time`/`DateTime`: fires every time the popup picker changes
+    // the widget's value (a day cell click, or a spinner up/down click) —
+    // see `NodeKind::Date`/`Time`/`DateTime` and `nowui-runtime`'s
+    // `select_date_popup`/`select_time_popup`/`select_datetime_popup`.
+    "onSelect",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -71,12 +76,13 @@ pub enum NodeKind {
         label: String,
         checked: bool,
     },
-    /// A closed-box-plus-optional-open-list select control. Unlike a real
-    /// browser `<select>`, the open option list isn't a floating overlay —
-    /// there's no popup/layer-outside-ancestor-clips system in this engine
-    /// (see CLAUDE.md) — it occupies real layout space below the box,
-    /// pushing later siblings down, and is clipped like anything else if a
-    /// clipping ancestor is scrolled/too small.
+    /// A closed-box-plus-optional-open-list select control. The open option
+    /// list is a genuine floating popup — occupies no in-flow layout space,
+    /// isn't clipped by its container, and floats above everything else
+    /// (drawn after the whole tree, see `paint::paint_dropdown_popup`) —
+    /// not reachable through normal rect-based hit-testing, so
+    /// `nowui-runtime`'s click handler checks `find_open_dropdown_popup_at`
+    /// before falling back to the ordinary hit test.
     Dropdown {
         placeholder: String,
         options: Vec<String>,
@@ -115,6 +121,42 @@ pub enum NodeKind {
     /// string mechanism `Dropdown`'s options use.
     MenuItem {
         label: String,
+    },
+    /// A `DD/MM/YYYY` closed box + a floating month-calendar popup, same
+    /// "occupies no in-flow space, floats above everything, open" shape as
+    /// `Dropdown` (see `NodeKind::Dropdown`'s doc comment). `view_year`/
+    /// `view_month` are pure UI-navigation state (which month the popup is
+    /// currently browsing) — independent of `value`, which only ever
+    /// changes when a day cell is actually clicked. Re-synced to `value`'s
+    /// own month whenever the popup is opened (see `nowui-runtime`'s
+    /// `handle_click`), so reopening always starts on the picked date.
+    Date {
+        value: String,
+        placeholder: String,
+        open: bool,
+        view_year: i32,
+        view_month: u32,
+    },
+    /// An `HH:MM` (or `HH:MM:SS`, with the `with-seconds` style flag — see
+    /// `Style::with_seconds`) closed box + a floating spinner popup (one
+    /// up-arrow/value/down-arrow column per unit). Unlike `Date`/`Dropdown`,
+    /// picking a value never auto-closes the popup — dialing in a time
+    /// takes more than one click (see `nowui-runtime`'s `select_time_popup`).
+    Time {
+        value: String,
+        placeholder: String,
+        open: bool,
+    },
+    /// `Date` and `Time` combined into one popup (a calendar stacked above a
+    /// spinner) writing into one `"DD/MM/YYYY HH:MM[:SS]"` value — see
+    /// `datetime::join_datetime`/`split_datetime`. Like `Time`, never
+    /// auto-closes on a single pick.
+    DateTime {
+        value: String,
+        placeholder: String,
+        open: bool,
+        view_year: i32,
+        view_month: u32,
     },
 }
 

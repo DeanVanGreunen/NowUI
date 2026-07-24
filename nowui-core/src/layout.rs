@@ -26,7 +26,7 @@ pub fn solve(ui: &mut Ui, viewport: Size, painter: &mut dyn Painter) {
         measure(ui, root, painter, &mut sizes);
         // Root fills the viewport unless it has an explicit fixed size.
         let root_rect = Rect::new(0.0, 0.0, viewport.w, viewport.h);
-        arrange(ui, root, root_rect, &sizes);
+        arrange(ui, root, root_rect, &sizes, root_rect);
         // After the normal pass, so every `Menu`'s own `computed` rect
         // (which anchors its popup) is final.
         arrange_menu_popups(ui, root, &sizes);
@@ -57,7 +57,7 @@ fn arrange_menu_popups(ui: &mut Ui, id: NodeId, sizes: &HashMap<NodeId, Size>) {
             + style.border_width.bottom;
         let popup_rect = Rect::new(rect.x, rect.y + rect.h, rect.w, popup_h);
         let inner = popup_rect.inset(style.padding).inset(style.border_width);
-        arrange_flow(ui, &style, &children, inner, sizes, Point::default());
+        arrange_flow(ui, &style, &children, inner, sizes, Point::default(), inner);
         ui.get_mut(id).content_size = Size::new(popup_rect.w, popup_rect.h);
     }
     // Recurse regardless — a Menu can be nested inside another popup/widget,
@@ -130,6 +130,17 @@ fn measure(ui: &mut Ui, id: NodeId, painter: &mut dyn Painter, sizes: &mut HashM
             let m = painter.measure_text(label, style.font_size);
             Size::new(m.x, m.y)
         }
+        // `Date`/`Time`/`DateTime`: same "closed box only, the popup never
+        // contributes to intrinsic size" convention as `Dropdown` above —
+        // the calendar/spinner popup is floating, out-of-flow content.
+        crate::arena::NodeKind::Date { value, placeholder, .. }
+        | crate::arena::NodeKind::Time { value, placeholder, .. }
+        | crate::arena::NodeKind::DateTime { value, placeholder, .. } => {
+            let (box_h, _) = crate::style::dropdown_metrics(style.font_size);
+            let label = if value.is_empty() { placeholder } else { value };
+            let m = painter.measure_text(label, style.font_size);
+            Size::new(m.x + 24.0, box_h)
+        }
         crate::arena::NodeKind::Container => Size::default(),
     };
 
@@ -195,7 +206,7 @@ fn measure(ui: &mut Ui, id: NodeId, painter: &mut dyn Painter, sizes: &mut HashM
 }
 
 /// Pass 2: give `id` a concrete rect and place its children within it.
-fn arrange(ui: &mut Ui, id: NodeId, rect: Rect, sizes: &HashMap<NodeId, Size>) {
+fn arrange(ui: &mut Ui, id: NodeId, rect: Rect, sizes: &HashMap<NodeId, Size>, containing_block: Rect) {
     ui.get_mut(id).computed = rect;
 
     let style = ui.get(id).style.clone();
@@ -214,10 +225,21 @@ fn arrange(ui: &mut Ui, id: NodeId, rect: Rect, sizes: &HashMap<NodeId, Size>) {
 
     let inner = rect.inset(style.padding).inset(style.border_width);
 
+    // A `position-relative`/`position-absolute` node establishes a new
+    // containing block for its own descendants (matching real CSS); anything
+    // else just passes its own containing block straight through, so an
+    // absolutely-positioned node several levels down still resolves against
+    // the *nearest* positioned ancestor, not merely its direct parent.
+    let child_containing_block = if matches!(style.position, Position::Relative | Position::Absolute) {
+        inner
+    } else {
+        containing_block
+    };
+
     // Absolutely-positioned children are out of flow: skipped by the normal
-    // arrangement pass entirely, then positioned separately against `inner`
-    // (this node's content box — see `Position::Absolute`'s docs for the
-    // "always the direct parent" simplification).
+    // arrangement pass entirely, then positioned separately against
+    // `child_containing_block` (the nearest positioned ancestor's content
+    // box — see `Position::Absolute`'s docs).
     let mut in_flow = Vec::with_capacity(children.len());
     let mut out_of_flow = Vec::new();
     for &c in &children {
@@ -230,21 +252,24 @@ fn arrange(ui: &mut Ui, id: NodeId, rect: Rect, sizes: &HashMap<NodeId, Size>) {
 
     let scroll_offset = ui.get(id).scroll_offset;
     let content_size = if style.display == Display::Grid {
-        arrange_grid(ui, &style, &in_flow, inner, sizes, scroll_offset)
+        arrange_grid(ui, &style, &in_flow, inner, sizes, scroll_offset, child_containing_block)
     } else {
-        arrange_flow(ui, &style, &in_flow, inner, sizes, scroll_offset)
+        arrange_flow(ui, &style, &in_flow, inner, sizes, scroll_offset, child_containing_block)
     };
     ui.get_mut(id).content_size = content_size;
 
     for c in out_of_flow {
-        arrange_absolute(ui, c, inner, sizes);
+        arrange_absolute(ui, c, child_containing_block, sizes);
     }
 }
 
-/// Position an out-of-flow child against `containing_block` (its direct
-/// parent's content box) via `left`/`top`/`right`/`bottom`. If both opposing
-/// offsets are set and the corresponding axis is `Hug`, they define the
-/// extent directly (matching plain CSS `left`+`right` with `width: auto`).
+/// Position an out-of-flow child against `containing_block` (the content box
+/// of its nearest `position-relative`/`position-absolute` ancestor, walking
+/// up past any number of plain in-flow ancestors — falling back to the
+/// layer's root if none is positioned, same as CSS's initial containing
+/// block) via `left`/`top`/`right`/`bottom`. If both opposing offsets are set
+/// and the corresponding axis is `Hug`, they define the extent directly
+/// (matching plain CSS `left`+`right` with `width: auto`).
 fn arrange_absolute(ui: &mut Ui, id: NodeId, containing_block: Rect, sizes: &HashMap<NodeId, Size>) {
     let style = ui.get(id).style.clone();
     let natural = sizes.get(&id).copied().unwrap_or_default();
@@ -268,7 +293,7 @@ fn arrange_absolute(ui: &mut Ui, id: NodeId, containing_block: Rect, sizes: &Has
         (None, None, sizing) => (containing_block.y, resolve_absolute_extent(sizing, natural.h, containing_block.h)),
     };
 
-    arrange(ui, id, Rect::new(x, y, w, h), sizes);
+    arrange(ui, id, Rect::new(x, y, w, h), sizes, containing_block);
 }
 
 fn resolve_absolute_extent(sizing: Sizing, natural: f32, containing: f32) -> f32 {
@@ -287,6 +312,7 @@ fn arrange_flow(
     inner: Rect,
     sizes: &HashMap<NodeId, Size>,
     scroll_offset: Point,
+    containing_block: Rect,
 ) -> Size {
     let gap = style.gap;
     let is_row = axis_is_row(style.direction);
@@ -406,7 +432,7 @@ fn arrange_flow(
             child_rect.y -= scroll_offset.y;
         }
 
-        arrange(ui, c, child_rect, sizes);
+        arrange(ui, c, child_rect, sizes, containing_block);
         cursor += main_extent + gap;
     }
 
@@ -599,6 +625,7 @@ fn arrange_grid(
     inner: Rect,
     sizes: &HashMap<NodeId, Size>,
     scroll_offset: Point,
+    containing_block: Rect,
 ) -> Size {
     let (cols, rows, cells) = grid_tracks_and_cells(ui, style, children);
     let ncols = cols.len();
@@ -646,7 +673,7 @@ fn arrange_grid(
         if style.scroll_y {
             child_rect.y -= scroll_offset.y;
         }
-        arrange(ui, c, child_rect, sizes);
+        arrange(ui, c, child_rect, sizes, containing_block);
     }
 
     Size::new(

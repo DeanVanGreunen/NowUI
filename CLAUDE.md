@@ -249,10 +249,11 @@ Slider {value: state.volume}
 ```
 
 Any widget can carry a `{value: state.path}` binding (read by `Text`/`Checkbox`/`Dropdown`/
-`Slider`/`ProgressBar`/`TextInput`) plus any of the event keys: `onClick`, `onMouseMove`,
-`onMouseDown`, `onMouseUp`, `onKeyPress`, `onKeyDown`, `onKeyUp`, `onResize`. Bindings are rooted
-at the literal `state` segment (`state.counter.increment`) — stripped before crossing into the
-Rust-side `NowUiState` reflection boundary.
+`Slider`/`ProgressBar`/`TextInput`/`Date`/`Time`/`DateTime`) plus any of the event keys: `onClick`,
+`onMouseMove`, `onMouseDown`, `onMouseUp`, `onKeyPress`, `onKeyDown`, `onKeyUp`, `onResize`,
+`onSelect` (`Date`/`Time`/`DateTime` only — fires when their popup changes the value). Bindings
+are rooted at the literal `state` segment (`state.counter.increment`) — stripped before crossing
+into the Rust-side `NowUiState` reflection boundary.
 
 ### `if`/`else if`/`else` and `for` — dynamic regions
 
@@ -370,6 +371,37 @@ live. `text-color` is the track-fill/thumb color, `border-color` is the empty-tr
 ProgressBar w-full text-emerald-500 border-gray-200 {value: 82}
 ```
 
+**`Date`/`Time`/`DateTime`** — a `Dropdown`-shaped closed box (bordered, showing `value` or a
+placeholder while empty) plus a floating picker popup, opened/closed by clicking the box like
+`Dropdown`/`Checkbox`:
+
+```nowui
+Date `Choose a date` {value: state.birthday, onSelect: state.onBirthdayPicked}
+Time `Choose a time` with-seconds {value: state.alarm, onSelect: state.onAlarmPicked}
+DateTime `Choose both` with-seconds {value: state.meeting, onSelect: state.onMeetingPicked}
+```
+
+- Value formats: `Date` is `DD/MM/YYYY`; `Time` is `HH:MM`, or `HH:MM:SS` with the `with-seconds`
+  bare style flag; `DateTime` is the two joined by one space (`DD/MM/YYYY HH:MM[:SS]`). All
+  parsing/formatting lives in `nowui-core`'s `datetime` module — no external date/time crate
+  (`datetime::now()` reads the system clock as **UTC**, not the OS's local timezone; no timezone
+  database is linked in, matching the "don't half-implement it" convention below).
+- `onSelect` (a new `EVENT_BINDING_KEYS` entry) fires every time the popup actually changes the
+  value — once per day-cell click for `Date`, once per spinner arrow click for `Time`/`DateTime`.
+- `Date`'s popup is a month-grid calendar (fixed 6x7 cells, `<`/`>` nav arrows to browse other
+  months) rendered on the system clock's current month at first open, and re-synced to the bound
+  value's own month every time it's reopened. Picking a day is **terminal** — like `Dropdown`
+  selecting an option, it writes the value, dispatches `onSelect`, and closes the popup.
+- `Time`'s popup is a compact spinner: one `+`/value/`-` column per unit (hour/minute, plus
+  seconds with `with-seconds`) — a click steps that unit by one, wrapping at its bound. Unlike
+  `Date`, a pick **never** auto-closes the popup, since dialing in a time takes more than one click.
+- `DateTime`'s popup stacks a calendar directly above a spinner in one floating popup. Clicking
+  either half updates only that half of the combined value (via `datetime::split_datetime`/
+  `join_datetime`) and, like `Time`, never auto-closes the popup on its own — only clicking the
+  box again, or clicking elsewhere, closes it.
+- All three are styled the same way as `Dropdown`'s box (`border-color`/`rounded`/`radius`,
+  `bg`/`text-color` on both the box and the popup panel).
+
 **`scroll-h`/`scroll-v`** — clips overflow along that axis, mouse wheel pans it:
 
 ```nowui
@@ -382,8 +414,10 @@ Container scroll-v h-[160px] w-full border rounded gap-1 p-2 {
 Thumb/track reuse `border-color` (falls back to neutral gray) at full/low alpha — no dedicated
 `scrollbar-*` class family.
 
-**`position-absolute`/`position-relative`** — containing block is always the *direct* parent's
-content box (one level only, not the nearest positioned ancestor like real CSS):
+**`position-absolute`/`position-relative`** — containing block is the *nearest*
+`position-relative`/`position-absolute` **ancestor**'s content box, same as real CSS: a plain,
+unpositioned container in between is skipped over, however many levels deep. A layer with no
+positioned ancestor at all falls back to its root's content box (CSS's initial containing block):
 
 ```nowui
 Container position-relative w-[hug] h-[hug] {
@@ -393,6 +427,13 @@ Container position-relative w-[hug] h-[hug] {
   }
 }
 ```
+
+Implementation: `layout::arrange` threads a `containing_block: Rect` parameter down through the
+whole recursive descent (`arrange` → `arrange_flow`/`arrange_grid` → `arrange`/`arrange_absolute`).
+A node whose own `style.position` is `Relative` or `Absolute` swaps in its own content box
+(`inner`) as the `containing_block` handed to its children; every other node just forwards the one
+it was given. `arrange_absolute` resolves `left`/`top`/`right`/`bottom` against whichever rect it's
+handed — it never has to know how many plain ancestors were skipped to reach it.
 
 An `Absolute` child escapes its direct parent's own paint clip too (so a badge pinned outside its
 box via a negative offset isn't cut off), while still respecting any *further* ancestor clip.

@@ -73,9 +73,9 @@ pub enum Position {
     Relative,
     /// Removed from normal flow entirely (doesn't consume space in its
     /// parent's sizing) and positioned via `left`/`top`/`right`/`bottom`
-    /// against its direct parent's content box. NowUI simplification: real
-    /// CSS resolves against the nearest *positioned* ancestor found by
-    /// walking up any number of levels; here it's always the direct parent.
+    /// against the content box of the nearest `Relative`/`Absolute`
+    /// ancestor — walking up past any number of plain ancestors, same as
+    /// real CSS (see `layout::arrange`'s `containing_block` threading).
     Absolute,
 }
 
@@ -209,6 +209,10 @@ pub struct Style {
     /// account for (explicit `\n` line breaks are caret/selection-aware;
     /// word-wrap-induced line breaks are visually correct but not).
     pub multiline: bool,
+    /// `with-seconds` bare flag: `Time`/`DateTime` include `:SS` in both their
+    /// displayed/parsed value string and their spinner popup's third column.
+    /// Ignored by every other widget kind, same convention as `multiline`.
+    pub with_seconds: bool,
     pub bg: Option<Color>,
     pub text_color: Color,
     pub text_align: TextAlign,
@@ -278,6 +282,7 @@ impl Default for Style {
             scroll_y: false,
             cursor: CursorIcon::default(),
             multiline: false,
+            with_seconds: false,
             bg: None,
             text_color: Color::BLACK,
             text_align: TextAlign::Left,
