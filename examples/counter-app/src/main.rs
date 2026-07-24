@@ -11,20 +11,21 @@ pub struct App {
 }
 
 impl App {
-  pub fn sign_in(&self, _event: &Event) {
+  pub fn sign_in(&self, _state: &mut App, _event: &Event) {
         println!("username: {}, password: {}", self.username, self.password);
     }
 }
 
 #[derive(Default, Clone, NowUiState)]
 #[nowui(methods(handle_me))]
+#[nowui(root(App))]
 pub struct Row {
     id:String,
     label:String,
 }
 
 impl Row {
-    pub fn handle_me(&mut self, _event:&Event){
+    pub fn handle_me(&mut self, _state: &mut App, _event:&Event){
     }
 }
 

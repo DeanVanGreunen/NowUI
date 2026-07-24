@@ -17,17 +17,18 @@ struct AppState {
 // derive macros never see it — so they're listed explicitly here.
 #[derive(Default, Clone, NowUiState)]
 #[nowui(methods(increment, decrement))]
+#[nowui(root(AppState))]
 struct Counter {
     count: i64,
 }
 
 impl Counter {
-    fn increment(&mut self, _event: &Event) {
-        self.count += 1;
+    fn increment(&mut self, app:&mut AppState, _event: &Event) {
+        app.counter.count += 1;
     }
 
-    fn decrement(&mut self, _event: &Event) {
-        self.count -= 1;
+    fn decrement(&mut self, app:&mut AppState, _event: &Event) {
+        app.counter.count -= 1;
     }
 }
 

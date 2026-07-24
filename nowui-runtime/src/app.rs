@@ -23,8 +23,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nowui_core::{
-    compute_effective, display_string, dropdown_metrics, AnimatableStyle, Color, Event, EventKind,
-    NodeId, NodeKind, NowUiState, Point, Rect, Size, StateValue, TemplatePart, Ui,
+    compute_effective, display_string, dropdown_metrics, AnimatableStyle, Color, CursorIcon, Event,
+    EventKind, NodeId, NodeKind, NowUiState, Point, Rect, Size, StateValue, TemplatePart, Ui,
 };
 use nowui_render::{present_to_softbuffer, SkiaPainter, TextContext};
 use nowui_render_gpu::{GpuFontCache, GpuPainter, GpuSurfaceState};
@@ -48,7 +48,7 @@ const CLEAR: Color = Color { r: 0x26, g: 0x80, b: 0xd4, a: 255 };
 /// unconditionally, whether or not anything actually changed.
 const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
 
-pub struct App<S: NowUiState> {
+pub struct App<S: NowUiState + 'static> {
     /// The OS window's title bar text — set once at `App::new` (from
     /// `run`/`run_path`'s `window_title` argument) and applied in `resumed`
     /// when the winit `Window` is actually created.
@@ -78,6 +78,11 @@ pub struct App<S: NowUiState> {
     text: TextContext,
     /// The node the cursor is currently over (`hover:` variant trigger).
     hovered: Option<NodeId>,
+    /// The OS cursor (visible?, icon) last actually set on the window —
+    /// compared against each `CursorMoved`'s freshly-resolved value so
+    /// `Window::set_cursor`/`set_cursor_visible` are only called on an actual
+    /// change, not once per mouse-move event.
+    current_cursor: (bool, winit::window::CursorIcon),
     /// The node the mouse button is currently held down on (`active:` trigger).
     pressed: Option<NodeId>,
     /// Set while a `Slider`'s thumb is being dragged — real, intrinsic
@@ -116,7 +121,7 @@ pub struct App<S: NowUiState> {
     next_frame: Instant,
 }
 
-impl<S: NowUiState> App<S> {
+impl<S: NowUiState + 'static> App<S> {
     pub fn new(title: String, ui: Ui, state: S, semantic: crate::semantic::Semantic, backend: Backend) -> Self {
         App {
             title,
@@ -130,6 +135,7 @@ impl<S: NowUiState> App<S> {
             cursor: Point::default(),
             text: TextContext::new(),
             hovered: None,
+            current_cursor: (true, winit::window::CursorIcon::default()),
             pressed: None,
             dragging_slider: None,
             dragging_text_input: None,
@@ -285,7 +291,16 @@ impl<S: NowUiState> App<S> {
         let cursor = self.cursor;
         let node = self.ui.get_mut(id);
         let mut event = Event { kind, cursor, key, node };
-        if self.state.call(&state_subpath(&path), &mut event) {
+        // SAFETY: `root` is a second, independently-constructed `&mut S`
+        // aliasing `self.state` — the same object `call` is about to be
+        // invoked on as its receiver — so a handler can reach sibling state
+        // through `root`/`state` even from a method declared on some nested
+        // field several delegation-hops down (see `NowUiState::call`'s doc
+        // comment for the full picture and the caveat this carries: don't
+        // write to the exact same field through both `self` and `root` in
+        // one handler).
+        let root_ptr: *mut S = &mut self.state;
+        if self.state.call(&state_subpath(&path), &mut event, unsafe { &mut *root_ptr }) {
             self.ui.dirty = true;
         }
     }
@@ -936,6 +951,22 @@ fn state_subpath(path: &[String]) -> Vec<&str> {
     path.iter().skip(skip).map(String::as_str).collect()
 }
 
+/// Map a resolved `cursor-*` style value to what actually has to be told to
+/// the OS window: `(visible, icon)` — `icon` is meaningless whenever
+/// `visible` is `false` (`cursor-none`), since the cursor isn't drawn at all.
+fn cursor_icon_for(icon: CursorIcon) -> (bool, winit::window::CursorIcon) {
+    match icon {
+        CursorIcon::Auto => (true, winit::window::CursorIcon::default()),
+        CursorIcon::Pointer => (true, winit::window::CursorIcon::Pointer),
+        // No single generic "resize" cursor exists in `winit`/`cursor-icon`;
+        // `AllResize` (an omnidirectional 4-way arrow) is the closest match
+        // to "this is resizable" without committing to one axis/direction.
+        CursorIcon::Resize => (true, winit::window::CursorIcon::AllResize),
+        CursorIcon::NotAllowed => (true, winit::window::CursorIcon::NotAllowed),
+        CursorIcon::Hidden => (false, winit::window::CursorIcon::default()),
+    }
+}
+
 /// Write `values` (one per original backtick, same order/count as
 /// `nowui-runtime/src/semantic.rs`'s `primitive()` built the node's string
 /// fields from) into whichever `NodeKind` fields came from those backticks.
@@ -987,7 +1018,7 @@ fn apply_resolved_templates(kind: &mut NodeKind, values: &[String]) {
     }
 }
 
-impl<S: NowUiState> ApplicationHandler for App<S> {
+impl<S: NowUiState + 'static> ApplicationHandler for App<S> {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attrs = Window::default_attributes()
             .with_title(self.title.clone())
@@ -1071,6 +1102,32 @@ impl<S: NowUiState> ApplicationHandler for App<S> {
                     self.hovered = hit;
                     self.ui.dirty = true;
                     self.request_redraw();
+                }
+
+                // `cursor-*` cascades like real CSS `cursor`: an `Auto`
+                // (unset) node defers to its nearest ancestor that actually
+                // declared one, rather than only ever looking at the single
+                // deepest hit node — otherwise `Button cursor-pointer { Text
+                // ... }` wouldn't show a hand while over the `Text` child,
+                // since `hit_test` returns that innermost leaf, not `Button`.
+                let resolved_icon = self
+                    .ui
+                    .hit_test_chain(self.cursor)
+                    .iter()
+                    .rev()
+                    .map(|&id| self.ui.get(id).style.cursor)
+                    .find(|c| *c != CursorIcon::Auto)
+                    .unwrap_or(CursorIcon::Auto);
+                let wanted = cursor_icon_for(resolved_icon);
+                if wanted != self.current_cursor {
+                    self.current_cursor = wanted;
+                    if let Some(window) = &self.window {
+                        let (visible, icon) = wanted;
+                        window.set_cursor_visible(visible);
+                        if visible {
+                            window.set_cursor(icon);
+                        }
+                    }
                 }
             }
 

@@ -83,6 +83,17 @@ pub fn derive_nowui_state(input: TokenStream) -> TokenStream {
         Err(e) => return e.to_compile_error().into(),
     };
 
+    // `#[nowui(root(App))]`: the concrete type `call`'s `root: &mut dyn Any`
+    // parameter actually points at, for a struct that's only ever reached by
+    // delegating one or more field-hops down from the real root state (see
+    // `NowUiState::call`'s doc comment) — defaults to `Self`, correct for a
+    // struct that *is* the root (the common case: nothing delegates into it).
+    let root_ty = match parse_root_attr(&input) {
+        Ok(Some(ty)) => ty,
+        Ok(None) => name.clone(),
+        Err(e) => return e.to_compile_error().into(),
+    };
+
     let mut get_arms = Vec::new();
     let mut set_arms = Vec::new();
     let mut call_arms = Vec::new();
@@ -125,7 +136,7 @@ pub fn derive_nowui_state(input: TokenStream) -> TokenStream {
                         match rest.split_first() {
                             Some((idx, rest)) => match idx.parse::<usize>() {
                                 Ok(idx) => match self.#ident.get_mut(idx) {
-                                    Some(item) => ::nowui_core::NowUiState::call(item, rest, event),
+                                    Some(item) => ::nowui_core::NowUiState::call(item, rest, event, root),
                                     None => false,
                                 },
                                 Err(_) => false,
@@ -208,7 +219,7 @@ pub fn derive_nowui_state(input: TokenStream) -> TokenStream {
                     Some((&#name_str, rest)) => ::nowui_core::NowUiState::set(&mut self.#ident, rest, value),
                 });
                 call_arms.push(quote! {
-                    Some((&#name_str, rest)) => ::nowui_core::NowUiState::call(&mut self.#ident, rest, event),
+                    Some((&#name_str, rest)) => ::nowui_core::NowUiState::call(&mut self.#ident, rest, event, root),
                 });
                 object_fields.push(quote! {
                     (#name_str.to_string(), ::nowui_core::NowUiState::to_state_value(&self.#ident))
@@ -221,7 +232,15 @@ pub fn derive_nowui_state(input: TokenStream) -> TokenStream {
         let name_str = m.to_string();
         quote! {
             Some((&#name_str, rest)) if rest.is_empty() => {
-                self.#m(event);
+                let root = root
+                    .downcast_mut::<#root_ty>()
+                    .expect(concat!(
+                        "nowui: `call`'s `root` argument wasn't a `",
+                        stringify!(#root_ty),
+                        "` — check this struct's `#[nowui(root(...))]` (or lack of one) \
+                         matches what `nowui-runtime` actually passes in",
+                    ));
+                self.#m(root, event);
                 true
             }
         }
@@ -255,7 +274,12 @@ pub fn derive_nowui_state(input: TokenStream) -> TokenStream {
                 }
             }
 
-            fn call(&mut self, path: &[&str], event: &mut ::nowui_core::Event<'_>) -> bool {
+            fn call(&mut self, path: &[&str], event: &mut ::nowui_core::Event<'_>, root: &mut dyn ::std::any::Any) -> bool {
+                // Silences an unused-variable warning on a struct with no
+                // `#[nowui(methods(...))]` and no nested/`Vec<T: NowUiState>`
+                // field — `root` never used, i.e. every arm below (if any)
+                // falls straight through to `_ => false`.
+                let _ = &root;
                 match path.split_first() {
                     #(#call_arms)*
                     _ => false,
@@ -341,8 +365,11 @@ fn parse_methods_attr(input: &DeriveInput) -> syn::Result<Vec<Ident>> {
                 syn::parenthesized!(content in meta.input);
                 let _: syn::LitStr = content.parse()?;
                 Ok(())
+            } else if meta.path.is_ident("root") {
+                // Handled by `parse_root_attr`; consume `(TypeName)` here too.
+                meta.parse_nested_meta(|_inner| Ok(()))
             } else {
-                Err(meta.error("unknown `nowui` attribute — expected `methods(...)` or `view(...)`"))
+                Err(meta.error("unknown `nowui` attribute — expected `methods(...)`, `view(...)`, or `root(...)`"))
             }
         })?;
     }
@@ -371,12 +398,49 @@ fn parse_view_attr(input: &DeriveInput) -> syn::Result<Option<syn::LitStr>> {
                 // Handled by `parse_methods_attr`; consume `(a, b, c)` here
                 // too so `parse_nested_meta` doesn't error on it.
                 meta.parse_nested_meta(|_inner| Ok(()))
+            } else if meta.path.is_ident("root") {
+                // Handled by `parse_root_attr`; consume `(TypeName)` here too.
+                meta.parse_nested_meta(|_inner| Ok(()))
             } else {
-                Err(meta.error("unknown `nowui` attribute — expected `methods(...)` or `view(...)`"))
+                Err(meta.error("unknown `nowui` attribute — expected `methods(...)`, `view(...)`, or `root(...)`"))
             }
         })?;
     }
     Ok(view)
+}
+
+/// Parse `#[nowui(root(App))]` into `Some(App)` — the concrete root state
+/// type that `call`'s `root: &mut dyn Any` parameter should be
+/// `downcast_mut`'d to before invoking any of this struct's own
+/// `#[nowui(methods(...))]`. No `root(...)` attribute at all is fine (`None`
+/// — the caller defaults to `Self`, correct for a struct that's never
+/// reached by delegating down from some other root).
+fn parse_root_attr(input: &DeriveInput) -> syn::Result<Option<Ident>> {
+    let mut root = None;
+    for attr in &input.attrs {
+        if !attr.path().is_ident("nowui") {
+            continue;
+        }
+        attr.parse_nested_meta(|meta| {
+            if meta.path.is_ident("root") {
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let ident: Ident = content.parse()?;
+                root = Some(ident);
+                Ok(())
+            } else if meta.path.is_ident("methods") {
+                meta.parse_nested_meta(|_inner| Ok(()))
+            } else if meta.path.is_ident("view") {
+                let content;
+                syn::parenthesized!(content in meta.input);
+                let _: syn::LitStr = content.parse()?;
+                Ok(())
+            } else {
+                Err(meta.error("unknown `nowui` attribute — expected `methods(...)`, `view(...)`, or `root(...)`"))
+            }
+        })?;
+    }
+    Ok(root)
 }
 
 /// Walk the whole `#`-import graph starting at `rel` (relative to this

@@ -18,16 +18,17 @@ struct AppState {
 
 #[derive(Default, Clone, NowUiState)]
 #[nowui(methods(increment, decrement))]
+#[nowui(root(AppState))]
 struct Counter {
     count: i64,
 }
 
 impl Counter {
-    fn increment(&mut self, _event: &mut Event) {
+    fn increment(&mut self, _state: &mut AppState, _event: &mut Event) {
         self.count += 1;
     }
 
-    fn decrement(&mut self, _event: &mut Event) {
+    fn decrement(&mut self, _state: &mut AppState, _event: &mut Event) {
         self.count -= 1;
     }
 }
@@ -36,14 +37,23 @@ fn click(node: &mut Node) -> Event<'_> {
     Event { kind: EventKind::Click, cursor: Point::default(), key: None, node }
 }
 
+/// `call`'s `root` parameter aliases `state` itself (see `NowUiState::call`'s
+/// doc comment on why that's the necessary, if not fully sound, shape) — this
+/// mirrors exactly what `nowui-runtime`'s `App::dispatch_event` does to
+/// construct it, just at test scope.
+fn call_with_self_as_root<S: NowUiState>(state: &mut S, path: &[&str], event: &mut Event) -> bool {
+    let root_ptr: *mut S = state;
+    state.call(path, event, unsafe { &mut *root_ptr })
+}
+
 #[test]
 fn call_delegates_through_a_nested_state_field() {
     let mut state = AppState::default();
     let mut node = Node::new(NodeKind::Container, Style::default());
 
-    assert!(state.call(&["counter", "increment"], &mut click(&mut node)));
-    assert!(state.call(&["counter", "increment"], &mut click(&mut node)));
-    assert!(state.call(&["counter", "decrement"], &mut click(&mut node)));
+    assert!(call_with_self_as_root(&mut state, &["counter", "increment"], &mut click(&mut node)));
+    assert!(call_with_self_as_root(&mut state, &["counter", "increment"], &mut click(&mut node)));
+    assert!(call_with_self_as_root(&mut state, &["counter", "decrement"], &mut click(&mut node)));
 
     assert_eq!(state.counter.count, 1);
 }
@@ -52,18 +62,19 @@ fn call_delegates_through_a_nested_state_field() {
 fn call_returns_false_for_an_unknown_path() {
     let mut state = AppState::default();
     let mut node = Node::new(NodeKind::Container, Style::default());
-    assert!(!state.call(&["counter", "nope"], &mut click(&mut node)));
-    assert!(!state.call(&["nope"], &mut click(&mut node)));
+    assert!(!call_with_self_as_root(&mut state, &["counter", "nope"], &mut click(&mut node)));
+    assert!(!call_with_self_as_root(&mut state, &["nope"], &mut click(&mut node)));
 }
 
 #[derive(Default, Clone, NowUiState)]
 #[nowui(methods(handle_me))]
+#[nowui(root(RowsState))]
 struct Row {
     label: String,
 }
 
 impl Row {
-    fn handle_me(&mut self, event: &mut Event) {
+    fn handle_me(&mut self, _state: &mut RowsState, event: &mut Event) {
         event.node.style.opacity = 0.0;
     }
 }
@@ -82,14 +93,14 @@ fn call_dispatches_into_a_vec_item_by_index() {
     let mut state = RowsState { rows: vec![Row::default(), Row::default()] };
     let mut node = Node::new(NodeKind::Container, Style::default());
 
-    assert!(state.call(&["rows", "1", "handle_me"], &mut click(&mut node)));
+    assert!(call_with_self_as_root(&mut state, &["rows", "1", "handle_me"], &mut click(&mut node)));
     assert_eq!(node.style.opacity, 0.0);
 
     // Out of range, or a scalar-index segment that isn't even a number —
     // both fail closed rather than panicking.
     let mut node2 = Node::new(NodeKind::Container, Style::default());
-    assert!(!state.call(&["rows", "5", "handle_me"], &mut click(&mut node2)));
-    assert!(!state.call(&["rows", "nope", "handle_me"], &mut click(&mut node2)));
+    assert!(!call_with_self_as_root(&mut state, &["rows", "5", "handle_me"], &mut click(&mut node2)));
+    assert!(!call_with_self_as_root(&mut state, &["rows", "nope", "handle_me"], &mut click(&mut node2)));
 }
 
 #[test]
@@ -102,7 +113,7 @@ fn handler_can_mutate_the_originating_node() {
         _unused: bool,
     }
     impl Hider {
-        fn hide(&mut self, event: &mut Event) {
+        fn hide(&mut self, _state: &mut Hider, event: &mut Event) {
             event.node.style.opacity = 0.0;
         }
     }
@@ -110,6 +121,6 @@ fn handler_can_mutate_the_originating_node() {
     let mut state = Hider::default();
     let mut node = Node::new(NodeKind::Container, Style::default());
     assert_ne!(node.style.opacity, 0.0);
-    assert!(state.call(&["hide"], &mut click(&mut node)));
+    assert!(call_with_self_as_root(&mut state, &["hide"], &mut click(&mut node)));
     assert_eq!(node.style.opacity, 0.0);
 }

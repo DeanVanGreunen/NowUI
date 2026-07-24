@@ -172,11 +172,37 @@ pub trait NowUiState {
     /// as a no-op, not a panic.
     fn set(&mut self, path: &[&str], value: StateValue) -> bool;
 
-    /// Invoke the zero-extra-argument handler method at `path` (e.g.
-    /// `["counter", "increment"]` for an `{onClick: state.counter.increment}`
-    /// binding), passing `event`. Returns `false` if no such method is
-    /// declared (see `#[nowui(methods(...))]` on the derive).
-    fn call(&mut self, path: &[&str], event: &mut Event<'_>) -> bool;
+    /// Invoke the handler method at `path` (e.g. `["counter", "increment"]`
+    /// for an `{onClick: state.counter.increment}` binding), passing it a
+    /// mutable reference to the *root* app state (`root`) alongside `event`.
+    /// Returns `false` if no such method is declared (see
+    /// `#[nowui(methods(...))]` on the derive).
+    ///
+    /// `root` is `&mut dyn Any` rather than a generic type parameter because
+    /// the handler methods `#[derive(NowUiState)]` generates arms for are
+    /// ordinary, concretely-typed functions (`fn on_click(&mut self, state:
+    /// &mut App, event: &mut Event)`) — the derive on a *nested* struct
+    /// (anything reached by delegating one or more field-hops down from the
+    /// actual root) has no visibility into what its ultimate root type is
+    /// (separate derive invocations share no information), so it has to be
+    /// told via `#[nowui(root(App))]`; the generated `call` arm then
+    /// `downcast_mut::<App>()`s this parameter right before invoking the
+    /// method. A struct never used in a nested position (the usual case —
+    /// the root state type itself) needs no `root(...)` attribute at all:
+    /// the default is `Self`, which is exactly correct for it.
+    ///
+    /// SAFETY / soundness note: `root` and `self` (or, one or more
+    /// delegation hops up, an ancestor `self` reached earlier in the same
+    /// call chain) alias the very same memory whenever the handler's own
+    /// struct sits somewhere inside the root's own field tree — which, by
+    /// construction, it always does. `nowui-runtime` constructs the initial
+    /// `root` via a raw-pointer reborrow of the same state it's about to
+    /// call `call` on (see `App::dispatch_event`), which is technically
+    /// unsound per Rust's aliasing model even though it holds up fine for
+    /// straightforward, non-overlapping field reads/writes in practice.
+    /// Avoid writing to the exact same field through both `self` and `root`
+    /// in one handler.
+    fn call(&mut self, path: &[&str], event: &mut Event<'_>, root: &mut dyn std::any::Any) -> bool;
 
     /// Snapshot `self` as a `StateValue::Object` (field name -> value, in
     /// declaration order). Used only when `Self` is a `Vec<T>` element type
@@ -258,7 +284,7 @@ impl NowUiState for NoState {
     fn set(&mut self, _path: &[&str], _value: StateValue) -> bool {
         false
     }
-    fn call(&mut self, _path: &[&str], _event: &mut Event<'_>) -> bool {
+    fn call(&mut self, _path: &[&str], _event: &mut Event<'_>, _root: &mut dyn std::any::Any) -> bool {
         false
     }
 }

@@ -79,6 +79,23 @@ pub enum Position {
     Absolute,
 }
 
+/// `cursor-pointer`/`cursor-resize`/`cursor-no` — the OS mouse cursor icon
+/// `nowui-runtime` sets while the pointer is over this node (see
+/// `App`'s `CursorMoved` handler). `Auto` means no override: leave whatever
+/// icon was already showing (the OS default arrow, unless a lower/underlying
+/// node set one — see that handler for exactly how overlap is resolved).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub enum CursorIcon {
+    #[default]
+    Auto,
+    Pointer,
+    Resize,
+    NotAllowed,
+    /// `cursor-none`: hide the OS cursor entirely while over this node
+    /// (distinct from `cursor-no`/`NotAllowed`, which still shows an icon).
+    Hidden,
+}
+
 /// One track of a `grid-template-columns`/`grid-template-rows` list.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum GridTrack {
@@ -184,6 +201,7 @@ pub struct Style {
     /// mouse wheel to pan it (see `nowui-runtime`'s wheel handler).
     pub scroll_x: bool,
     pub scroll_y: bool,
+    pub cursor: CursorIcon,
     /// `multi` bare flag: a `TextInput` wraps at its own box width and
     /// treats Enter as a literal `\n` instead of ignoring it, rather than
     /// the single-line, horizontally-scrolling default. See CLAUDE.md's
@@ -258,6 +276,7 @@ impl Default for Style {
             margin: Edges::default(),
             scroll_x: false,
             scroll_y: false,
+            cursor: CursorIcon::default(),
             multiline: false,
             bg: None,
             text_color: Color::BLACK,
@@ -385,6 +404,7 @@ fn overlay_touched_fields(working: &mut Style, unvaried: &Style, variant: &Style
         margin,
         scroll_x,
         scroll_y,
+        cursor,
         bg,
         text_color,
         text_align,

@@ -21,8 +21,8 @@ pub use nowui_macros::NowUiState;
 pub use painter::{Painter, TextStyle};
 pub use state::{display_string, Event, EventKind, NoState, NowUiState, StateValue};
 pub use style::{
-    compute_effective, dropdown_metrics, slider_metrics, Align, AnimatableStyle, Direction,
-    Display, GridTrack, Position, Sizing, Style, StyleVariants, TextAlign, Transform2D,
+    compute_effective, dropdown_metrics, slider_metrics, Align, AnimatableStyle, CursorIcon,
+    Direction, Display, GridTrack, Position, Sizing, Style, StyleVariants, TextAlign, Transform2D,
     Transition, DEFAULT_CONTROL_WIDTH,
 };
 pub use tailwind::Easing;

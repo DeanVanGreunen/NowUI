@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use nowui_core::{
-    tailwind, Align, Color, Direction, Display, Easing, Edges, GridTrack, Node as ArenaNode,
+    tailwind, Align, Color, CursorIcon, Direction, Display, Easing, Edges, GridTrack, Node as ArenaNode,
     NodeId, NodeKind, NowUiState, Position, Sizing, StateValue, Style, TextAlign, Transition, Ui, EVENT_BINDING_KEYS,
 };
 use nowui_syntax::ast::{BindValue, Expr, NamedArg, Node as AstNode, Param, StylePair, Template, TplPart};
@@ -530,6 +530,11 @@ pub(crate) fn apply_exact(s: &mut Style, key: &str, v: &str) -> bool {
         "position-static" => s.position = Position::Static,
         "position-relative" => s.position = Position::Relative,
         "position-absolute" => s.position = Position::Absolute,
+
+        "cursor-pointer" => s.cursor = CursorIcon::Pointer,
+        "cursor-resize" => s.cursor = CursorIcon::Resize,
+        "cursor-no" => s.cursor = CursorIcon::NotAllowed,
+        "cursor-none" => s.cursor = CursorIcon::Hidden,
         "left" => s.left = Some(parse_px(v)),
         "right" => s.right = Some(parse_px(v)),
         "top" => s.top = Some(parse_px(v)),
@@ -1351,7 +1356,7 @@ mod tests {
             fn set(&mut self, _path: &[&str], _value: nowui_core::StateValue) -> bool {
                 false
             }
-            fn call(&mut self, _path: &[&str], _event: &mut nowui_core::Event<'_>) -> bool {
+            fn call(&mut self, _path: &[&str], _event: &mut nowui_core::Event<'_>, _root: &mut dyn std::any::Any) -> bool {
                 false
             }
             fn to_state_value(&self) -> nowui_core::StateValue {
