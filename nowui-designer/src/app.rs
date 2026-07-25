@@ -7,14 +7,16 @@
 //! and detach all land in later stages without changing this shape much —
 //! just what gets rendered into which window.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nowui_core::Size;
+use nowui_core::{NodeKind, Point, Size};
 use nowui_render_gpu::{GpuFontCache, GpuPainter, GpuSurfaceState};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::keyboard::ModifiersState;
 use winit::window::{Window, WindowId};
 
 use crate::chrome::Chrome;
@@ -40,6 +42,8 @@ pub struct DesignerApp {
     text: nowui_text::TextContext,
     font_cache: GpuFontCache,
     next_frame: Instant,
+    cursor: Point,
+    modifiers: ModifiersState,
 }
 
 impl DesignerApp {
@@ -58,6 +62,39 @@ impl DesignerApp {
             text: nowui_text::TextContext::new(),
             font_cache: GpuFontCache::new(),
             next_frame: Instant::now(),
+            cursor: Point::default(),
+            modifiers: ModifiersState::empty(),
+        }
+    }
+
+    /// Re-renders the live preview from the editor's *current in-memory
+    /// buffer*, not disk — a `PreviewDoc::reload_with_overrides` override
+    /// keyed on the entry path, same mechanism an unsaved editor buffer is
+    /// designed for (see its own doc comment). Called after every keystroke
+    /// that actually changed the buffer (`editor::edit_text_input` reports
+    /// whether it did), so what's on screen always matches what's in the
+    /// editor, saved or not.
+    fn reload_from_editor_buffer(&mut self) {
+        let mut overrides = HashMap::new();
+        overrides.insert(self.doc.entry_path.clone(), self.chrome.editor_text().to_string());
+        if let Err(e) = self.doc.reload_with_overrides(&overrides) {
+            // A mid-edit syntax error is expected and common — not logged
+            // as an error, the same "leave the last good Ui in place"
+            // behavior `PreviewDoc::reload_with_overrides` already gives
+            // the caller for free.
+            let _ = e;
+        }
+    }
+
+    /// Saves the editor's current buffer to disk. The watcher then sees its
+    /// own write and would otherwise immediately "reload from disk" right
+    /// back over whatever's already showing — harmless (same content) but
+    /// wasteful; not specifically suppressed here since a stray extra
+    /// reload of identical content isn't a correctness issue, only a minor
+    /// inefficiency.
+    fn save_editor_buffer(&mut self) {
+        if let Err(e) = std::fs::write(&self.doc.entry_path, self.chrome.editor_text()) {
+            eprintln!("nowui-designer: failed to save `{}`: {e}", self.doc.entry_path.display());
         }
     }
 
@@ -150,6 +187,55 @@ impl ApplicationHandler for DesignerApp {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::RedrawRequested => self.redraw(),
+            WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor = Point::new(position.x as f32, position.y as f32);
+                self.chrome.ui.cursor = self.cursor;
+            }
+            WindowEvent::MouseInput { state: ElementState::Pressed, button: MouseButton::Left, .. } => {
+                // Click-to-position isn't wired up yet (see `editor.rs`'s
+                // own doc comment) — clicking the editor focuses it and
+                // puts the caret at the end; clicking anything else clears
+                // focus, so keystrokes don't land in the editor by
+                // accident once the user's attention has moved elsewhere.
+                let hit = self.chrome.ui.hit_test(self.cursor);
+                if hit == Some(self.chrome.editor_node) {
+                    self.chrome.ui.focus = Some(self.chrome.editor_node);
+                    if let NodeKind::TextInput { label, cursor, selection_anchor, .. } = &mut self.chrome.ui.get_mut(self.chrome.editor_node).kind {
+                        *cursor = nowui_core::text_input::char_len(label);
+                        *selection_anchor = None;
+                    }
+                } else {
+                    self.chrome.ui.focus = None;
+                }
+            }
+            WindowEvent::KeyboardInput { event: key_event, .. } => {
+                if key_event.state != ElementState::Pressed {
+                    return;
+                }
+                // Ctrl+S saves regardless of focus (a global shortcut, same
+                // convention most editors use) — everything else only
+                // applies to the editor while it's actually focused.
+                let ctrl = self.modifiers.control_key();
+                if ctrl && matches!(&key_event.logical_key, winit::keyboard::Key::Character(c) if c.eq_ignore_ascii_case("s")) {
+                    self.save_editor_buffer();
+                    return;
+                }
+                if self.chrome.ui.focus != Some(self.chrome.editor_node) {
+                    return;
+                }
+                let shift = self.modifiers.shift_key();
+                let changed = crate::editor::edit_text_input(
+                    &mut self.chrome.ui,
+                    self.chrome.editor_node,
+                    &key_event.logical_key,
+                    key_event.text.as_deref(),
+                    shift,
+                );
+                if changed {
+                    self.reload_from_editor_buffer();
+                }
+            }
             _ => {}
         }
     }

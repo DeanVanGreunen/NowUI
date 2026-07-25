@@ -13,6 +13,7 @@
 
 mod app;
 mod chrome;
+mod editor;
 mod preview;
 mod state;
 mod virtual_fs;
@@ -66,13 +67,17 @@ fn main() -> ExitCode {
     };
     let state = DesignerState { tree };
 
-    let chrome = match chrome::Chrome::load(&state) {
+    let mut chrome = match chrome::Chrome::load(&state) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("nowui-designer: failed to load the designer's own chrome: {e}");
             return ExitCode::FAILURE;
         }
     };
+    match std::fs::read_to_string(&entry_path) {
+        Ok(src) => chrome.set_editor_text(&src),
+        Err(e) => eprintln!("nowui-designer: could not read `{}` into the editor: {e}", entry_path.display()),
+    }
 
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);

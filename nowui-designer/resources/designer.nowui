@@ -3,12 +3,15 @@
 // `RenderVfsNode` layout below — see nowui-runtime's `dynamic::
 // substitute_named_arg` for the engine fix that makes a loop variable
 // passed as a *named arg* into a self-referential layout resolve live
-// state, not just the literal loop-variable name), and one preview slot.
-// No tabs/editor/inspector yet (see nowui-designer/src/app.rs's own module
+// state, not just the literal loop-variable name), a raw-source editor
+// (see `editor.rs` — click-to-position isn't wired yet, clicking always
+// puts the caret at the end), and one preview slot. No tabs/syntax-
+// highlighting/inspector yet (see nowui-designer/src/app.rs's own module
 // doc for the build-order this is following). The preview slot is
-// recognized *structurally* right now (the root's own last child) rather
-// than via a dedicated marker — a documented simplification for this early
-// stage, not a permanent design; see `app.rs`'s `preview_slot_rect`.
+// recognized *structurally* right now (the root's own LAST child, and the
+// editor as the first `TextInput` found anywhere in the tree) rather than
+// via a dedicated marker — a documented simplification for this stage, not
+// a permanent design; see `chrome.rs`'s `preview_slot_rect`/`editor_node`.
 
 layout: RenderVfsNode(entry) {
   TreeViewItem `${entry.name}` {
@@ -22,6 +25,9 @@ layout: App w-[fill] h-[fill] row {
     TreeView text-white {
       for entry in state.tree { RenderVfsNode entry=entry }
     }
+  }
+  Container w-[fill] h-[fill] bg-white border {
+    TextInput `` `Open a .nowui file to start editing` multi w-[fill] h-[fill] p-[10px]
   }
   Container w-[fill] h-[fill] bg-gray-200 {
   }

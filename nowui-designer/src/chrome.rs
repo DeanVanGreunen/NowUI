@@ -5,12 +5,16 @@
 //! `NowUiState`). Bound to `state::DesignerState` (currently just the
 //! scanned project tree, for the explorer's own recursive `TreeView`).
 
-use nowui_core::{NowUiState, Rect, Ui};
+use nowui_core::{NodeId, NodeKind, NowUiState, Rect, Ui};
 use nowui_runtime::semantic::Semantic;
 
 pub struct Chrome {
     pub ui: Ui,
     semantic: Semantic,
+    /// The raw-source `TextInput` — the first one found anywhere in the
+    /// built tree (see `resources/designer.nowui`'s own comment: a
+    /// documented simplification, not a dedicated marker).
+    pub editor_node: NodeId,
 }
 
 impl Chrome {
@@ -19,7 +23,32 @@ impl Chrome {
         let ast = nowui_syntax::parse(src).map_err(|errors| format!("designer.nowui failed to parse: {errors:?}"))?;
         let mut semantic = Semantic::new(&ast);
         let ui = semantic.build("App", state).ok_or_else(|| "designer.nowui has no `layout: App`".to_string())?;
-        Ok(Chrome { ui, semantic })
+        let editor_node = ui
+            .nodes
+            .iter()
+            .position(|n| matches!(n.kind, NodeKind::TextInput { .. }))
+            .map(|i| NodeId(i as u32))
+            .ok_or_else(|| "designer.nowui has no TextInput for the editor".to_string())?;
+        Ok(Chrome { ui, semantic, editor_node })
+    }
+
+    /// Overwrite the editor's own buffer — used once at startup to seed it
+    /// with the opened file's real content (`resources/designer.nowui`'s
+    /// own `TextInput` starts with an empty/placeholder value).
+    pub fn set_editor_text(&mut self, text: &str) {
+        if let NodeKind::TextInput { label, cursor, selection_anchor, .. } = &mut self.ui.get_mut(self.editor_node).kind {
+            *label = text.to_string();
+            *cursor = nowui_core::text_input::char_len(label);
+            *selection_anchor = None;
+        }
+    }
+
+    /// The editor's own current buffer content.
+    pub fn editor_text(&self) -> &str {
+        match &self.ui.get(self.editor_node).kind {
+            NodeKind::TextInput { label, .. } => label,
+            _ => "",
+        }
     }
 
     /// Re-expand any `if`/`for` region whose underlying state actually
@@ -71,6 +100,16 @@ mod tests {
         let slot = chrome.preview_slot_rect();
         assert!(slot.w > 0.0 && slot.h > 0.0, "the preview slot has a real, nonzero rect once the chrome is solved");
         assert!(slot.x > 0.0, "the slot sits to the right of the sidebar, not at the window's own left edge");
+    }
+
+    #[test]
+    fn set_editor_text_seeds_the_buffer_and_places_the_caret_at_the_end() {
+        let mut chrome = Chrome::load(&nowui_core::NoState).expect("resources/designer.nowui should load");
+        chrome.set_editor_text("layout: App { Text `hi` }");
+        assert_eq!(chrome.editor_text(), "layout: App { Text `hi` }");
+        let nowui_core::NodeKind::TextInput { cursor, selection_anchor, .. } = &chrome.ui.get(chrome.editor_node).kind else { panic!() };
+        assert_eq!(*cursor, "layout: App { Text `hi` }".chars().count());
+        assert!(selection_anchor.is_none());
     }
 
     #[test]
