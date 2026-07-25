@@ -85,14 +85,14 @@ pub enum NodeKind {
         /// it each edit from a tokenizer, via the same direct-node-mutation
         /// pattern `Event::node` already establishes elsewhere. Layout/
         /// measurement are unaffected (color doesn't change glyph metrics).
-        /// Only honored in **single-line** mode: `paint_text_input` draws
-        /// each contiguous same-color run as its own `draw_text` call
-        /// instead of one uniform `Style::text_color` run. Multiline mode
-        /// still renders in a uniform color — per-run coloring there would
-        /// need to run per *visual* (post-word-wrap) line, not the hard
-        /// line this field's ranges are naturally expressed against, and
-        /// hasn't been built; a known, documented limitation rather than a
-        /// silent gap.
+        /// `paint_text_input`/`paint_multiline_text_input` draw each
+        /// contiguous same-color run as its own `draw_text` call instead of
+        /// one uniform `Style::text_color` run. In multiline mode, runs are
+        /// resolved per **hard** line (split on `\n`), not per *visual*
+        /// (post-word-wrap) line — a hard line that itself word-wraps still
+        /// colors correctly as a whole, just without per-wrapped-visual-line
+        /// precision, the same simplification the caret/selection overlay
+        /// already accepts for the exact same reason.
         highlight_spans: Vec<(std::ops::Range<usize>, crate::geometry::Color)>,
     },
     Button {

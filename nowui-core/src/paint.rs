@@ -937,7 +937,7 @@ fn paint_text_input(
     painter.push_clip(content_rect);
 
     if style.multiline {
-        paint_multiline_text_input(painter, content_rect, text_style, style, &shown, cursor, selection_anchor, ime_preview, focused, scroll.y);
+        paint_multiline_text_input(painter, content_rect, text_style, style, &shown, cursor, selection_anchor, ime_preview, focused, scroll.y, highlight_spans);
         painter.pop_clip();
         return;
     }
@@ -1010,9 +1010,15 @@ fn paint_text_input(
 /// for the overall design and disclosed hard-line-only caret/selection
 /// limitation. Draws `shown` as a *single* `draw_text` call at
 /// `content_rect.w` (letting cosmic-text wrap it for real, both on `\n` and
-/// on overflow), then overlays selection/caret/underline positioned by
-/// hard-line count — never horizontally scrolled (wrapping replaces the
-/// need for it), only vertically, via `scroll_y`.
+/// on overflow) when `highlight_spans` is empty; otherwise draws it one
+/// **hard line** at a time so each line can carry its own color runs (see
+/// `draw_text_with_highlights`) — the same hard-line-not-visual-line
+/// simplification the caret/selection overlay below already accepts (a
+/// long line that itself word-wraps still renders correctly, just without
+/// per-wrapped-visual-line precision). Either way, selection/caret/
+/// underline overlay positioned by hard-line count — never horizontally
+/// scrolled (wrapping replaces the need for it), only vertically, via
+/// `scroll_y`.
 #[allow(clippy::too_many_arguments)]
 fn paint_multiline_text_input(
     painter: &mut dyn Painter,
@@ -1025,6 +1031,7 @@ fn paint_multiline_text_input(
     ime_preview: &str,
     focused: bool,
     scroll_y: f32,
+    highlight_spans: &[(std::ops::Range<usize>, Color)],
 ) {
     let line_h = crate::text_input::line_height(style.font_size);
     let lines = crate::text_input::hard_lines(shown);
@@ -1056,7 +1063,25 @@ fn paint_multiline_text_input(
         }
     }
 
-    painter.draw_text(shown, text_rect, text_style);
+    if !highlight_spans.is_empty() && ime_preview.is_empty() {
+        for (i, line) in lines.iter().enumerate() {
+            let line_start = crate::text_input::char_index_at(shown, i, 0);
+            let line_end = line_start + line.chars().count();
+            let local_spans: Vec<(std::ops::Range<usize>, Color)> = highlight_spans
+                .iter()
+                .filter(|(r, _)| r.start < line_end && r.end > line_start)
+                .map(|(r, c)| (r.start.max(line_start) - line_start..r.end.min(line_end) - line_start, *c))
+                .collect();
+            let line_rect = Rect { y: line_y(i), h: line_h, ..text_rect };
+            if local_spans.is_empty() {
+                painter.draw_text(line, line_rect, text_style);
+            } else {
+                draw_text_with_highlights(painter, line, line_rect, text_style, &local_spans);
+            }
+        }
+    } else {
+        painter.draw_text(shown, text_rect, text_style);
+    }
 
     if !focused {
         return;
@@ -1426,6 +1451,33 @@ mod tests {
 
         assert_eq!(painter.texts, vec!["line one\nline two".to_string()]);
         assert_eq!(painter.text_bounds[0].w, 200.0, "wraps at the box width, not the full text width");
+    }
+
+    #[test]
+    fn multiline_highlight_spans_draw_separate_colored_runs_per_hard_line() {
+        let mut ui = Ui::new();
+        let style = Style { multiline: true, ..Style::default() };
+        let mut kind = text_input_kind("ab\ncd", "", false);
+        let red = Color::rgb(255, 0, 0);
+        let blue = Color::rgb(0, 0, 255);
+        if let NodeKind::TextInput { highlight_spans, .. } = &mut kind {
+            // "ab\ncd" -> a=0 b=1 \n=2 c=3 d=4. Color 'a' red, 'd' blue —
+            // one span on the first hard line, one on the second.
+            *highlight_spans = vec![(0..1, red), (4..5, blue)];
+        }
+        let id = ui.push(Node::new(kind, style));
+        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 200.0, 60.0);
+        ui.add_layer(id, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        // First hard line ("ab") splits into "a" (red) then "b" (default);
+        // second hard line ("cd") splits into "c" (default) then "d" (blue).
+        assert_eq!(painter.texts, vec!["a".to_string(), "b".to_string(), "c".to_string(), "d".to_string()]);
+        assert_eq!(painter.text_colors[0], red);
+        assert_eq!(painter.text_colors[3], blue);
+        assert!(painter.text_bounds[2].y > painter.text_bounds[0].y, "the second hard line's runs sit below the first's");
     }
 
     #[test]

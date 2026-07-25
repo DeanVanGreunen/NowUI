@@ -233,6 +233,7 @@ impl ApplicationHandler for DesignerApp {
                     shift,
                 );
                 if changed {
+                    self.chrome.update_editor_highlighting();
                     self.reload_from_editor_buffer();
                 }
             }

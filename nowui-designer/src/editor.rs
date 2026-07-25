@@ -13,8 +13,38 @@
 //! a real, disclosed gap, not a silent one.
 
 use nowui_core::text_input::{char_len, delete_range, insert_str, move_left, move_right};
-use nowui_core::{NodeId, NodeKind, Ui};
+use nowui_core::{Color, NodeId, NodeKind, Ui};
 use winit::keyboard::{Key, NamedKey};
+
+/// `.nowui` syntax colors, one per `nowui_lsp::tokenizer` kind constant —
+/// a fixed, VS-Code-dark-theme-ish palette (this crate has no theme system
+/// of its own yet). Reused in-process (see this crate's own module doc,
+/// and `nowui-lsp`'s Cargo.toml comment, for why `nowui-lsp`'s tokenizer is
+/// called directly here instead of over real LSP/JSON-RPC).
+fn color_for_token_kind(kind: u32) -> Color {
+    match kind {
+        nowui_lsp::tokenizer::COMMENT => Color::rgb(0x6a, 0x99, 0x55),
+        nowui_lsp::tokenizer::KEYWORD => Color::rgb(0xc5, 0x86, 0xc0),
+        nowui_lsp::tokenizer::STRING => Color::rgb(0xce, 0x91, 0x78),
+        nowui_lsp::tokenizer::NUMBER => Color::rgb(0xb5, 0xce, 0xa8),
+        nowui_lsp::tokenizer::TYPE => Color::rgb(0x4e, 0xc9, 0xb0),
+        nowui_lsp::tokenizer::VARIABLE => Color::rgb(0x9c, 0xdc, 0xfe),
+        nowui_lsp::tokenizer::PROPERTY => Color::rgb(0x9c, 0xdc, 0xfe),
+        nowui_lsp::tokenizer::NAMESPACE => Color::rgb(0xd7, 0xba, 0x7d),
+        _ => Color::rgb(0xd4, 0xd4, 0xd4),
+    }
+}
+
+/// Tokenizes `source` and maps each token into a `highlight_spans` entry —
+/// `Token::start`/`len` are already **char** indices (see its own doc
+/// comment), the same convention `highlight_spans` uses, so no byte/char
+/// conversion is needed.
+pub fn compute_highlight_spans(source: &str) -> Vec<(std::ops::Range<usize>, Color)> {
+    nowui_lsp::tokenizer::tokenize(source)
+        .into_iter()
+        .map(|t| (t.start..t.start + t.len, color_for_token_kind(t.kind)))
+        .collect()
+}
 
 /// Applies one keyboard event to `id`'s `TextInput` state (`label`/`cursor`/
 /// `selection_anchor`). Returns `true` only when `label` itself actually
@@ -107,6 +137,26 @@ mod tests {
     fn label_of(ui: &Ui, id: NodeId) -> &str {
         let NodeKind::TextInput { label, .. } = &ui.get(id).kind else { panic!() };
         label
+    }
+
+    #[test]
+    fn compute_highlight_spans_colors_a_keyword_a_type_and_a_string_distinctly() {
+        let src = "layout: T { Text `hi` }";
+        let spans = compute_highlight_spans(src);
+
+        let layout_start = src.find("layout").unwrap();
+        let text_start = src.find("Text").unwrap();
+        let string_start = src.find('`').unwrap();
+
+        let color_at = |char_idx: usize| spans.iter().find(|(r, _)| r.contains(&char_idx)).map(|(_, c)| *c);
+
+        let keyword_color = color_at(layout_start).expect("`layout` should be tokenized");
+        let type_color = color_at(text_start).expect("`Text` should be tokenized");
+        let string_color = color_at(string_start + 1).expect("the backtick string body should be tokenized");
+
+        assert_ne!(keyword_color, type_color, "a keyword and a widget kind get different colors");
+        assert_ne!(keyword_color, string_color);
+        assert_ne!(type_color, string_color);
     }
 
     #[test]

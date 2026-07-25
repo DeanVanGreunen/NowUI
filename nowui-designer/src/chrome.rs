@@ -41,6 +41,20 @@ impl Chrome {
             *cursor = nowui_core::text_input::char_len(label);
             *selection_anchor = None;
         }
+        self.update_editor_highlighting();
+    }
+
+    /// Re-tokenizes the editor's own current buffer (`editor::
+    /// compute_highlight_spans`, the `nowui-lsp` tokenizer called
+    /// in-process) and writes the result into its `highlight_spans` —
+    /// called after every edit, same "cheap enough to redo whole" precedent
+    /// `nowui-lsp` itself already sets for full-document re-tokenization on
+    /// every keystroke.
+    pub fn update_editor_highlighting(&mut self) {
+        let spans = crate::editor::compute_highlight_spans(self.editor_text());
+        if let NodeKind::TextInput { highlight_spans, .. } = &mut self.ui.get_mut(self.editor_node).kind {
+            *highlight_spans = spans;
+        }
     }
 
     /// The editor's own current buffer content.
