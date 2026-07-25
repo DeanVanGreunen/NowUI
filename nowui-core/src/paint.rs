@@ -132,7 +132,7 @@ fn paint_node(ui: &Ui, id: NodeId, painter: &mut dyn Painter, popups: &mut Vec<N
         NodeKind::Button { label } => {
             painter.draw_text(label, content_rect, &text_style);
         }
-        NodeKind::TextInput { label, placeholder, masked, cursor, selection_anchor, ime_preview } => {
+        NodeKind::TextInput { label, placeholder, masked, cursor, selection_anchor, ime_preview, highlight_spans } => {
             paint_text_input(
                 painter,
                 content_rect,
@@ -146,6 +146,7 @@ fn paint_node(ui: &Ui, id: NodeId, painter: &mut dyn Painter, popups: &mut Vec<N
                 ime_preview,
                 ui.focus == Some(id),
                 node.scroll_offset,
+                highlight_spans,
             );
         }
         NodeKind::Checkbox { label, checked } => {
@@ -751,6 +752,47 @@ fn paint_datetime_popup(ui: &Ui, id: NodeId, painter: &mut dyn Painter) {
 /// Width, in pixels, of the first `char_count` chars of `shown` — the shared
 /// building block for placing the caret and the selection highlight, both of
 /// which just need "how wide is the text up to here."
+/// Draws `shown` as a sequence of `draw_text` calls, one per contiguous
+/// same-color run derived from `highlight_spans` — any char index not
+/// covered by a span falls back to `base_style.color`. Single-line only (see
+/// `NodeKind::TextInput::highlight_spans`'s doc comment): each run is
+/// positioned by its own measured prefix width, same technique
+/// `char_prefix_width` already uses for the caret/selection overlay, so runs
+/// sit flush against each other with no gap/overlap.
+fn draw_text_with_highlights(
+    painter: &mut dyn Painter,
+    shown: &str,
+    text_rect: Rect,
+    base_style: &TextStyle,
+    highlight_spans: &[(std::ops::Range<usize>, Color)],
+) {
+    let char_count = shown.chars().count();
+    let color_at = |i: usize| -> Color {
+        highlight_spans.iter().find(|(r, _)| r.contains(&i)).map(|(_, c)| *c).unwrap_or(base_style.color)
+    };
+
+    let mut run_start = 0usize;
+    let mut run_color = if char_count > 0 { color_at(0) } else { base_style.color };
+    for i in 1..=char_count {
+        let next_color = if i < char_count { color_at(i) } else { run_color };
+        if next_color != run_color || i == char_count {
+            let run_text: String = shown.chars().skip(run_start).take(i - run_start).collect();
+            let x = text_rect.x + char_prefix_width(painter, shown, run_start, base_style.size);
+            let run_rect = Rect { x, ..text_rect };
+            let run_style = TextStyle {
+                color: run_color,
+                size: base_style.size,
+                align: base_style.align,
+                weight: base_style.weight,
+                letter_spacing: base_style.letter_spacing,
+            };
+            painter.draw_text(&run_text, run_rect, &run_style);
+            run_start = i;
+            run_color = next_color;
+        }
+    }
+}
+
 fn char_prefix_width(painter: &mut dyn Painter, shown: &str, char_count: usize, font_size: f32) -> f32 {
     if char_count == 0 {
         return 0.0;
@@ -793,6 +835,7 @@ fn char_prefix_width(painter: &mut dyn Painter, shown: &str, char_count: usize, 
 /// the caret/selection/underline correctly — `text-right`/`text-center` on a
 /// `TextInput` isn't accounted for here.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 fn paint_text_input(
     painter: &mut dyn Painter,
     content_rect: Rect,
@@ -806,6 +849,7 @@ fn paint_text_input(
     ime_preview: &str,
     focused: bool,
     scroll: Point,
+    highlight_spans: &[(std::ops::Range<usize>, Color)],
 ) {
     let shown = crate::text_input::display_string(label, cursor, ime_preview, masked);
 
@@ -862,7 +906,11 @@ fn paint_text_input(
         }
     }
 
-    painter.draw_text(&shown, text_rect, text_style);
+    if !highlight_spans.is_empty() && ime_preview.is_empty() {
+        draw_text_with_highlights(painter, &shown, text_rect, text_style, highlight_spans);
+    } else {
+        painter.draw_text(&shown, text_rect, text_style);
+    }
 
     if !focused {
         painter.pop_clip();
@@ -1028,6 +1076,7 @@ mod tests {
             cursor: label.chars().count(),
             selection_anchor: None,
             ime_preview: String::new(),
+            highlight_spans: Vec::new(),
         }
     }
 
@@ -1071,6 +1120,7 @@ mod tests {
         fills: Vec<(Rect, Color)>,
         texts: Vec<String>,
         text_bounds: Vec<Rect>,
+        text_colors: Vec<Color>,
         clips: Vec<Rect>,
     }
     impl Painter for FullRecordingPainter {
@@ -1078,9 +1128,10 @@ mod tests {
             self.fills.push((rect, color));
         }
         fn stroke_rect(&mut self, _: Rect, _: Color, _: f32, _: Edges) {}
-        fn draw_text(&mut self, text: &str, bounds: Rect, _: &TextStyle) {
+        fn draw_text(&mut self, text: &str, bounds: Rect, style: &TextStyle) {
             self.texts.push(text.to_string());
             self.text_bounds.push(bounds);
+            self.text_colors.push(style.color);
         }
         fn push_clip(&mut self, rect: Rect) {
             self.clips.push(rect);
@@ -1117,6 +1168,47 @@ mod tests {
         paint(&ui, &mut painter);
 
         assert_eq!(painter.fills.len(), 1, "exactly one fill: the caret (no selection, no IME)");
+    }
+
+    #[test]
+    fn highlight_spans_draw_separate_colored_runs_instead_of_one_uniform_call() {
+        let mut kind = text_input_kind("abcdef", "", false);
+        let red = Color::rgb(255, 0, 0);
+        let blue = Color::rgb(0, 0, 255);
+        if let NodeKind::TextInput { highlight_spans, .. } = &mut kind {
+            *highlight_spans = vec![(0..3, red), (3..6, blue)];
+        }
+        let mut ui = Ui::new();
+        let id = ui.push(Node::new(kind, Style::default()));
+        ui.add_layer(id, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.texts, vec!["abc", "def"], "one draw_text call per contiguous same-color run");
+        assert_eq!(painter.text_colors, vec![red, blue]);
+        assert!(
+            painter.text_bounds[1].x > painter.text_bounds[0].x,
+            "the second run must be positioned after the first, not overlapping it"
+        );
+    }
+
+    #[test]
+    fn highlight_spans_are_ignored_while_composing_an_ime_preview() {
+        let mut kind = text_input_kind("abc", "", false);
+        let red = Color::rgb(255, 0, 0);
+        if let NodeKind::TextInput { highlight_spans, ime_preview, .. } = &mut kind {
+            *highlight_spans = vec![(0..3, red)];
+            *ime_preview = "x".to_string();
+        }
+        let mut ui = Ui::new();
+        let id = ui.push(Node::new(kind, Style::default()));
+        ui.add_layer(id, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.texts.len(), 1, "a single uniform-color draw_text call, not split runs");
     }
 
     #[test]

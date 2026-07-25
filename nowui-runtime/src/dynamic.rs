@@ -198,13 +198,14 @@ pub fn make_resolver<'a>(
 /// path — nothing to rewrite onto).
 pub fn substitute_loop_var(node: &AstNode, var: &str, value: &StateValue, iter_path: &[String], index: usize) -> AstNode {
     match node {
-        AstNode::Widget { kind, args, string_args, styles, bindings, children } => AstNode::Widget {
+        AstNode::Widget { kind, args, string_args, styles, bindings, children, span } => AstNode::Widget {
             kind: kind.clone(),
             args: args.clone(),
             string_args: string_args.iter().map(|t| substitute_template(t, var, value)).collect(),
             styles: styles.clone(),
             bindings: bindings.iter().map(|b| substitute_binding(b, var, iter_path, index)).collect(),
             children: children.iter().map(|c| substitute_loop_var(c, var, value, iter_path, index)).collect(),
+            span: *span,
         },
         AstNode::If { branches, else_branch } => AstNode::If {
             branches: branches
@@ -242,7 +243,7 @@ fn substitute_binding(b: &Binding, var: &str, iter_path: &[String], index: usize
             let mut new_path = iter_path.to_vec();
             new_path.push(index.to_string());
             new_path.extend(rest.iter().cloned());
-            Binding { key: b.key.clone(), value: BindValue::Path(new_path) }
+            Binding { key: b.key.clone(), value: BindValue::Path(new_path), span: b.span }
         }
         _ => b.clone(),
     }

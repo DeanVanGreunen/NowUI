@@ -69,6 +69,24 @@ pub enum NodeKind {
         /// simplification — see CLAUDE.md); the caret always renders at the
         /// end of the preview while composing.
         ime_preview: String,
+        /// Per-token color overrides for syntax highlighting, as
+        /// `(char_range, color)` — index-aligned with `label`'s **chars**
+        /// (matching `cursor`/`selection_anchor`'s own char-not-byte
+        /// convention, see `text_input.rs`), not authored via `.nowui`
+        /// grammar. Empty by default (zero cost for every ordinary
+        /// `TextInput`); a code-editor consumer (nowui-designer) populates
+        /// it each edit from a tokenizer, via the same direct-node-mutation
+        /// pattern `Event::node` already establishes elsewhere. Layout/
+        /// measurement are unaffected (color doesn't change glyph metrics).
+        /// Only honored in **single-line** mode: `paint_text_input` draws
+        /// each contiguous same-color run as its own `draw_text` call
+        /// instead of one uniform `Style::text_color` run. Multiline mode
+        /// still renders in a uniform color — per-run coloring there would
+        /// need to run per *visual* (post-word-wrap) line, not the hard
+        /// line this field's ranges are naturally expressed against, and
+        /// hasn't been built; a known, documented limitation rather than a
+        /// silent gap.
+        highlight_spans: Vec<(std::ops::Range<usize>, crate::geometry::Color)>,
     },
     Button {
         label: String,

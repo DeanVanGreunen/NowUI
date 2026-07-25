@@ -6,6 +6,19 @@
 //! whose `kind` matches a definition name — it is expanded in the semantic
 //! pass (see nowui-runtime::semantic).
 
+/// A byte-offset range into the source text a node/token was parsed from.
+/// Additive editor-tooling metadata — nothing in the parser or grammar
+/// depends on it, and it carries no meaning across files (see `FileId` in
+/// nowui-runtime's loader for how spans are disambiguated across
+/// `#`-imports). `Default` yields `0..0`, used by any construction site that
+/// synthesizes a node with no real source (tests, loop-var substitution
+/// fallbacks) rather than a real parse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Span {
+    pub start: usize,
+    pub end: usize,
+}
+
 /// A top-level node. Either a reusable layout definition or a widget instance.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Node {
@@ -34,6 +47,10 @@ pub enum Node {
         styles: Vec<StylePair>,
         bindings: Vec<Binding>,
         children: Vec<Node>,
+        /// The whole widget's own byte range, `kind` through its last
+        /// trailing block. Used by editor tooling (click-to-select a
+        /// rendered node, then locate/patch its source) — see nowui-designer.
+        span: Span,
     },
     /// `if EXPR { ... } else if EXPR { ... } else { ... }` — `branches` is
     /// the `if` condition plus every `else if`, in source order; `else_branch`
@@ -107,6 +124,9 @@ pub struct StylePair {
     pub key: String,
     /// Empty string for bare flags like `grid`.
     pub value: String,
+    /// This token's own byte range — lets the inspector replace/remove just
+    /// this one `key-[value]` without touching the rest of the widget line.
+    pub span: Span,
 }
 
 /// A `key: value` entry inside a `{ ... }` bindings block.
@@ -114,6 +134,9 @@ pub struct StylePair {
 pub struct Binding {
     pub key: String,
     pub value: BindValue,
+    /// This binding's own byte range (`key: value`), same purpose as
+    /// `StylePair::span`.
+    pub span: Span,
 }
 
 /// The value side of a binding or named arg.

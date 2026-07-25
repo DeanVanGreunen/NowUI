@@ -48,6 +48,13 @@ pub struct Semantic {
     /// here too (cheaper than checking at creation time) and simply no-op in
     /// `dispatch_event`.
     pending_on_load: Vec<NodeId>,
+    /// `NodeId -> source span` for every widget node expanded so far, within
+    /// *this* `Semantic`'s own single source file — populated in `expand()`
+    /// alongside `pending_on_load`. Editor tooling (nowui-designer) that
+    /// spans multiple `#`-imported files pairs this with its own per-file
+    /// `Semantic`/offset bookkeeping to disambiguate which file a span is
+    /// relative to; a single-file caller can use it directly.
+    pub node_spans: HashMap<NodeId, nowui_syntax::ast::Span>,
 }
 
 /// A live top-level dynamic region: the still-unexpanded AST it came from,
@@ -93,7 +100,7 @@ impl Semantic {
                 );
             }
         }
-        Semantic { defs, warnings: Vec::new(), regions: Vec::new(), pending_on_load: Vec::new() }
+        Semantic { defs, warnings: Vec::new(), regions: Vec::new(), pending_on_load: Vec::new(), node_spans: HashMap::new() }
     }
 
     /// Drain every node id created (by `expand`) since the last call to
@@ -279,7 +286,7 @@ impl Semantic {
             return None;
         }
 
-        let AstNode::Widget { kind, args, string_args, styles, bindings, children } = node else {
+        let AstNode::Widget { kind, args, string_args, styles, bindings, children, span } = node else {
             // A nested LayoutDef, or a bare If/For (handled by
             // `expand_children`, never reaches here) inside a body is
             // unusual; ignore for now.
@@ -299,6 +306,7 @@ impl Semantic {
             let container = ui.push(ArenaNode::new(NodeKind::Container, merged));
             apply_generic_bindings(ui, container, bindings, scope);
             self.pending_on_load.push(container);
+            self.node_spans.insert(container, *span);
             let kids = self.expand_children(ui, container, &def.children, &inner, state, depth + 1, true);
             ui.get_mut(container).children = kids;
             return Some(container);
@@ -310,6 +318,7 @@ impl Semantic {
         let id = ui.push(ArenaNode::new(arena_kind, style));
         apply_generic_bindings(ui, id, bindings, scope);
         self.pending_on_load.push(id);
+        self.node_spans.insert(id, *span);
 
         // Only worth storing (and re-rendering each frame) if at least one
         // backtick actually has a `${...}` in it — the common all-literal
@@ -349,6 +358,7 @@ impl Semantic {
                     cursor: 0,
                     selection_anchor: None,
                     ime_preview: String::new(),
+                    highlight_spans: Vec::new(),
                 })
             }
             "Dropdown" => Some(NodeKind::Dropdown {
@@ -425,7 +435,7 @@ impl Semantic {
         for p in pairs {
             match p.key.split_once(':') {
                 Some((variant, rest)) => {
-                    let stripped = StylePair { key: rest.to_string(), value: p.value.clone() };
+                    let stripped = StylePair { key: rest.to_string(), value: p.value.clone(), span: p.span };
                     match variant {
                         "hover" => hover_pairs.push(stripped),
                         "focus" => focus_pairs.push(stripped),
@@ -1154,6 +1164,31 @@ mod tests {
     }
 
     #[test]
+    fn node_spans_map_every_widget_to_its_own_source_range() {
+        let src = "layout: T { Container { Text `hi` } Button `Go` }";
+        let ast = nowui_syntax::parse(src).expect("should parse");
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).expect("entry layout");
+        let root = ui.get(ui.layers[0].root);
+        assert_eq!(root.children.len(), 2, "Container and Button");
+
+        let container_id = root.children[0];
+        let container_span = sem.node_spans.get(&container_id).expect("container has a recorded span");
+        let container_src = "Container { Text `hi` }";
+        let start = src.find(container_src).unwrap();
+        assert_eq!(&src[container_span.start..container_span.end], container_src);
+        assert_eq!(container_span.start, start);
+
+        let text_id = ui.get(container_id).children[0];
+        let text_span = sem.node_spans.get(&text_id).expect("nested Text has a recorded span");
+        assert_eq!(&src[text_span.start..text_span.end], "Text `hi`");
+
+        let button_id = root.children[1];
+        let button_span = sem.node_spans.get(&button_id).expect("button has a recorded span");
+        assert_eq!(&src[button_span.start..button_span.end], "Button `Go`");
+    }
+
+    #[test]
     fn resolves_compact_scale_classes() {
         let s = first_child_style(
             "layout: T { Card p-4 gap-2 bg-blue-500 text-white rounded-lg font-bold { Text `hi` } }",
@@ -1499,7 +1534,11 @@ mod tests {
         // `Binding` rather than through `nowui_syntax::parse`.
         let mut ui = Ui::new();
         let id = ui.push(ArenaNode::new(NodeKind::Container, Style::default()));
-        let bindings = vec![nowui_syntax::ast::Binding { key: "onLoadDelay".to_string(), value: BindValue::Number(-2.0) }];
+        let bindings = vec![nowui_syntax::ast::Binding {
+            key: "onLoadDelay".to_string(),
+            value: BindValue::Number(-2.0),
+            span: nowui_syntax::ast::Span::default(),
+        }];
         apply_generic_bindings(&mut ui, id, &bindings, &Scope::new());
         assert_eq!(ui.get(id).on_load_delay_secs, 0.0);
     }

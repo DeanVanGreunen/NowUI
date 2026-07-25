@@ -2406,6 +2406,7 @@ mod tests {
                 cursor: label.chars().count(),
                 selection_anchor: None,
                 ime_preview: String::new(),
+                highlight_spans: Vec::new(),
             },
             Style::default(),
         ));

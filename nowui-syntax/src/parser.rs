@@ -33,7 +33,78 @@ fn pad<T>(
 
 /// Parse a full file into its list of top-level layout definitions.
 pub fn parse(src: &str) -> Result<Vec<Node>, Vec<Simple<char>>> {
-    file_parser().parse(src)
+    let mut nodes = file_parser().parse(src)?;
+    for n in &mut nodes {
+        trim_trailing_ws_spans(n, src);
+    }
+    Ok(nodes)
+}
+
+/// `pad()` consumes its own trailing whitespace/comments as part of what a
+/// sub-parser "consumed" (see its own doc comment — it only pads *after*,
+/// via `padded_by`), so a `map_with_span` span computed over a combinator
+/// chain ending in a `pad(...)`-wrapped token (a widget's trailing
+/// `{bindings}`/child block close-brace, a style token, a binding) is wider
+/// than the token's own semantic content by however much trailing
+/// whitespace followed it. Trimmed back here as a post-pass over the parsed
+/// tree, rather than restructuring `pad`'s leading-vs-trailing convention
+/// everywhere it's used — editor tooling (spans exist for it, not the
+/// grammar) wants the tight boundary, not the grammar's own consumption.
+fn trim_trailing_ws_spans(node: &mut Node, src: &str) {
+    fn trim(span: &mut Span, src: &str) {
+        let mut end = span.end;
+        while end > span.start {
+            let Some(ch) = src[..end].chars().next_back() else { break };
+            if ch.is_whitespace() {
+                end -= ch.len_utf8();
+            } else {
+                break;
+            }
+        }
+        span.end = end;
+    }
+
+    match node {
+        Node::Widget { styles, bindings, children, span, .. } => {
+            trim(span, src);
+            for s in styles {
+                trim(&mut s.span, src);
+            }
+            for b in bindings {
+                trim(&mut b.span, src);
+            }
+            for c in children {
+                trim_trailing_ws_spans(c, src);
+            }
+        }
+        Node::LayoutDef { styles, bindings, children, .. } => {
+            for s in styles {
+                trim(&mut s.span, src);
+            }
+            for b in bindings {
+                trim(&mut b.span, src);
+            }
+            for c in children {
+                trim_trailing_ws_spans(c, src);
+            }
+        }
+        Node::If { branches, else_branch } => {
+            for (_, body) in branches {
+                for c in body {
+                    trim_trailing_ws_spans(c, src);
+                }
+            }
+            for c in else_branch {
+                trim_trailing_ws_spans(c, src);
+            }
+        }
+        Node::For { body, .. } => {
+            for c in body {
+                trim_trailing_ws_spans(c, src);
+            }
+        }
+        Node::Import { .. } => {}
+    }
 }
 
 fn file_parser() -> impl Parser<char, Vec<Node>, Error = Simple<char>> {
@@ -228,9 +299,10 @@ fn style() -> impl Parser<char, StylePair, Error = Simple<char>> + Clone {
         .or_not();
 
     key.then(value)
-        .map(|(key, value)| StylePair {
+        .map_with_span(|(key, value), span: std::ops::Range<usize>| StylePair {
             key,
             value: value.map(|v| v.trim().to_string()).unwrap_or_default(),
+            span: Span { start: span.start, end: span.end },
         })
         .padded()
 }
@@ -240,7 +312,11 @@ fn bindings() -> impl Parser<char, Vec<Binding>, Error = Simple<char>> + Clone {
     text::ident()
         .then_ignore(pad(just(':')))
         .then(bind_value())
-        .map(|(key, value)| Binding { key, value })
+        .map_with_span(|(key, value), span: std::ops::Range<usize>| Binding {
+            key,
+            value,
+            span: Span { start: span.start, end: span.end },
+        })
         .separated_by(pad(just(',')))
         .allow_trailing()
         .delimited_by(pad(just('{')), pad(just('}')))
@@ -290,13 +366,14 @@ fn node() -> impl Parser<char, Node, Error = Simple<char>> + Clone {
             .then(style().repeated())
             .then(bindings().or_not())
             .then(child_block.clone().or_not())
-            .map(|(((((kind, args), string_args), styles), bindings), children)| Node::Widget {
+            .map_with_span(|(((((kind, args), string_args), styles), bindings), children), span: std::ops::Range<usize>| Node::Widget {
                 kind,
                 args,
                 string_args,
                 styles,
                 bindings: bindings.unwrap_or_default(),
                 children: children.unwrap_or_default(),
+                span: Span { start: span.start, end: span.end },
             });
 
         let else_tail = pad(just("else")).ignore_then(choice((

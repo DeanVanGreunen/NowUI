@@ -244,6 +244,36 @@ mod tests {
     }
 
     #[test]
+    fn widget_span_covers_kind_through_trailing_block() {
+        let src = "layout: T { Button `Go` {onClick: state.signIn} }";
+        let ast = parse(src).expect("should parse");
+        let Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
+        let Node::Widget { span, .. } = &children[0] else { panic!() };
+        let widget_src = "Button `Go` {onClick: state.signIn}";
+        let start = src.find(widget_src).unwrap();
+        assert_eq!(span.start, start);
+        assert_eq!(span.end, start + widget_src.len());
+    }
+
+    #[test]
+    fn style_pair_and_binding_spans_are_their_own_token_only() {
+        let src = "layout: T { Text `x` w-[fill] {onClick: state.go} }";
+        let ast = parse(src).expect("should parse");
+        let Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
+        let Node::Widget { styles, bindings, .. } = &children[0] else { panic!() };
+
+        let style_start = src.find("w-[fill]").unwrap();
+        assert_eq!(styles[0].span.start, style_start);
+        assert_eq!(styles[0].span.end, style_start + "w-[fill]".len());
+        assert_eq!(&src[styles[0].span.start..styles[0].span.end], "w-[fill]");
+
+        let binding_start = src.find("onClick: state.go").unwrap();
+        assert_eq!(bindings[0].span.start, binding_start);
+        assert_eq!(bindings[0].span.end, binding_start + "onClick: state.go".len());
+        assert_eq!(&src[bindings[0].span.start..bindings[0].span.end], "onClick: state.go");
+    }
+
+    #[test]
     fn parses_layout_params_and_use() {
         let src = r#"
             layout: Login(theme, onSubmit) {
