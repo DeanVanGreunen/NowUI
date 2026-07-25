@@ -9,6 +9,7 @@ members = [
     "nowui-render-gpu",
     "nowui-runtime",
     "nowui-lsp",
+    "nowui-designer",
     "examples/counter-app",
 ]
 
@@ -33,3 +34,9 @@ quote = "1"
 proc-macro2 = "1"
 tower-lsp = "0.20"
 tokio = "1"
+# nowui-designer only: file-watching (live reload) and native open-file/
+# folder dialogs (the one place the designer legitimately steps outside the
+# dogfooded-in-.nowui world — an OS-native picker can't itself be a .nowui
+# widget).
+notify = "6"
+rfd = "0.14"

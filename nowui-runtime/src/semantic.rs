@@ -329,6 +329,13 @@ impl Semantic {
 
         let kids = self.expand_children(ui, id, children, scope, state, depth + 1, true);
         ui.get_mut(id).children = kids;
+
+        if let NodeKind::TreeView { has_checkbox_selection, .. } = &ui.get(id).kind {
+            if *has_checkbox_selection {
+                propagate_tree_checkbox(ui, id);
+            }
+        }
+
         Some(id)
     }
 
@@ -389,6 +396,45 @@ impl Semantic {
             // `paint.rs`.
             "Menu" => Some(NodeKind::Menu { label: arg(0), open: false }),
             "MenuItem" => Some(NodeKind::MenuItem { label: arg(0) }),
+            // `has_checkbox_selection`/`can_select_multiple` are literal-bool
+            // bindings (`{hasCheckboxSelection: true}`), same `bind_value()`
+            // literal-vs-path convention `mask` already uses on `TextInput`
+            // above — not `EVENT_BINDING_KEYS` paths. `checkbox` on each
+            // child `TreeViewItem` is resolved after this returns, once the
+            // whole subtree exists — see `propagate_tree_checkbox`, called
+            // from `expand` right after a `TreeView`'s children are built.
+            "TreeView" => Some(NodeKind::TreeView {
+                has_checkbox_selection: bindings.iter().any(|b| b.key == "hasCheckboxSelection" && matches!(b.value, BindValue::Bool(true))),
+                can_select_multiple: bindings.iter().any(|b| b.key == "canSelectMultiple" && matches!(b.value, BindValue::Bool(true))),
+            }),
+            // `checkbox` starts `false` here regardless of whether it sits
+            // under a checkbox-mode `TreeView` — `propagate_tree_checkbox`
+            // (called from `expand` once the enclosing `TreeView`'s own
+            // NodeId and children are known) fixes it up afterward, the same
+            // "no parent pointer, so resolve top-down after the fact" shape
+            // `NodeKind::TreeViewItem`'s own doc comment describes.
+            // `id` only supports a literal backtick string (`{id: `paper-1`}`) in
+            // this build — unlike `value`/`onClick`/etc., it isn't threaded
+            // through the same per-redraw path-resolution machinery
+            // (`App::resolve_values`) that lets a `state.path`-valued
+            // binding stay live, so a `{id: state.path}` binding (e.g. from
+            // a `for`-loop-rewritten `item.id`) is silently left empty
+            // rather than resolved to something misleadingly literal-looking
+            // — a disclosed gap, not silently wrong data.
+            "TreeViewItem" => Some(NodeKind::TreeViewItem {
+                id: bindings
+                    .iter()
+                    .find(|b| b.key == "id")
+                    .and_then(|b| match &b.value {
+                        BindValue::Str(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_default(),
+                label: arg(0),
+                collapsed: false,
+                selected: bindings.iter().any(|b| b.key == "selected" && matches!(b.value, BindValue::Bool(true))),
+                checkbox: false,
+            }),
             // `picker`/`date_picker`/`time_picker` start seeded from an empty
             // `value` (i.e. the system clock's current date/time) — they're
             // re-seeded from whatever `value` actually is every time the
@@ -414,7 +460,16 @@ impl Semantic {
                 active_tab: nowui_core::datetime::DateTimeTab::Calendar,
             }),
             // Bare containers used directly in a body (e.g. `Card`, `Row`).
-            "Card" | "Container" | "Row" | "Column" | "Bar" | "Grid" | "List" => Some(NodeKind::Container),
+            // `Headers`/`Header`/`Rows`/`Pagination` (`Column` already covered
+            // above) are likewise ordinary containers — `DataGrid` gives them
+            // special meaning purely by structural position (its first child
+            // is treated as `Headers`, its second as `Rows`), the same
+            // precedent `Menu`'s real-arena-node `MenuItem` children already
+            // set. See `NodeKind::DataGrid`'s own doc comment.
+            "Card" | "Container" | "Row" | "Column" | "Bar" | "Grid" | "List" | "Headers" | "Header" | "Rows" | "Pagination" => {
+                Some(NodeKind::Container)
+            }
+            "DataGrid" => Some(NodeKind::DataGrid),
             other => {
                 self.warnings.push(format!("unknown widget `{other}` — treated as container"));
                 Some(NodeKind::Container)
@@ -981,6 +1036,23 @@ pub(crate) fn apply_prefixed(s: &mut Style, key: &str, v: &str) -> bool {
     }
 
     false
+}
+
+/// Walks every descendant of a `TreeView` (real arena children, not AST —
+/// called after `expand` has already built the whole subtree) and sets each
+/// `TreeViewItem`'s own `checkbox` field to mirror the ancestor `TreeView`'s
+/// `has_checkbox_selection`. Exists purely because the arena has no parent
+/// pointers (see `NodeKind::TreeViewItem`'s own doc comment) — a
+/// `TreeViewItem` can't look its own ancestor up at paint/layout time, so
+/// this resolves it once, top-down, right after construction instead.
+fn propagate_tree_checkbox(ui: &mut Ui, id: NodeId) {
+    let children = ui.get(id).children.clone();
+    for child in children {
+        if let NodeKind::TreeViewItem { checkbox, .. } = &mut ui.get_mut(child).kind {
+            *checkbox = true;
+        }
+        propagate_tree_checkbox(ui, child);
+    }
 }
 
 fn apply_side(edges: &mut Edges, side: &str, px: f32) {
@@ -1707,6 +1779,97 @@ mod tests {
         for &id in &grid.children {
             assert!(matches!(ui.get(id).kind, NodeKind::Text { .. }));
         }
+    }
+
+    #[test]
+    fn data_grid_maps_to_its_own_node_kind_and_rows_for_body_splices_flat_columns() {
+        // Mirrors the `Grid`/`for` precedent above: a `for` inside `Rows`
+        // must splice its per-iteration `Column`s in as flat siblings, not
+        // one wrapper container per row — `arrange_data_grid` reinterprets
+        // that flat list positionally (`ncols` from `Headers`' own child
+        // count), same as `Display::Grid` already does for its own cells.
+        let src = r#"layout: T {
+            DataGrid {
+                Headers { Header { Text `ID` } Header { Text `Name` } }
+                Rows { for x in state.rows { Column { Text `${x}` } Column { Text `row` } } }
+            }
+        }"#;
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+
+        let state = DynamicTestState { show: false, rows: vec![1, 2, 3] };
+        let ui = sem.build("T", &state).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let grid = ui.get(root.children[0]);
+        assert!(matches!(grid.kind, NodeKind::DataGrid), "DataGrid widget kind maps to NodeKind::DataGrid");
+        assert_eq!(grid.children.len(), 2, "Headers, then Rows");
+
+        let headers = ui.get(grid.children[0]);
+        assert_eq!(headers.children.len(), 2, "one Header per column");
+        assert!(matches!(headers.kind, NodeKind::Container));
+
+        let rows = ui.get(grid.children[1]);
+        assert_eq!(rows.children.len(), 6, "3 rows x 2 Columns each, flattened directly under Rows");
+        for &id in &rows.children {
+            assert!(matches!(ui.get(id).kind, NodeKind::Container), "Column maps to an ordinary Container");
+        }
+    }
+
+    #[test]
+    fn datagrid_treeview_demo_example_parses_and_builds() {
+        // Regression coverage for `nowui-runtime/examples/
+        // datagrid_treeview_demo.nowui` itself — catches the demo silently
+        // breaking as the engine evolves, same precedent `nowui-syntax`'s
+        // own `parses_login_example` sets for `login.nowui`, just also
+        // through the semantic pass (`Semantic::build`), not just `parse`.
+        let src = include_str!("../examples/datagrid_treeview_demo.nowui");
+        let ast = nowui_syntax::parse(src).expect("demo file should parse");
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("App", &nowui_core::NoState).expect("demo file should build");
+        assert!(sem.warnings.is_empty(), "no unknown-widget/unsupported-variant warnings: {:?}", sem.warnings);
+
+        let root = ui.get(ui.layers[0].root);
+        assert_eq!(root.children.len(), 2, "the two side-by-side Container columns");
+
+        let grid_column = ui.get(root.children[0]);
+        let grid = ui.get(*grid_column.children.last().unwrap()); // after the two heading Texts
+        assert!(matches!(grid.kind, NodeKind::DataGrid));
+
+        let tree_column = ui.get(root.children[1]);
+        let tree = ui.get(*tree_column.children.last().unwrap());
+        assert!(matches!(tree.kind, NodeKind::TreeView { .. }));
+    }
+
+    #[test]
+    fn tree_view_maps_to_its_own_node_kinds_and_propagates_checkbox_mode_down_every_level() {
+        let src = r#"layout: T {
+            TreeView {hasCheckboxSelection: true, canSelectMultiple: true} {
+                TreeViewItem `Paper` {id: `paper-1`} {
+                    TreeViewItem `Header Container` {id: `header-1`}
+                }
+            }
+        }"#;
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+
+        let tree = ui.get(root.children[0]);
+        let NodeKind::TreeView { has_checkbox_selection, can_select_multiple } = &tree.kind else { panic!("expected a TreeView node") };
+        assert!(has_checkbox_selection);
+        assert!(can_select_multiple);
+
+        let paper = ui.get(tree.children[0]);
+        let NodeKind::TreeViewItem { id, label, collapsed, checkbox, .. } = &paper.kind else { panic!("expected a TreeViewItem") };
+        assert_eq!(id, "paper-1");
+        assert_eq!(label, "Paper");
+        assert!(!collapsed, "starts expanded");
+        assert!(checkbox, "propagated down from the TreeView's own hasCheckboxSelection");
+
+        let header = ui.get(paper.children[0]);
+        let NodeKind::TreeViewItem { id, checkbox, .. } = &header.kind else { panic!("expected a nested TreeViewItem") };
+        assert_eq!(id, "header-1");
+        assert!(checkbox, "propagation reaches every nesting level, not just direct children");
     }
 
     #[test]

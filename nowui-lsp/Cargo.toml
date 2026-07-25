@@ -6,6 +6,10 @@ description = "Language server (syntax highlighting + diagnostics) for .nowui fi
 license = "MIT"
 repository = "https://github.com/DeanVanGreunen/NowUI"
 
+[lib]
+name = "nowui_lsp"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nowui-lsp"
 path = "src/main.rs"
@@ -13,9 +17,11 @@ path = "src/main.rs"
 [dependencies]
 # Reuses the real parser for diagnostics (parse errors), same as
 # nowui-runtime — but semantic-token highlighting is a separate, standalone
-# lexer (see src/tokenizer.rs), not driven by the chumsky AST, since
-# nowui-syntax's `ast::Node` carries no source spans (see its own doc
-# comments) and threading them through would be a large, unrelated change.
+# lexer (see src/tokenizer.rs), not driven by the chumsky AST. `ast::Node`
+# now does carry spans (added for nowui-designer's click-to-select/inspector,
+# see nowui-syntax's ast.rs), but the tokenizer stays standalone regardless:
+# it's a best-effort, single-pass lexer that highlights source it can't fully
+# parse yet (as-you-type, mid-edit), which a real AST walk can't do.
 nowui-syntax = { path = "../nowui-syntax", version = "0.1.0" }
 tower-lsp = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "io-std", "macros"] }

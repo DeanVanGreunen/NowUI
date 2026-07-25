@@ -1,0 +1,38 @@
+layout: App w-[fill] h-[fill] bg-gray-100 row gap-6 p-6 {
+  Container w-[fill-2] gap-2 {
+    Text `DataGrid` text-lg font-semibold
+    Text `Column widths follow the widest cell in that column, header included — try comparing the ID column (its header is short) against Name.` text-gray-500 text-sm
+
+    DataGrid bg-white border rounded-lg {
+      Headers w-full bg-gray-800 text-white p-2 {
+        Header w-[80px] { Text `ID` {onClick: state.sortById} }
+        Header w-[fill] { Text `Name` {onClick: state.sortByName} }
+      }
+      Rows {
+        for row in state.rows {
+          Column p-2 border {onClick: row.onSelect} { Text `${row.id}` }
+          Column p-2 border { Text `${row.name}` }
+        }
+      }
+    }
+  }
+
+  Container w-[fill] gap-2 {
+    Text `TreeView` text-lg font-semibold
+    Text `Checkbox selection and multi-select are both on. Click a row's own triangle to expand/collapse; click its checkbox to select.` text-gray-500 text-sm
+
+    TreeView bg-white border rounded-lg p-2 {hasCheckboxSelection: true, canSelectMultiple: true} {
+      TreeViewItem `Paper` {id: `paper-1`} {
+        TreeViewItem `Header Container` {id: `header-1`} {
+          TreeViewItem `Logo` {id: `logo-1`}
+          TreeViewItem `Nav Menu` {id: `nav-1`}
+        }
+        TreeViewItem `Body Container` {id: `body-1`} {
+          TreeViewItem `Sidebar` {id: `sidebar-1`}
+          TreeViewItem `Main Content` {id: `main-1`}
+        }
+        TreeViewItem `Footer Container` {id: `footer-1`}
+      }
+    }
+  }
+}

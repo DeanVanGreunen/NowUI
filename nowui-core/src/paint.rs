@@ -282,7 +282,18 @@ fn paint_node(ui: &Ui, id: NodeId, painter: &mut dyn Painter, popups: &mut Vec<N
                 popups.push(id);
             }
         }
-        NodeKind::Container => {}
+        // Own bg/border already drawn above (generic, every node kind); its
+        // `Headers`/`Rows`/`Pagination` children are ordinary `Container`s
+        // painted by the generic children-recursion below, same as `Menu`'s
+        // real-arena-node `MenuItem`s.
+        NodeKind::Container | NodeKind::DataGrid => {}
+        // Its top-level `TreeViewItem` children paint via the generic
+        // children-recursion below — `TreeView` itself carries no visible
+        // content of its own.
+        NodeKind::TreeView { .. } => {}
+        NodeKind::TreeViewItem { label, collapsed, checkbox, selected, .. } => {
+            paint_tree_view_item(painter, content_rect, style, &text_style, label, *collapsed, *checkbox, *selected, !node.children.is_empty());
+        }
     }
 
     // A `Menu`'s children never paint as normal in-flow children — open or
@@ -835,6 +846,71 @@ fn char_prefix_width(painter: &mut dyn Painter, shown: &str, char_count: usize, 
 /// the caret/selection/underline correctly — `text-right`/`text-center` on a
 /// `TextInput` isn't accounted for here.
 #[allow(clippy::too_many_arguments)]
+/// Draws a `TreeViewItem`'s own row (disclosure indicator, optional
+/// checkbox, label) — the row occupies only the top `text_input::
+/// line_height(style.font_size)` slice of `content_rect`; the rest (if
+/// expanded and non-collapsed) belongs to its children, laid out by
+/// `layout::arrange_tree_view_item` and painted separately via the generic
+/// children-recursion. No dedicated "chevron"/"triangle" `Painter` primitive
+/// exists (the trait only has rects/text/clip/transform), so the disclosure
+/// indicator is a small filled square when expanded, hollow (stroked) when
+/// collapsed — same hand-drawn-primitive convention `Checkbox`'s own
+/// checkmark already uses, just a different shape standing in for a
+/// chevron.
+#[allow(clippy::too_many_arguments)]
+fn paint_tree_view_item(
+    painter: &mut dyn Painter,
+    content_rect: Rect,
+    style: &crate::style::Style,
+    text_style: &TextStyle,
+    label: &str,
+    collapsed: bool,
+    checkbox: bool,
+    selected: bool,
+    has_children: bool,
+) {
+    let own_row_h = crate::text_input::line_height(style.font_size);
+    let row_rect = Rect { h: own_row_h, ..content_rect };
+
+    if has_children {
+        let size = (own_row_h - 4.0).clamp(4.0, 8.0);
+        let indicator = Rect::new(
+            row_rect.x + (crate::layout::TREE_TRIANGLE_W - size) / 2.0,
+            row_rect.y + (own_row_h - size) / 2.0,
+            size,
+            size,
+        );
+        if collapsed {
+            painter.stroke_rect(indicator, style.text_color, 1.0, Edges::default());
+        } else {
+            painter.fill_rect(indicator, style.text_color, Edges::default());
+        }
+    }
+
+    let mut label_x = row_rect.x + crate::layout::TREE_TRIANGLE_W;
+    if checkbox {
+        let box_size = style.font_size;
+        let box_rect = Rect::new(label_x, row_rect.y + (own_row_h - box_size) / 2.0, box_size, box_size);
+        let box_border = style.border_color.unwrap_or(style.text_color);
+        if let Some(bg) = style.bg {
+            painter.fill_rect(box_rect, bg, style.radius);
+        }
+        painter.stroke_rect(box_rect, box_border, 1.0, style.radius);
+        if selected {
+            let mut inner = box_rect;
+            inner.x += 3.0;
+            inner.y += 3.0;
+            inner.w -= 6.0;
+            inner.h -= 6.0;
+            painter.fill_rect(inner, style.text_color, style.radius);
+        }
+        label_x += box_size + 6.0;
+    }
+
+    let label_rect = Rect { x: label_x, w: (row_rect.x + row_rect.w - label_x).max(0.0), ..row_rect };
+    painter.draw_text(label, label_rect, text_style);
+}
+
 #[allow(clippy::too_many_arguments)]
 fn paint_text_input(
     painter: &mut dyn Painter,

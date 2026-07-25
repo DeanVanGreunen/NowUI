@@ -139,6 +139,100 @@ mod tests {
     }
 
     #[test]
+    fn data_grid_column_width_follows_the_widest_cell_including_the_header() {
+        let mut ui = Ui::new();
+
+        // Two header cells: 50px and 60px.
+        let h0 = ui.push(Node::new(NodeKind::Container, Style { width: Sizing::Fixed(50.0), height: Sizing::Fixed(20.0), ..Default::default() }));
+        let h1 = ui.push(Node::new(NodeKind::Container, Style { width: Sizing::Fixed(60.0), height: Sizing::Fixed(20.0), ..Default::default() }));
+        let headers = ui.push(Node::new(NodeKind::Container, Style::default()));
+        ui.get_mut(headers).children = vec![h0, h1];
+
+        // Two rows. Row 0, col 0 is 120px wide — wider than its own header
+        // (50px) — so the *whole* column 0 (header included) must widen to
+        // 120px, not just that one cell's own row.
+        let r0c0 = ui.push(Node::new(NodeKind::Container, Style { width: Sizing::Fixed(120.0), height: Sizing::Fixed(10.0), ..Default::default() }));
+        let r0c1 = ui.push(Node::new(NodeKind::Container, Style { width: Sizing::Fixed(10.0), height: Sizing::Fixed(10.0), ..Default::default() }));
+        let r1c0 = ui.push(Node::new(NodeKind::Container, Style { width: Sizing::Fixed(10.0), height: Sizing::Fixed(10.0), ..Default::default() }));
+        let r1c1 = ui.push(Node::new(NodeKind::Container, Style { width: Sizing::Fixed(10.0), height: Sizing::Fixed(10.0), ..Default::default() }));
+        let rows = ui.push(Node::new(NodeKind::Container, Style::default()));
+        ui.get_mut(rows).children = vec![r0c0, r0c1, r1c0, r1c1];
+
+        let grid = ui.push(Node::new(NodeKind::DataGrid, Style { width: Sizing::Fixed(400.0), ..Default::default() }));
+        ui.get_mut(grid).children = vec![headers, rows];
+        ui.add_layer(grid, "main");
+
+        layout::solve(&mut ui, Size::new(400.0, 200.0), &mut NullPainter);
+
+        // Column 0 is 120px everywhere: the header, row 0's cell (its own
+        // natural width), and row 1's cell (which only ever asked for 10px).
+        assert_eq!(ui.get(h0).computed.w, 120.0, "header widened to match the widest cell in its column");
+        assert_eq!(ui.get(r0c0).computed.w, 120.0);
+        assert_eq!(ui.get(r1c0).computed.w, 120.0, "row 1's cell widened too, even though it never asked for 120px itself");
+
+        // Column 1 stays at its header's own 60px (no cell exceeds it).
+        assert_eq!(ui.get(h1).computed.w, 60.0);
+        assert_eq!(ui.get(r0c1).computed.w, 60.0);
+        assert_eq!(ui.get(r1c1).computed.w, 60.0);
+
+        // Column x-offsets follow column 0's resolved (widened) width.
+        assert_eq!(ui.get(h1).computed.x, 120.0);
+        assert_eq!(ui.get(r1c1).computed.x, 120.0);
+
+        // Rows start below the header row, stacked in row order.
+        assert_eq!(ui.get(h0).computed.y, 0.0);
+        assert_eq!(ui.get(r0c0).computed.y, 20.0, "row 0 starts right after the 20px-tall header row");
+        assert_eq!(ui.get(r1c0).computed.y, 30.0, "row 1 starts after row 0's own 10px height");
+    }
+
+    #[test]
+    fn tree_view_item_indents_children_and_excludes_a_collapsed_subtree_from_layout() {
+        let mut ui = Ui::new();
+
+        let leaf = ui.push(Node::new(
+            NodeKind::TreeViewItem { id: "leaf".to_string(), label: "Leaf".to_string(), collapsed: false, selected: false, checkbox: false },
+            Style::default(),
+        ));
+        let child = ui.push(Node::new(
+            NodeKind::TreeViewItem { id: "child".to_string(), label: "Child".to_string(), collapsed: false, selected: false, checkbox: false },
+            Style::default(),
+        ));
+        ui.get_mut(child).children = vec![leaf];
+
+        let parent = ui.push(Node::new(
+            NodeKind::TreeViewItem { id: "parent".to_string(), label: "Parent".to_string(), collapsed: false, selected: false, checkbox: false },
+            Style::default(),
+        ));
+        ui.get_mut(parent).children = vec![child];
+
+        let tree = ui.push(Node::new(NodeKind::TreeView { has_checkbox_selection: false, can_select_multiple: false }, Style { width: Sizing::Fixed(300.0), ..Default::default() }));
+        ui.get_mut(tree).children = vec![parent];
+        ui.add_layer(tree, "main");
+
+        layout::solve(&mut ui, Size::new(300.0, 300.0), &mut NullPainter);
+
+        let parent_rect = ui.get(parent).computed;
+        let child_rect = ui.get(child).computed;
+        let leaf_rect = ui.get(leaf).computed;
+
+        assert_eq!(parent_rect.x, 0.0);
+        assert!(child_rect.x > parent_rect.x, "child indents right of its parent");
+        assert_eq!(child_rect.x - parent_rect.x, leaf_rect.x - child_rect.x, "every nesting level indents by the same amount");
+        assert!(child_rect.y > parent_rect.y, "child stacks below its parent's own row");
+        assert!(leaf_rect.y > child_rect.y, "leaf stacks below its parent's own row too");
+
+        // Now collapse the middle node and re-solve: `leaf` must be excluded
+        // from layout entirely — parent's own height shrinks back to just
+        // its own row, since `child`'s whole (indented) subtree disappears.
+        let NodeKind::TreeViewItem { collapsed, .. } = &mut ui.get_mut(child).kind else { panic!() };
+        *collapsed = true;
+        let expanded_parent_h = parent_rect.h;
+        layout::solve(&mut ui, Size::new(300.0, 300.0), &mut NullPainter);
+        let collapsed_parent_h = ui.get(parent).computed.h;
+        assert!(collapsed_parent_h < expanded_parent_h, "collapsing a middle node shrinks its ancestor's own height");
+    }
+
+    #[test]
     fn grid_places_children_into_tracks() {
         let mut ui = Ui::new();
         let cells: Vec<_> = (0..4)

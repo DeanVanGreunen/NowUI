@@ -545,6 +545,16 @@ impl<S: NowUiState + 'static> App<S> {
     /// so isn't reachable through the normal rect-based `hit_test`.
     fn handle_click(&mut self, id: NodeId) {
         let mut new_value = None;
+        // Precomputed before the match below (which needs `self.ui.
+        // get_mut(id)` — a `TreeViewItem`'s own `computed` rect always
+        // starts at its own row's x, regardless of nesting depth, since
+        // `layout::arrange_tree_view_item` already bakes each level's own
+        // indent into where a child's rect begins; see the two zones
+        // `TREE_TRIANGLE_W` and `TREE_TRIANGLE_W..+font_size` mark out,
+        // matching exactly what `paint::paint_tree_view_item` draws there.
+        let tree_item_local_x = self.ui.cursor.x - self.ui.get(id).computed.x;
+        let tree_item_has_children = !self.ui.get(id).children.is_empty();
+        let mut tree_collapse_toggled_to: Option<bool> = None;
         match &mut self.ui.get_mut(id).kind {
             NodeKind::Checkbox { checked, .. } => {
                 *checked = !*checked;
@@ -592,10 +602,32 @@ impl<S: NowUiState + 'static> App<S> {
                     *active_tab = nowui_core::datetime::DateTimeTab::Calendar;
                 }
             }
+            // Two independent hit zones within the item's own row (never its
+            // children's rows — those are separate, deeper arena nodes the
+            // hit test already resolves to directly): the disclosure
+            // triangle toggles `collapsed` (only meaningful when it actually
+            // has children), the checkbox — only drawn/hit-testable at all
+            // in `checkbox` mode — toggles `selected`. A click in the label
+            // zone does neither on its own; `onClick` (dispatched below,
+            // unconditionally) is how an app hooks up its own
+            // select/navigate behavior for that.
+            NodeKind::TreeViewItem { collapsed, checkbox, selected, .. } => {
+                if tree_item_local_x < nowui_core::layout::TREE_TRIANGLE_W {
+                    if tree_item_has_children {
+                        *collapsed = !*collapsed;
+                        tree_collapse_toggled_to = Some(*collapsed);
+                    }
+                } else if *checkbox {
+                    *selected = !*selected;
+                }
+            }
             _ => {}
         }
         if let Some(v) = new_value {
             self.write_back_value(id, v);
+        }
+        if let Some(collapsed) = tree_collapse_toggled_to {
+            self.dispatch_event(id, if collapsed { "onNodeCollapsed" } else { "onNodeUncollapsed" }, EventKind::Click, None);
         }
         // Clicking anywhere closes every *other* open dropdown/menu/picker —
         // there's no outside-click-detection system built in, so without
@@ -1538,7 +1570,12 @@ fn apply_resolved_templates(kind: &mut NodeKind, values: &[String]) {
                 *placeholder = v.clone();
             }
         }
-        NodeKind::Slider { .. } | NodeKind::ProgressBar { .. } | NodeKind::Container => {}
+        NodeKind::TreeViewItem { label, .. } => {
+            if let Some(v) = values.first() {
+                *label = v.clone();
+            }
+        }
+        NodeKind::Slider { .. } | NodeKind::ProgressBar { .. } | NodeKind::Container | NodeKind::DataGrid | NodeKind::TreeView { .. } => {}
     }
 }
 
@@ -2037,6 +2074,72 @@ mod tests {
         app.handle_click(menu);
         let NodeKind::Menu { open, .. } = &app.ui.get(menu).kind else { panic!() };
         assert!(!open, "second click closes it again");
+    }
+
+    #[test]
+    fn clicking_the_disclosure_triangle_toggles_collapsed_and_dispatches_the_matching_event() {
+        let mut ui = Ui::new();
+        let leaf = ui.push(Node::new(
+            NodeKind::TreeViewItem { id: "leaf".to_string(), label: "Leaf".to_string(), collapsed: false, selected: false, checkbox: false },
+            Style::default(),
+        ));
+        let item = ui.push(Node::new(
+            NodeKind::TreeViewItem { id: "item".to_string(), label: "Parent".to_string(), collapsed: false, selected: false, checkbox: false },
+            Style::default(),
+        ));
+        ui.get_mut(item).children = vec![leaf];
+        ui.get_mut(item).computed = Rect::new(0.0, 0.0, 200.0, 20.0);
+        ui.get_mut(item).events.insert("onNodeCollapsed".to_string(), vec!["state".to_string(), "on_collapsed".to_string()]);
+        ui.get_mut(item).events.insert("onNodeUncollapsed".to_string(), vec!["state".to_string(), "on_uncollapsed".to_string()]);
+        ui.add_layer(item, "main");
+        ui.cursor = Point::new(5.0, 5.0); // inside the disclosure-triangle zone (0..TREE_TRIANGLE_W)
+
+        #[derive(Default, Clone, nowui_core::NowUiState)]
+        #[nowui(methods(on_collapsed, on_uncollapsed))]
+        struct S {
+            collapsed_count: u32,
+            uncollapsed_count: u32,
+        }
+        impl S {
+            fn on_collapsed(&mut self, _app: &mut S, _e: &nowui_core::Event) {
+                self.collapsed_count += 1;
+            }
+            fn on_uncollapsed(&mut self, _app: &mut S, _e: &nowui_core::Event) {
+                self.uncollapsed_count += 1;
+            }
+        }
+
+        let mut app = App::new("test".to_string(), ui, S::default(), crate::semantic::Semantic::new(&[]), Backend::Cpu);
+
+        app.handle_click(item);
+        let NodeKind::TreeViewItem { collapsed, .. } = &app.ui.get(item).kind else { panic!() };
+        assert!(collapsed, "clicking the triangle collapses an expanded item");
+        assert_eq!(app.state.collapsed_count, 1);
+        assert_eq!(app.state.uncollapsed_count, 0);
+
+        app.handle_click(item);
+        let NodeKind::TreeViewItem { collapsed, .. } = &app.ui.get(item).kind else { panic!() };
+        assert!(!collapsed, "clicking it again re-expands it");
+        assert_eq!(app.state.collapsed_count, 1);
+        assert_eq!(app.state.uncollapsed_count, 1);
+    }
+
+    #[test]
+    fn clicking_the_checkbox_zone_toggles_selected_only_in_checkbox_mode() {
+        let mut ui = Ui::new();
+        let item = ui.push(Node::new(
+            NodeKind::TreeViewItem { id: "item".to_string(), label: "Item".to_string(), collapsed: false, selected: false, checkbox: true },
+            Style::default(),
+        ));
+        ui.get_mut(item).computed = Rect::new(0.0, 0.0, 200.0, 20.0);
+        ui.add_layer(item, "main");
+        ui.cursor = Point::new(20.0, 5.0); // past the triangle zone, into the checkbox
+        let mut app = App::new("test".to_string(), ui, nowui_core::NoState, crate::semantic::Semantic::new(&[]), Backend::Cpu);
+
+        app.handle_click(item);
+        let NodeKind::TreeViewItem { selected, collapsed, .. } = &app.ui.get(item).kind else { panic!() };
+        assert!(selected, "checkbox-zone click toggles selected");
+        assert!(!collapsed, "a checkbox-zone click must not also toggle collapsed");
     }
 
     #[test]

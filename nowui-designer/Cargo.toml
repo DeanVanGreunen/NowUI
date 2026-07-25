@@ -1,0 +1,26 @@
+[package]
+name = "nowui-designer"
+version = "0.1.0"
+edition = "2021"
+description = "Visual designer for .nowui files: virtual file explorer, tabbed editor, live preview, inspector."
+license = "MIT"
+repository = "https://github.com/DeanVanGreunen/NowUI"
+
+[[bin]]
+name = "nowui-designer"
+path = "src/main.rs"
+
+[dependencies]
+# Lower-level pieces used directly (not nowui-runtime::App/run*, which owns
+# its own single winit::EventLoop/window — the designer needs a
+# multi-window harness of its own; see app.rs's own module doc).
+nowui-core = { path = "../nowui-core", version = "0.1.0" }
+nowui-syntax = { path = "../nowui-syntax", version = "0.1.0" }
+nowui-runtime = { path = "../nowui-runtime", version = "0.1.0" }
+nowui-render-gpu = { path = "../nowui-render-gpu", version = "0.1.0" }
+# In-process tokenizer reuse for syntax highlighting (see nowui-lsp's own
+# Cargo.toml comment) — no tower-lsp/tokio pulled in just for this.
+nowui-lsp = { path = "../nowui-lsp", version = "0.1.0" }
+winit = { workspace = true }
+notify = { workspace = true }
+rfd = { workspace = true }

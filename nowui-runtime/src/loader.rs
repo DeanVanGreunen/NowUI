@@ -5,7 +5,7 @@
 //! guarding against import cycles — lives here instead, since `nowui-runtime`
 //! is already where file I/O happens (see `main.rs`).
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use nowui_syntax::ast::Node;
@@ -19,7 +19,35 @@ use nowui_syntax::ast::Node;
 pub fn load_and_resolve(entry_path: &Path) -> Result<Vec<Node>, String> {
     let mut out = Vec::new();
     let mut visited = HashSet::new();
-    load_into(entry_path, &mut out, &mut visited)?;
+    load_into(entry_path, &mut out, &mut visited, None, &mut None)?;
+    Ok(out)
+}
+
+/// Like `load_and_resolve`, but also returns every file the walk actually
+/// visited (in load order, canonicalized, deduped the same way — a diamond
+/// import appears once), for a caller that needs the whole transitive file
+/// set — nowui-designer's virtual file explorer, and its watcher (which
+/// paths to watch for a reload). Node-level parsing/import-resolution
+/// semantics are otherwise identical to `load_and_resolve`.
+pub fn load_and_resolve_tagged(entry_path: &Path) -> Result<(Vec<Node>, Vec<PathBuf>), String> {
+    let mut out = Vec::new();
+    let mut visited = HashSet::new();
+    let mut order = Vec::new();
+    load_into(entry_path, &mut out, &mut visited, None, &mut Some(&mut order))?;
+    Ok((out, order))
+}
+
+/// Like `load_and_resolve`, but any path present in `overrides` (matched by
+/// canonical path, same identity `load_into`'s own cycle/dedup guard uses)
+/// is resolved from that in-memory string instead of the filesystem —
+/// letting a caller preview a document with unsaved editor buffers applied,
+/// without writing them to disk first. A path not present in `overrides`
+/// falls back to reading it from disk as usual, so this degrades to exactly
+/// `load_and_resolve` when `overrides` is empty.
+pub fn load_and_resolve_with_overrides(entry_path: &Path, overrides: &HashMap<PathBuf, String>) -> Result<Vec<Node>, String> {
+    let mut out = Vec::new();
+    let mut visited = HashSet::new();
+    load_into(entry_path, &mut out, &mut visited, Some(overrides), &mut None)?;
     Ok(out)
 }
 
@@ -82,22 +110,34 @@ fn load_bundled_into(
     Ok(())
 }
 
-fn load_into(path: &Path, out: &mut Vec<Node>, visited: &mut HashSet<PathBuf>) -> Result<(), String> {
+fn load_into(
+    path: &Path,
+    out: &mut Vec<Node>,
+    visited: &mut HashSet<PathBuf>,
+    overrides: Option<&HashMap<PathBuf, String>>,
+    order: &mut Option<&mut Vec<PathBuf>>,
+) -> Result<(), String> {
     let canonical = path
         .canonicalize()
         .map_err(|e| format!("could not read `{}`: {e}", path.display()))?;
-    if !visited.insert(canonical) {
+    if !visited.insert(canonical.clone()) {
         return Ok(());
     }
+    if let Some(order) = order {
+        order.push(canonical.clone());
+    }
 
-    let src = std::fs::read_to_string(path).map_err(|e| format!("could not read `{}`: {e}", path.display()))?;
+    let src = match overrides.and_then(|o| o.get(&canonical)) {
+        Some(text) => text.clone(),
+        None => std::fs::read_to_string(path).map_err(|e| format!("could not read `{}`: {e}", path.display()))?,
+    };
     let ast = nowui_syntax::parse(&src)
         .map_err(|errors| format!("parse error(s) in `{}`:\n{errors:?}", path.display()))?;
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     for node in ast {
         match node {
-            Node::Import { path: rel } => load_into(&dir.join(&rel), out, visited)?,
+            Node::Import { path: rel } => load_into(&dir.join(&rel), out, visited, overrides, order)?,
             other => out.push(other),
         }
     }
@@ -155,6 +195,48 @@ mod tests {
             .filter(|n| matches!(n, Node::LayoutDef { name, .. } if name == "Shared"))
             .count();
         assert_eq!(shared_count, 1, "shared.nowui imported via both a and b must only be loaded once");
+    }
+
+    #[test]
+    fn tagged_reports_every_visited_file_once_even_through_a_diamond_import() {
+        let dir = scratch_dir("tagged_diamond");
+        fs::write(dir.join("shared.nowui"), "layout: Shared { Text `s` }").unwrap();
+        fs::write(dir.join("a.nowui"), "# shared.nowui\nlayout: A { Shared }").unwrap();
+        fs::write(dir.join("b.nowui"), "# shared.nowui\nlayout: B { Shared }").unwrap();
+        fs::write(dir.join("main.nowui"), "# a.nowui\n# b.nowui\nlayout: App { A }").unwrap();
+
+        let (ast, files) = load_and_resolve_tagged(&dir.join("main.nowui")).expect("should resolve");
+        assert_eq!(files.len(), 4, "main, a, b, shared — shared counted once despite the diamond");
+        let names: HashSet<_> = files.iter().filter_map(|p| p.file_name()).collect();
+        assert!(names.contains(std::ffi::OsStr::new("main.nowui")));
+        assert!(names.contains(std::ffi::OsStr::new("shared.nowui")));
+        assert!(!ast.is_empty());
+    }
+
+    #[test]
+    fn overrides_take_precedence_over_disk_content() {
+        let dir = scratch_dir("overrides");
+        fs::write(dir.join("main.nowui"), "layout: App { Text `on disk` }").unwrap();
+
+        let canonical = dir.join("main.nowui").canonicalize().unwrap();
+        let mut overrides = HashMap::new();
+        overrides.insert(canonical, "layout: App { Text `unsaved edit` }".to_string());
+
+        let ast = load_and_resolve_with_overrides(&dir.join("main.nowui"), &overrides).expect("should resolve");
+        let Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
+        let Node::Widget { string_args, .. } = &children[0] else { panic!() };
+        assert_eq!(string_args[0].render_flat(), "unsaved edit");
+    }
+
+    #[test]
+    fn a_path_absent_from_overrides_still_falls_back_to_disk() {
+        let dir = scratch_dir("overrides_fallback");
+        fs::write(dir.join("main.nowui"), "layout: App { Text `on disk` }").unwrap();
+
+        let ast = load_and_resolve_with_overrides(&dir.join("main.nowui"), &HashMap::new()).expect("should resolve");
+        let Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
+        let Node::Widget { string_args, .. } = &children[0] else { panic!() };
+        assert_eq!(string_args[0].render_flat(), "on disk");
     }
 
     #[test]

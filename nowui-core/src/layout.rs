@@ -72,6 +72,14 @@ fn arrange_menu_popups(ui: &mut Ui, id: NodeId, sizes: &HashMap<NodeId, Size>) {
     }
 }
 
+/// `TreeViewItem` layout constants (`arrange_tree_view_item`/`measure`, also
+/// used by `paint::paint_node` to draw the disclosure triangle/checkbox at
+/// matching positions, and by `nowui-runtime`'s click handler to tell which
+/// zone of a `TreeViewItem`'s own row was clicked): the disclosure-triangle
+/// column width, and how far each nesting level indents its children.
+pub const TREE_TRIANGLE_W: f32 = 14.0;
+pub const TREE_INDENT: f32 = 16.0;
+
 fn axis_is_row(d: Direction) -> bool {
     matches!(d, Direction::Row | Direction::RowReverse)
 }
@@ -148,7 +156,22 @@ fn measure(ui: &mut Ui, id: NodeId, painter: &mut dyn Painter, sizes: &mut HashM
             let m = painter.measure_text(label, style.font_size);
             Size::new(m.x, m.y)
         }
-        crate::arena::NodeKind::Container => Size::default(),
+        // Real width comes from `arrange_data_grid`'s own column-width
+        // resolution, run against already-measured child sizes — a `DataGrid`
+        // with no explicit `w-*`/`h-*` of its own has no intrinsic Hug size,
+        // same documented convention as `Display::Grid` ("give it an
+        // explicit w-full/w-[…]").
+        crate::arena::NodeKind::Container | crate::arena::NodeKind::DataGrid | crate::arena::NodeKind::TreeView { .. } => Size::default(),
+        // Own row only: disclosure-triangle column + optional checkbox
+        // column + measured label. Height pinned to the same
+        // `text_input::line_height` estimate `arrange_tree_view_item` uses
+        // for its own-row height, so measure/arrange never disagree about
+        // where the indented children block starts.
+        crate::arena::NodeKind::TreeViewItem { label, checkbox, .. } => {
+            let m = painter.measure_text(label, style.font_size);
+            let checkbox_w = if *checkbox { style.font_size + 6.0 } else { 0.0 };
+            Size::new(TREE_TRIANGLE_W + checkbox_w + m.x, crate::text_input::line_height(style.font_size))
+        }
     };
 
     // A `Menu`'s children (real arena nodes, typically `MenuItem`) never
@@ -159,7 +182,28 @@ fn measure(ui: &mut Ui, id: NodeId, painter: &mut dyn Painter, sizes: &mut HashM
     // has their real sizes memoized in `sizes` when it needs them.
     let is_menu = matches!(&node.kind, crate::arena::NodeKind::Menu { .. });
 
-    let content = if is_menu {
+    // A `TreeViewItem` doesn't fit the generic fold below (which *maxes*
+    // `own` against the children's folded main-extent, matching every other
+    // widget's "either has its own content or has children" shape) — it has
+    // both, stacked: its own row, then its (indented) children's block
+    // *summed* beneath it. Excluded entirely while `collapsed` or leaf, same
+    // "children never contribute to intrinsic size" principle `is_menu`
+    // already uses, just for a different reason (nothing to show, not
+    // "floats elsewhere").
+    let tree_item_children: Option<Size> = match &node.kind {
+        crate::arena::NodeKind::TreeViewItem { collapsed: false, .. } if !children.is_empty() => {
+            let w = child_sizes.iter().fold(0.0f32, |m, s| m.max(s.w));
+            let h: f32 = child_sizes.iter().map(|s| s.h).sum();
+            Some(Size::new(w, h))
+        }
+        _ => None,
+    };
+
+    let content = if let Some(child_block) = tree_item_children {
+        Size::new(own.w.max(child_block.w + TREE_INDENT), own.h + child_block.h)
+    } else if matches!(&node.kind, crate::arena::NodeKind::TreeViewItem { .. }) {
+        Size::new(own.w, own.h)
+    } else if is_menu {
         Size::new(own.w, own.h)
     } else if style.display == Display::Grid {
         grid_intrinsic(&children, &style, sizes)
@@ -258,7 +302,11 @@ fn arrange(ui: &mut Ui, id: NodeId, rect: Rect, sizes: &HashMap<NodeId, Size>, c
     }
 
     let scroll_offset = ui.get(id).scroll_offset;
-    let content_size = if style.display == Display::Grid {
+    let content_size = if matches!(ui.get(id).kind, crate::arena::NodeKind::DataGrid) {
+        arrange_data_grid(ui, &in_flow, inner, sizes, child_containing_block)
+    } else if matches!(ui.get(id).kind, crate::arena::NodeKind::TreeViewItem { .. }) {
+        arrange_tree_view_item(ui, id, &style, &in_flow, inner, sizes, child_containing_block)
+    } else if style.display == Display::Grid {
         arrange_grid(ui, &style, &in_flow, inner, sizes, scroll_offset, child_containing_block)
     } else {
         arrange_flow(ui, &style, &in_flow, inner, sizes, scroll_offset, child_containing_block)
@@ -687,6 +735,120 @@ fn arrange_grid(
         col_widths.iter().sum::<f32>() + col_gaps_total,
         row_heights.iter().sum::<f32>() + row_gaps_total,
     )
+}
+
+/// Lays out a `NodeKind::DataGrid`'s children directly, bypassing the
+/// generic flow/grid solver entirely (see `NodeKind::DataGrid`'s own doc
+/// comment for the expected shape: a `Headers` container, then a `Rows`
+/// container, then optionally more — e.g. a `Pagination` widget — stacked
+/// below at their own intrinsic height).
+///
+/// Column widths follow real `<table>` auto-layout, not a CSS Grid `fr`
+/// track: `col_width[c] = max(header[c]'s own width, the widest `Column`
+/// cell in that column across every row)` — computed once here from
+/// `sizes` (already memoized by `measure()`), then imposed on every
+/// `Header`/`Column` at that index, header included, not just whichever row
+/// happened to be widest.
+fn arrange_data_grid(ui: &mut Ui, children: &[NodeId], inner: Rect, sizes: &HashMap<NodeId, Size>, containing_block: Rect) -> Size {
+    let Some(&headers_id) = children.first() else {
+        return Size::default();
+    };
+    let header_cells = ui.get(headers_id).children.clone();
+    let ncols = header_cells.len();
+
+    let rows_id = children.get(1).copied();
+    let row_cells = rows_id.map(|id| ui.get(id).children.clone()).unwrap_or_default();
+    let nrows = if ncols > 0 { row_cells.len() / ncols } else { 0 };
+
+    let mut col_widths = vec![0.0f32; ncols];
+    for (i, &h) in header_cells.iter().enumerate() {
+        col_widths[i] = sizes.get(&h).map(|s| s.w).unwrap_or(0.0);
+    }
+    for (idx, &cell) in row_cells.iter().enumerate() {
+        let c = idx % ncols.max(1);
+        col_widths[c] = col_widths[c].max(sizes.get(&cell).map(|s| s.w).unwrap_or(0.0));
+    }
+    let total_w = col_widths.iter().sum::<f32>().max(inner.w);
+    // A column with no explicit header/cell width at all (e.g. every cell
+    // empty) still gets an even share of any leftover width, so an
+    // all-empty grid doesn't collapse every column to zero.
+    if ncols > 0 && col_widths.iter().all(|&w| w == 0.0) {
+        col_widths = vec![inner.w / ncols as f32; ncols];
+    }
+
+    let header_h = header_cells.iter().map(|&h| sizes.get(&h).map(|s| s.h).unwrap_or(0.0)).fold(0.0f32, f32::max);
+    let mut x = inner.x;
+    for (i, &h) in header_cells.iter().enumerate() {
+        arrange(ui, h, Rect::new(x, inner.y, col_widths[i], header_h), sizes, containing_block);
+        x += col_widths[i];
+    }
+    if let Some(headers_id) = children.first().copied() {
+        ui.get_mut(headers_id).computed = Rect::new(inner.x, inner.y, total_w.max(x - inner.x), header_h);
+    }
+
+    let mut y = inner.y + header_h;
+    for r in 0..nrows {
+        let row_h = (0..ncols)
+            .map(|c| sizes.get(&row_cells[r * ncols + c]).map(|s| s.h).unwrap_or(0.0))
+            .fold(0.0f32, f32::max);
+        let mut x = inner.x;
+        for c in 0..ncols {
+            let cell = row_cells[r * ncols + c];
+            arrange(ui, cell, Rect::new(x, y, col_widths[c], row_h), sizes, containing_block);
+            x += col_widths[c];
+        }
+        y += row_h;
+    }
+    if let Some(rows_id) = rows_id {
+        ui.get_mut(rows_id).computed = Rect::new(inner.x, inner.y + header_h, total_w, y - (inner.y + header_h));
+    }
+
+    // Any further children (e.g. `Pagination`) stack below at their own
+    // intrinsic height, full DataGrid width — same "just a Container" shape
+    // as everything else here, no special data of its own.
+    for &extra in children.iter().skip(2) {
+        let h = sizes.get(&extra).map(|s| s.h).unwrap_or(0.0);
+        arrange(ui, extra, Rect::new(inner.x, y, total_w, h), sizes, containing_block);
+        y += h;
+    }
+
+    Size::new(total_w, y - inner.y)
+}
+
+/// Lays out a `NodeKind::TreeViewItem`'s own row (disclosure triangle +
+/// optional checkbox + label — drawn directly by `paint::paint_node`, not
+/// arena children) plus its nested `TreeViewItem` children, stacked below
+/// and indented one further `TREE_INDENT` — entirely skipped while
+/// `collapsed`, so a collapsed subtree occupies zero space (its descendants
+/// keep their arena nodes and prior `computed` rects, just never revisited
+/// by this pass — same "no node-removal/GC" precedent `if`/`for` regions
+/// already accept, harmless since a hidden node is never painted or
+/// hit-tested).
+fn arrange_tree_view_item(
+    ui: &mut Ui,
+    id: NodeId,
+    style: &Style,
+    children: &[NodeId],
+    inner: Rect,
+    sizes: &HashMap<NodeId, Size>,
+    containing_block: Rect,
+) -> Size {
+    let own_row_h = crate::text_input::line_height(style.font_size);
+    let collapsed = matches!(&ui.get(id).kind, crate::arena::NodeKind::TreeViewItem { collapsed: true, .. });
+
+    if collapsed || children.is_empty() {
+        return Size::new(inner.w, own_row_h);
+    }
+
+    let indented = Rect {
+        x: inner.x + TREE_INDENT,
+        y: inner.y + own_row_h,
+        w: (inner.w - TREE_INDENT).max(0.0),
+        h: (inner.h - own_row_h).max(0.0),
+    };
+    let stack_style = Style { direction: Direction::Column, gap: 0.0, ..Style::default() };
+    let content = arrange_flow(ui, &stack_style, children, indented, sizes, Point::default(), containing_block);
+    Size::new(inner.w.max(content.w + TREE_INDENT), own_row_h + content.h)
 }
 
 /// Convenience: point-in-rect for the root of a layer.

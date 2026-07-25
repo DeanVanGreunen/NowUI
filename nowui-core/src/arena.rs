@@ -35,6 +35,13 @@ pub const EVENT_BINDING_KEYS: &[&str] = &[
     // see `NodeKind::Date`/`Time`/`DateTime` and `nowui-runtime`'s
     // `select_date_popup`/`select_time_popup`/`select_datetime_popup`.
     "onSelect",
+    // `TreeView`: fires on the `TreeViewItem` whose own `collapsed` flag
+    // just changed (`event.node` — same mechanism as every other event key
+    // here), one or the other depending on the new state. `onNodeMove`
+    // (drag-to-reorder) is deliberately **not** in this list yet — see
+    // `NodeKind::TreeView`'s own doc comment for why.
+    "onNodeCollapsed",
+    "onNodeUncollapsed",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -182,6 +189,47 @@ pub enum NodeKind {
         date_picker: DatePickerState,
         time_picker: TimePickerState,
         active_tab: DateTimeTab,
+    },
+    /// A MUI-`DataGrid`-style table: real `<table>` auto-layout column
+    /// widths, not CSS Grid's `fr`-track model. Structurally recognized (see
+    /// `layout::arrange_data_grid`) rather than data-bearing — its first
+    /// in-flow child is expected to be a `Headers` container (one child per
+    /// column), its second a `Rows` container (`ncols`-many children per
+    /// row, row-major, same "for's flat spliced children get positionally
+    /// reinterpreted" precedent `Display::Grid` already relies on), and any
+    /// further children (e.g. a `Pagination` widget) simply stack below at
+    /// their own intrinsic height. `Headers`/`Header`/`Rows`/`Column` are
+    /// ordinary `NodeKind::Container`s — the semantic pass maps those widget
+    /// kind strings straight through with no dedicated variants of their
+    /// own, the same way `Menu`'s children are ordinary widgets given
+    /// special meaning only by their structural position.
+    DataGrid,
+    /// A hierarchical, expandable/collapsible, optionally (multi-)selectable
+    /// list — MUI `RichTreeView`-style. Carries only view-wide config; the
+    /// hierarchy itself is real arena nesting (see `NodeKind::TreeViewItem`).
+    /// **Not yet built**: drag-to-reorder (`onNodeMove`) — a real, scoped
+    /// gesture is a substantial enough addition (drag threshold, a
+    /// drop-position indicator, its own mouse-move/mouse-up dispatch) that
+    /// it's left for a follow-up rather than half-wired in here.
+    TreeView {
+        has_checkbox_selection: bool,
+        can_select_multiple: bool,
+    },
+    /// One node in a `TreeView`'s hierarchy. `label` is its own backtick
+    /// text (like `Button`/`MenuItem`); `Node::children` are nested
+    /// `TreeViewItem`s, indented one level further and (see
+    /// `layout::arrange_tree_view_item`) entirely excluded from layout while
+    /// `collapsed`. `checkbox` mirrors the nearest `TreeView` ancestor's own
+    /// `has_checkbox_selection` — resolved once by the semantic pass at
+    /// expansion time (`nowui-runtime`'s `propagate_tree_checkbox`) rather
+    /// than looked up via a parent pointer, since the arena has none (see
+    /// CLAUDE.md's "flat `Vec<Node>`, no parent pointers" rule).
+    TreeViewItem {
+        id: String,
+        label: String,
+        collapsed: bool,
+        selected: bool,
+        checkbox: bool,
     },
 }
 

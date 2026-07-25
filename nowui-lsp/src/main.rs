@@ -11,13 +11,11 @@
 //! files are small enough that re-tokenizing the whole document on every
 //! keystroke is cheap).
 
-mod line_index;
-mod tokenizer;
-
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use line_index::LineIndex;
+use nowui_lsp::tokenizer;
+use nowui_lsp::LineIndex;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer, LspService, Server};
