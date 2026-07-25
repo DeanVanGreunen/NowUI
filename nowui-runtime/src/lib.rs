@@ -17,8 +17,10 @@
 //!     all. See `examples/counter-app/src/main.rs`.
 
 pub mod app;
+pub mod bundled_assets;
 pub mod dynamic;
 pub mod loader;
+pub mod network_image;
 pub mod resolve;
 pub mod semantic;
 pub mod transitions;
@@ -31,6 +33,18 @@ use nowui_syntax::ast::Node;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 pub use app::App;
+
+/// A fixed neutral gray-black used for every chevron glyph (`Dropdown`/
+/// `Date`/`Time`/`DateTime`'s closed-box indicator, `TreeView`'s disclosure
+/// indicator) — deliberately *not* each widget's own `text_color`, unlike
+/// the plain-square glyph it replaces. Supporting a real per-widget tint
+/// would mean rasterizing a fresh chevron per distinct color actually used
+/// in one tree, threaded from `nowui-runtime` into `nowui-core`'s paint
+/// pass per-node rather than once per app — treating this glyph as fixed
+/// chrome (the same choice this file's own popup-internals palette already
+/// makes for `Date`/`Time`/`DateTime`'s open popup) is a deliberate,
+/// documented scope simplification, not an oversight.
+const CHEVRON_COLOR: [u8; 4] = [0x37, 0x41, 0x51, 255]; // Tailwind gray-700
 
 /// Which rendering backend `App` uses. `Gpu` (`vello`/`wgpu`, via
 /// `nowui-render-gpu`) is the default for `run`/`run_path`. `Cpu` (tiny-skia/
@@ -52,7 +66,7 @@ pub enum Backend {
 /// OS window's title bar text (`Window::with_title`).
 fn run_ast<S: NowUiState + 'static>(window_title: &str, ast: Vec<Node>, entry: &str, state: S, backend: Backend) -> ExitCode {
     let mut sem = semantic::Semantic::new(&ast);
-    let ui = match sem.build(entry, &state) {
+    let mut ui = match sem.build(entry, &state) {
         Some(ui) => ui,
         None => {
             eprintln!("error: entry layout `{entry}` not found");
@@ -60,6 +74,23 @@ fn run_ast<S: NowUiState + 'static>(window_title: &str, ast: Vec<Node>, entry: &
             return ExitCode::FAILURE;
         }
     };
+
+    // Rasterized once (cached inside `nowui_icons::icon_frame` itself, so a
+    // reload — dynamic regions rebuild `Ui` in place, never replace it —
+    // never re-rasterizes) and stashed directly on `Ui` for `nowui-core`'s
+    // paint code to read — `nowui-core` can't call `nowui_icons` itself
+    // (its "no chumsky/tiny-skia/vello" hard rule: `nowui-icons` pulls in
+    // `resvg`/`tiny-skia` transitively), so the already-rasterized `Frame`s
+    // are handed down the same way `Ui::cursor`/`Ui::mouse_down` already
+    // hand hand-drawn popup controls other runtime-owned state. `Dropdown`/
+    // `Date`/`Time`/`DateTime`'s own closed-box indicator and `TreeView`'s
+    // disclosure indicator all fall back to their old plain-square glyph
+    // if this is `None` (e.g. a `nowui-core`-only test `Ui`).
+    ui.chevron_up = nowui_icons::icon_frame("FaChevronUp", CHEVRON_COLOR).ok();
+    ui.chevron_down = nowui_icons::icon_frame("FaChevronDown", CHEVRON_COLOR).ok();
+    ui.chevron_right = nowui_icons::icon_frame("FaChevronRight", CHEVRON_COLOR).ok();
+    ui.icon_add_file = nowui_icons::icon_frame("FaFileCirclePlus", CHEVRON_COLOR).ok();
+    ui.icon_add_folder = nowui_icons::icon_frame("FaFolderPlus", CHEVRON_COLOR).ok();
 
     for w in &sem.warnings {
         eprintln!("warning: {w}");

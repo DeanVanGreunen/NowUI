@@ -24,7 +24,7 @@ pub use state::{display_string, Event, EventKind, NoState, NowUiState, StateValu
 pub use style::{
     compute_effective, dropdown_metrics, slider_metrics, Align, AnimatableStyle, CursorIcon,
     Direction, Display, GridTrack, Position, Sizing, Style, StyleVariants, TextAlign, Transform2D,
-    Transition, DEFAULT_CONTROL_WIDTH,
+    Transition, DEFAULT_CONTROL_WIDTH, DROPDOWN_POPUP_MAX_H,
 };
 pub use tailwind::Easing;
 
@@ -70,6 +70,68 @@ mod tests {
         assert_eq!(ra.h, 30.0);
         assert_eq!(rb.y, 30.0, "second child stacks below the first");
         assert_eq!(rb.h, 50.0);
+    }
+
+    fn image_kind(width: u32, height: u32) -> NodeKind {
+        NodeKind::Image {
+            source: "test.png".to_string(),
+            decoded: Some(nowui_image::DecodedImage {
+                width,
+                height,
+                frames: vec![nowui_image::Frame { width, height, rgba: vec![0; (width * height * 4) as usize], delay_ms: 0 }],
+            }),
+            current_frame: 0,
+            frame_elapsed_ms: 0.0,
+            error: None,
+        }
+    }
+
+    /// Wraps `child` in a default-style root container — a layer's own
+    /// root always fills the given viewport regardless of its own style
+    /// (see `layout::solve`'s doc comment), so a node whose *own* intrinsic
+    /// sizing is under test needs to sit one level below the root, same as
+    /// every other sizing test in this module.
+    fn solved_child_rect(child_kind: NodeKind, child_style: Style, viewport: Size) -> Rect {
+        let mut ui = Ui::new();
+        let child = ui.push(Node::new(child_kind, child_style));
+        let root = ui.push(Node::new(NodeKind::Container, Style::default()));
+        ui.get_mut(root).children = vec![child];
+        ui.add_layer(root, "main");
+        layout::solve(&mut ui, viewport, &mut NullPainter);
+        ui.get(child).computed
+    }
+
+    #[test]
+    fn image_w_auto_scales_from_a_fixed_height_by_the_natural_aspect_ratio() {
+        // 400x200 natural (2:1) image, h fixed at 100px -> w should scale to 200px.
+        let style = Style { width: Sizing::Hug, height: Sizing::Fixed(100.0), ..Default::default() };
+        let rect = solved_child_rect(image_kind(400, 200), style, Size::new(800.0, 600.0));
+        assert_eq!(rect.h, 100.0);
+        assert_eq!(rect.w, 200.0, "2:1 aspect ratio preserved: 100px tall -> 200px wide");
+    }
+
+    #[test]
+    fn image_h_auto_scales_from_a_fixed_width_by_the_natural_aspect_ratio() {
+        // 400x200 natural (2:1) image, w fixed at 100px -> h should scale to 50px.
+        let style = Style { width: Sizing::Fixed(100.0), height: Sizing::Hug, ..Default::default() };
+        let rect = solved_child_rect(image_kind(400, 200), style, Size::new(800.0, 600.0));
+        assert_eq!(rect.w, 100.0);
+        assert_eq!(rect.h, 50.0, "2:1 aspect ratio preserved: 100px wide -> 50px tall");
+    }
+
+    #[test]
+    fn image_with_both_axes_auto_uses_its_raw_natural_size() {
+        let style = Style { width: Sizing::Hug, height: Sizing::Hug, ..Default::default() };
+        let rect = solved_child_rect(image_kind(64, 32), style, Size::new(800.0, 600.0));
+        assert_eq!((rect.w, rect.h), (64.0, 32.0));
+    }
+
+    #[test]
+    fn an_undecoded_image_takes_up_no_space() {
+        let kind = NodeKind::Image { source: "still-loading.png".to_string(), decoded: None, current_frame: 0, frame_elapsed_ms: 0.0, error: None };
+        let style = Style { width: Sizing::Hug, height: Sizing::Hug, ..Default::default() };
+        let rect = solved_child_rect(kind, style, Size::new(800.0, 600.0));
+        assert_eq!((rect.w, rect.h), (0.0, 0.0));
     }
 
     #[test]
@@ -205,17 +267,17 @@ mod tests {
         let mut ui = Ui::new();
 
         let leaf = ui.push(Node::new(
-            NodeKind::TreeViewItem { id: "leaf".to_string(), label: "Leaf".to_string(), collapsed: false, selected: false, checkbox: false },
+            NodeKind::TreeViewItem { id: "leaf".to_string(), label: "Leaf".to_string(), collapsed: false, selected: false, checkbox: false, show_folder_actions: false, icon: None },
             Style::default(),
         ));
         let child = ui.push(Node::new(
-            NodeKind::TreeViewItem { id: "child".to_string(), label: "Child".to_string(), collapsed: false, selected: false, checkbox: false },
+            NodeKind::TreeViewItem { id: "child".to_string(), label: "Child".to_string(), collapsed: false, selected: false, checkbox: false, show_folder_actions: false, icon: None },
             Style::default(),
         ));
         ui.get_mut(child).children = vec![leaf];
 
         let parent = ui.push(Node::new(
-            NodeKind::TreeViewItem { id: "parent".to_string(), label: "Parent".to_string(), collapsed: false, selected: false, checkbox: false },
+            NodeKind::TreeViewItem { id: "parent".to_string(), label: "Parent".to_string(), collapsed: false, selected: false, checkbox: false, show_folder_actions: false, icon: None },
             Style::default(),
         ));
         ui.get_mut(parent).children = vec![child];
@@ -462,5 +524,70 @@ mod tests {
 
         assert_eq!(ui.get(closed_menu).content_size, Size::default());
         assert_eq!(ui.get(no_children_menu).content_size, Size::default());
+    }
+
+    #[test]
+    fn gc_frees_an_orphaned_subtree_but_leaves_the_live_tree_untouched() {
+        let mut ui = Ui::new();
+        // A small live tree: root -> child -> grandchild.
+        let grandchild = ui.push(Node::new(NodeKind::Text { content: "gc".to_string() }, Style::default()));
+        let child = ui.push(Node::new(NodeKind::Text { content: "live".to_string() }, Style::default()));
+        ui.get_mut(child).children = vec![grandchild];
+        let root = ui.push(Node::new(NodeKind::Container, Style::default()));
+        ui.get_mut(root).children = vec![child];
+        ui.add_layer(root, "main");
+
+        // An orphaned subtree — never referenced by anything reachable from
+        // `root` (simulating what a `for`/`if` region rebuild leaves behind
+        // once it splices in a fresh replacement without freeing the old one).
+        let orphan_child = ui.push(Node::new(NodeKind::Text { content: "orphaned leaf".to_string() }, Style::default()));
+        let orphan_root = ui.push(Node::new(NodeKind::Text { content: "orphaned root".to_string() }, Style::default()));
+        ui.get_mut(orphan_root).children = vec![orphan_child];
+
+        ui.gc();
+
+        let NodeKind::Text { content } = &ui.get(child).kind else { panic!("live child must survive gc untouched") };
+        assert_eq!(content, "live");
+        let NodeKind::Text { content } = &ui.get(grandchild).kind else { panic!("live grandchild must survive gc untouched") };
+        assert_eq!(content, "gc");
+
+        assert_eq!(ui.get(orphan_root).kind, NodeKind::Container, "the orphaned subtree's root is swept to an empty tombstone");
+        assert!(ui.get(orphan_root).children.is_empty());
+        assert_eq!(ui.get(orphan_child).kind, NodeKind::Container, "the orphan's own child is swept too");
+    }
+
+    #[test]
+    fn gc_keeps_the_currently_focused_node_alive_even_if_nothing_else_points_at_it() {
+        let mut ui = Ui::new();
+        let detached_but_focused = ui.push(Node::new(NodeKind::TextInput {
+            label: "still editing".to_string(),
+            placeholder: String::new(),
+            masked: false,
+            cursor: 0,
+            selection_anchor: None,
+            ime_preview: String::new(),
+            highlight_spans: Vec::new(),
+        }, Style::default()));
+        let root = ui.push(Node::new(NodeKind::Container, Style::default()));
+        ui.add_layer(root, "main");
+        ui.focus = Some(detached_but_focused);
+
+        ui.gc();
+
+        let NodeKind::TextInput { label, .. } = &ui.get(detached_but_focused).kind else { panic!("focus must survive gc") };
+        assert_eq!(label, "still editing");
+    }
+
+    #[test]
+    fn gc_never_reuses_a_swept_nodes_id_for_a_later_push() {
+        let mut ui = Ui::new();
+        let orphan = ui.push(Node::new(NodeKind::Text { content: "gone".to_string() }, Style::default()));
+        let root = ui.push(Node::new(NodeKind::Container, Style::default()));
+        ui.add_layer(root, "main");
+
+        ui.gc();
+        let new_id = ui.push(Node::new(NodeKind::Text { content: "new".to_string() }, Style::default()));
+
+        assert_ne!(orphan, new_id, "a fresh push never lands on a swept slot — every NodeId stays permanently distinct");
     }
 }

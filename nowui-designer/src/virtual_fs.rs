@@ -189,6 +189,33 @@ fn entry_path(e: &PendingEntry) -> PathBuf {
     }
 }
 
+/// Opens the host OS's own file manager with `path` pre-selected — the
+/// context menu's own "Reveal in File Explorer" (`app.rs`'s
+/// `reveal_in_file_explorer`). One of the very few points this crate
+/// legitimately steps outside `.nowui`/pure-Rust territory into a raw OS
+/// command, same category `main.rs`'s own native open-file dialog already
+/// is. `path` must exist on disk — a still-pending (unflushed) virtual
+/// entry has nothing real to reveal yet.
+pub fn reveal_in_file_explorer(path: &Path) -> io::Result<()> {
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn()?;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open").arg("-R").arg(path).spawn()?;
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // No universal "select this file" convention on Linux file
+        // managers — opening the containing folder is the reasonable,
+        // widely-supported fallback.
+        let dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
+        std::process::Command::new("xdg-open").arg(dir).spawn()?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

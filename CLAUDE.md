@@ -191,12 +191,29 @@ recursive definitions with a depth cap.
 Text `Plain text, no interpolation`
 Text `Count: ${state.counter.count}!`          // literal text and ${...} freely mixed
 TextInput `` `Enter Username`                  // first backtick = current value, second = placeholder
+Button `${state.isSaving == true ? "Saving..." : "Save"}`   // ternary — see below
 ```
 
 `${var}` or a dotted state path (`${state.counter.count}`) is resolved at **runtime**, re-rendered
 every redraw by `App::resolve_templates` against live state — not baked in at parse time. An
 all-literal node's `templates` stays empty (no extra per-frame cost). An empty `` `` `` backtick
 is still meaningful — it holds a positional slot (e.g. `TextInput`'s label vs. placeholder).
+
+`${...}` can also hold a full ternary — `cond ? then : else`, where `cond` is the same `Expr`
+grammar `if`/`for` conditions already use (literals, dotted paths, comparisons, `&&`/`||`/`!`,
+`.length`), and `then`/`else` are themselves `Expr` (usually `"quoted strings"`, but a nested
+dotted path or ternary also works). `${state.foo}` alone still lowers to the same simple
+`TemplatePart::Var` shape it always has — the ternary machinery only engages once a `?` shows up.
+Implementation note: `nowui-core` can't hold a raw `Expr` (its own hard "no `nowui-syntax`
+dependency" rule), so a ternary-bearing backtick is kept in its original, un-lowered form in
+`nowui-runtime`'s own `Semantic::template_exprs` side table (keyed by `NodeId`) instead of being
+lowered into `nowui_core::TemplatePart` — evaluated fresh every redraw via `dynamic::eval_expr`,
+the exact same evaluator `if`/`for` conditions already use. A node with *any* ternary-bearing
+backtick renders *all* of its own backticks through this side table (not a mixed per-argument
+strategy) — `nowui_core::Node::templates` is left with harmless empty-`Lit` placeholders at those
+indices. A `Variable`-aliased or `for`-loop-scoped name inside a ternary is resolved against its
+scope once, at build time (`resolve_scoped_expr`) — same substitution a plain `Var` template part
+already gets.
 
 ### Styles
 
@@ -209,9 +226,24 @@ Text text-lg font-semibold text-blue-600
 Button hover:bg-blue-700 active:scale-95 sm:w-[440px] transition duration-150
 ```
 
-- `variant:` prefix (`hover:`, `focus:`, `active:`, `sm:`/`md:`/`lg:`/`xl:`/`2xl:`) folds into the
-  key string at parse time, split back out in the semantic pass. Only a single prefix is
-  supported — no stacked variants (`sm:hover:x`).
+- `variant:` prefix (`hover:`, `focus:`, `active:`, `disabled:`, `sm:`/`md:`/`lg:`/`xl:`/`2xl:`)
+  folds into the key string at parse time, split back out in the semantic pass. Only a single
+  prefix is supported — no stacked variants (`sm:hover:x`).
+- **`disabled:`** — any widget can carry a `{disabled: state.path}` binding (a live `bool`,
+  resolved every redraw into `Node::disabled`, same read-half-of-reactivity shape as `value`) plus
+  `disabled:`-prefixed styles applied while it's `true` — applied *after* (so overriding)
+  `hover:`/`focus:`/`active:` for whatever fields it touches:
+
+  ```nowui
+  Button `Save` disabled:text-[#FF0000] disabled:bg-[#FFFF00] {disabled: state.someDisabledBool}
+  ```
+
+  A disabled node's own bound events don't fire at all (`onClick`, `onMouseDown`, etc. — but not
+  `onLoad`, which isn't real user interaction), and its own state-toggling interaction
+  (`Checkbox`'s check, `Dropdown`/`Menu`/`Date`/`Time`/`DateTime`'s open-on-click, ...) doesn't
+  happen either — same as a real HTML `disabled` attribute. `text` is accepted as a short bracket
+  alias for `text-color` (matching `bg`'s own existing short-bracket-alias-for-`bg-color`
+  precedent), so `disabled:text-[#FF0000]` and `disabled:text-color-[#FF0000]` are equivalent.
 - A bracket value can itself be a `${state.path}` interpolation, but only when the *whole*
   bracket is the interpolation — `w-[${state.myWidth}]` works, `"10${x}px"` does not.
 - Sizing primitives that are NowUI's own (not Tailwind): `w-[fill]`, `w-[fill-2]` (flex weight
@@ -306,8 +338,54 @@ Grid grid grid-cols-2 gap-4 w-full {
   the grid's own cells.
 - Unrelated redraws (a hover, a transition tick) leave an unchanged region's node ids untouched —
   a `TextInput` inside one doesn't lose focus/cursor state for no reason.
-- Known limitation: no node-removal/GC. Rebuilding a region doesn't free its old arena nodes —
-  harmless (never painted/hit-tested again) but wasteful for a frequently-changing `for` list.
+- A rebuilt region's old arena nodes are never painted/hit-tested again, but they aren't left to
+  leak forever either — `Ui::gc()` (mark-and-sweep from every `Layer::root` plus `Ui::focus`) frees
+  their heap payload (label strings, an `Image`'s decoded pixels, an abandoned subtree's own
+  `Vec<NodeId>` children lists, ...). `nowui_runtime::App::redraw` and `nowui-designer`'s own
+  `Chrome::refresh` both call it once per redraw, right after `Semantic::refresh_dynamic_regions`
+  (the only point in a frame that can actually create new garbage). It deliberately does **not**
+  shrink `Ui::nodes` or reuse a swept node's own `NodeId` for a later `push` — every `NodeId` an
+  arena ever hands out stays permanently distinct, so holding one across a `gc()` call (a side
+  table keyed by `NodeId`, a cached id in a test, ...) is always safe: a stale one just now points
+  at an inert, empty `Container` tombstone instead of a dangling *or* — the real hazard a
+  slot-reuse scheme would risk — a different, unrelated live node. The arena `Vec`'s own length
+  still only grows, but that fixed per-slot overhead was never the actual cost this matters for.
+
+### `Variable` — local scope aliases
+
+`Variable name=value` declares a local alias, usable by every *later* sibling in the same body
+(and their descendants) — a `let`, not a widget: it produces no arena node of its own.
+
+```nowui
+layout: T {
+  Variable counters=state.counters
+  if counters {
+    Text `${counters.length}`
+  }
+}
+```
+
+- Parses with zero grammar changes — `Variable name=value` is just an ordinary widget use
+  (`kind: "Variable"`, one `NamedArg`), the same shape a custom layout's own params already use.
+  `Semantic::expand_children` special-cases the `"Variable"` kind and intercepts it before it ever
+  reaches `expand()`/`primitive()` — it never becomes an arena node, so it also never emits an
+  "unknown widget" warning.
+- The value is resolved **eagerly** against the scope so far — reusing the exact `resolve_scoped_path`
+  step a custom layout's own `bind_scope` already applies to its params — so `Variable b=a` (aliasing
+  an earlier `Variable`, or a layout param, not `state` directly) chains correctly rather than
+  capturing an unresolved bare name.
+- Because the alias is stored as a path, not a resolved value, reads through it stay live — `if
+  counters { ... }`/`${counters.field}` re-resolve `state.counters` fresh every redraw, the same as
+  a direct `state.*` reference would.
+- Works inside `for` bodies too: a loop's own `dynamic::substitute_loop_var` already rewrites a
+  `NamedArg` rooted at the loop variable (`substitute_named_arg`) before `expand_children` ever
+  sees `Variable x=row.value`, so the alias ends up pointing at that concrete iteration's own
+  indexed path, not the bare loop-local name.
+- `.length` (chars for a `Str`, item count for a `List`) resolves through a `Variable` alias inside
+  an `if`/`for` condition (`dynamic::eval_expr`'s own path resolution handles it) — but **not**
+  inside a plain `` `${...}` `` template, since `resolve::render_template` doesn't special-case
+  `.length` at all. That's a pre-existing gap shared by every `.length` template reference, not
+  something specific to `Variable`.
 
 ### Widgets
 
@@ -335,16 +413,61 @@ flag) switches to word-wrapped, vertically-scrolling multi-line editing; caret/s
 hard-line model (splits on `\n` only — a hard line that itself word-wraps still renders/edits
 correctly, but the overlay doesn't track the extra wrapped visual lines).
 
-**`Dropdown`** — first backtick is the placeholder, every backtick after it is an option:
+**`Dropdown`** — first backtick is the placeholder. Options are always real `DropdownItem`
+children (there is no legacy plain-string-backtick form):
 
 ```nowui
-Dropdown `Choose a theme` `Light` `Dark` `System` w-full border rounded {value: state.theme}
+Dropdown `Choose a person` w-full border rounded {
+  onSelect: state.onSelectPerson, values: state.people
+} {
+  DropdownItem `` `-- choose a person --` default-selected
+  DropdownItem `` `-- staff below --` disabled
+  DropdownItem `alice` `Alice`
+}
 ```
 
-The open option list **floats over the page** — it doesn't push later siblings down, isn't
-clipped by its container, and isn't reachable through normal hit-testing (dedicated popup-rect
-hit-test in the runtime). Styleable: `border-color`/`rounded`/`radius` on the box, `bg`/
-`text-color` on both box and popup panel.
+- **`DropdownItem`** (`` `id` `label` ``, plus the bare `default-selected`/`disabled` flags) is
+  read directly out of the `Dropdown`'s own children at build time — it's data consumed into the
+  `Dropdown`'s own `option_ids`/`options`/`option_disabled`/`static_items`, **never a real arena
+  node of its own** (the same "data only, never becomes an independent arena node" precedent
+  `Variable` already sets — not a real-child-tree widget like `Menu`/`MenuItem`). Static
+  `DropdownItem`s always render *above* whatever a `values` binding contributes.
+- **`disabled`**: a `DropdownItem` is disabled (greyed-out text, unselectable by click) either
+  explicitly (the bare `disabled` flag) or implicitly whenever its own id is blank (`` `` `` — a
+  common "-- choose one --" placeholder pattern). A disabled item can still be the *initial*
+  selection via `default-selected` — same "a disabled placeholder `<option>` can still be the
+  default" convention a real HTML `<select>`/React already has — only a *user click* on it is
+  blocked (`Node::select_dropdown_by_id`/`select_dropdown_by_value`, being programmatic rather
+  than a click, are **not** gated by `disabled`). A `values`-bound item can only be disabled via
+  a blank id — the plain `DropdownItem` struct a `values` binding expects has no `disabled` field
+  of its own to opt into.
+- **`{values: state.path}`** binds a live `Vec<DropdownItem>` — a Rust struct with `label`/`id`
+  string fields (`#[derive(NowUiState)] struct DropdownItem { label: String, id: String }`,
+  matching how any other `Vec<T: NowUiState>` crosses into a `for` loop's iterable). Re-resolved
+  every redraw (`nowui-runtime`'s `resolve_dropdown_values`) and appended after the static items.
+  Selection is preserved *by id* across a rebuild — if the previously-selected id no longer
+  exists in the new list, falls back to whichever static item declared `default-selected`, else
+  clears to the placeholder.
+- **`onSelect`** fires when an (enabled) option is picked (in addition to, not instead of, the
+  ordinary `{value: state.path}` two-way write-back, which gets the option's own id).
+  `Event::child_id`/`child_label` carry the just-selected item's own id/label — since a dropdown
+  option isn't a real arena node `event.node` could otherwise point at (`event.node` is the
+  `Dropdown` itself). `None` for every other event.
+- **`Node::select_dropdown_by_id(id)`**/**`select_dropdown_by_value(label)`** let a handler
+  change a `Dropdown`'s selection programmatically (not just read it, and not gated by
+  `disabled`) — e.g. from the `Dropdown`'s own `onClick`/`onLoad`, where `event.node` is the
+  `Dropdown` in question. Returns `false` (no-op) if this node isn't a `Dropdown` or no option
+  matches.
+- The open option list **floats over the page** — it doesn't push later siblings down, isn't
+  reachable through normal hit-testing (dedicated popup-rect hit-test in the runtime), and never
+  grows past `DROPDOWN_POPUP_MAX_H` (300px) tall — beyond that it clips and becomes vertically
+  scrollable (mouse wheel, plus a thin scrollbar — same visual convention `scroll-v` containers
+  already use, reusing `Node::scroll_offset`) instead of just growing to fit every option.
+  Styleable: `border-color`/`rounded`/`radius` on the box, `bg`/`text-color` on both box and
+  popup panel. The closed box's own caret is `FaChevronUp`/`FaChevronDown` (open/closed) from
+  the embedded `nowui-icons` library — see the `Icon` widget
+  section below for how that library is populated; a plain filled square if it isn't linked in
+  (e.g. a bare `nowui-core` test `Ui`).
 
 **`Menu`/`MenuItem`** — a clickable header whose child list is a **floating popup below the
 header** (same principle as `Dropdown`'s popup), but with real arena-node children instead of
@@ -383,7 +506,8 @@ ProgressBar w-full text-emerald-500 border-gray-200 {value: 82}
 floating picker popup, opened/closed by clicking the box like `Dropdown`/`Checkbox`. Styled
 **exactly like `TextInput`** — no built-in box border/background of its own; `bg-*`/`border-*`/
 `rounded-*`/`p-*`/`h-*` etc. are the *only* thing drawing the closed box (see `paint_picker_box`),
-same as a plain `TextInput`:
+same as a plain `TextInput`. Its own icon glyph is `FaChevronUp`/`FaChevronDown` (open/closed),
+same convention and fallback as `Dropdown`'s caret above:
 
 ```nowui
 Date `Choose a date` w-full bg-white border rounded p-[10px] {
@@ -458,6 +582,138 @@ DateTime `Choose both` w-full bg-white border rounded p-[10px] {
   accent palette — hover shows a light-indigo highlight, a held mouse-button shows a darker one,
   computed live each redraw from `Ui::cursor`/`Ui::mouse_down` (these hand-drawn controls aren't
   real per-control arena nodes, so they can't carry their own `hover:`/`active:` style variants).
+
+**`Image`** — a local file, `#`/relative-path-resolved local file, or a `http://`/`https://`
+network URL, decoded via the `nowui-image` crate (png/gif/jpeg/bmp/webp — the `image` crate under
+the hood, no `nowui-core` dependency, same "shared preprocessing, no renderer coupling" shape as
+`nowui-text`):
+
+```nowui
+Image `assets/logo.png` w-[200px] h-[auto]                       // relative to this .nowui file
+Image `../shared/banner.jpg` w-[auto] h-[150px]
+Image `https://example.com/avatar.png` w-[64px] h-[64px]         // never bundled, always live
+Image `assets/spinner.gif` w-[80px] h-[80px] loop                // loops playback; omit `loop`
+                                                                   // to hold on the last frame
+```
+
+- **Relative local paths** are resolved by the *loader* (`nowui-runtime/src/loader.rs`'s
+  `resolve_image_paths`), relative to the `.nowui` file that wrote them — the loader is the only
+  pipeline stage that still has per-file directory context before `#`-imports flatten everything
+  into one shared `Vec<Node>` (same reasoning `#` imports themselves already use).
+- **`w-[auto]`/`h-[auto]`** reuse `Sizing::Hug` (no new sizing variant) — `NodeKind::Image`'s own
+  `measure()` arm (`nowui-core/src/layout.rs`) scales the auto axis from the image's natural
+  aspect ratio, but only when the *other* axis is `Sizing::Fixed`; a `Percent`/`Fill` other-axis
+  is a known, documented scope limit (only resolved at arrange time, too late for this measure-
+  pass computation). Both axes fixed stretches the image, aspect ratio not preserved.
+- **Network images are never bundled** ("they are dynamic" — always a live GET, every time the
+  owning node is created, never cached to disk or embedded at compile time). The fetch runs on a
+  background `std::thread` (`nowui-runtime/src/network_image.rs`), off the render thread — a
+  non-200 status, a transport error, and a decode failure are all reported the same way, through
+  `NodeKind::Image::error`. `App::sync_network_image_loads` polls in-flight fetches once per
+  redraw and starts a new one for any `http(s)://` node it finds still in the "loading" state
+  (`decoded: None, error: None` — the same representation used while a local file simply hasn't
+  been decoded yet, per `NodeKind::Image`'s own doc comment).
+- **`loop`** (a bare style flag, `Style::loop_playback`) only affects an animated GIF's playback:
+  once its frames have played through once, `loop` set wraps back to frame 0; unset, it just holds
+  on the last frame. Meaningless for any other format, or a single-frame GIF. Frame advancement
+  (`nowui-runtime/src/resolve.rs`'s `advance_image_animations`) is driven by real per-frame delay
+  data from the decoded GIF (`Frame::delay_ms`), ticked forward by `FRAME_INTERVAL` every redraw —
+  consistent with this engine's fixed-60fps, not event-driven, redraw loop.
+- **`.nowdat` bundling** (opt-in, alternative to loading straight off disk): the `nowui-bundle`
+  CLI packs a directory of image files into one `bundled.nowdat` sidecar archive —
+  `cargo run -p nowui-bundle -- <assets-dir> <output>/bundled.nowdat`, keyed by each file's own
+  **basename** (`logo.png`, not its full relative path — a deliberate simplification; two
+  differently-nested files sharing a basename is a build-time error the tool refuses to bundle,
+  not a silent collision). At runtime, `nowui-runtime`'s `bundled_assets.rs` looks for
+  `bundled.nowdat` next to the running executable (`std::env::current_exe()`'s own directory,
+  read once and cached for the process's lifetime) and tries a local `Image` source's basename
+  against it *before* falling back to a disk read — so switching a shipped app from "assets on
+  disk next to the exe" to "assets packed into one file" needs no change to `.nowui` source at
+  all, just running `nowui-bundle` once as a packaging step and shipping the resulting
+  `bundled.nowdat` alongside the executable instead of the raw asset files. This is the "reduce
+  the compiled executable's own file size for an app with a lot of large images" half of the
+  feature — unlike `#[nowui(view(...))]`'s `include_str!`-based `.nowui` *source* bundling, image
+  bytes are never baked into the binary itself via `include_bytes!`.
+
+**`Icon`** — a single icon from the embedded
+[react-icons](https://github.com/react-icons/react-icons) library, referenced by the exact export
+name react-icons itself uses (`FaUser`, `MdSettings`, `BsStar`, `IoRocket`, ...):
+
+```nowui
+Icon `FaUser` w-[48px] h-[48px]
+Icon `FaHeart` w-[48px] h-[48px] line-color-[#dc2626] {onClick: state.likePost}
+```
+
+- **Sourced from `nowui-icons-gen`** (a dev tool, not shipped in any app binary), which parses
+  react-icons' own generated JS modules — each set (`fa`, `md`, `bs`, ...) ships as one
+  `GenIcon({"tag":"svg","attr":{...},"child":[...]})` call per icon, and that argument is itself
+  valid JSON (an SVG-DOM-shaped tree) — no Node/npm dependency needed to read it. The tool
+  reconstructs real SVG XML from that tree and packs every icon into one `.nowdat` archive
+  (`nowui-icons/assets/icons.nowdat`, keyed by export name), regenerated via
+  `cargo run -p nowui-icons-gen -- <extracted-react-icons-npm-package-dir> nowui-icons/assets/icons.nowdat [set...]`
+  (sets default to `fa fa6 md bs io5` — the currently-bundled sets; add another set name to pull
+  in more of the library later).
+- **`nowui-icons`** embeds that archive via `include_bytes!` (compile-time, same "baked into the
+  binary" precedent `#[nowui(view(...))]` sets for `.nowui` source) and does the actual
+  SVG-to-RGBA rasterization via `resvg`/`usvg` (built on `tiny-skia`) — recoloring `currentColor`
+  (react-icons' own SVGs set `fill="currentColor" stroke="currentColor"` at the root) to the
+  resolved tint color textually before parsing, then rasterizing to a fixed `DEFAULT_RASTER_SIZE`
+  square (128px) once per `(name, color)` pair, cached for the process's lifetime.
+- **Not a `nowui-core` dependency** — `nowui-icons` pulls in `resvg`/`tiny-skia` transitively,
+  which would violate `nowui-core`'s "no chumsky/tiny-skia/vello" hard rule. `nowui-runtime`'s
+  semantic pass calls `nowui_icons::icon_frame(name, color)` and hands `nowui-core` only the
+  already-rasterized `nowui_image::Frame` — the exact same shape `Painter::draw_image` already
+  consumes for `Image`, so `NodeKind::Icon` paints through the identical path with zero new
+  `Painter` methods.
+- **Recolor**: `line-color-[#rrggbb]` (`fill-color` is an accepted alias — reads more naturally
+  for the hover case below, both set the same `Style::line_color` field), falling back to
+  `text-color` (whose own default is black). Baked into the rasterized pixels — but, unlike
+  `Image`'s decode-once-at-build-time `source`, **re-resolved every redraw** from the node's
+  *effective* style (`nowui-runtime`'s `resolve_icon_colors`, run after hover/focus/active
+  variants and transitions are applied — see `App::apply_dynamic_styles`), so
+  `hover:fill-color-[#ffff00]` and `hover:fill-color-[${state.hoverColorValue}]` (a `${state.
+  path}` bracket inside a hover variant — resolved by `resolve_dynamic_styles`, which walks
+  `variants.hover`/`focus`/`active`'s own `dynamic` map in addition to the base style's) both
+  actually change what's painted while hovered. Looks wasteful (re-rasterizing every `Icon` every
+  redraw) but isn't: `nowui_icons::icon_frame` caches by `(name, color)` for the process's
+  lifetime, so an unhovered icon's own call is just a cache hit plus one small `Vec` clone.
+- **`w-[auto]`/`h-[auto]`** work the same way `Image` already does (aspect-ratio-from-the-other-
+  fixed-axis, reusing `Sizing::Hug` — see `Image`'s own bullet above) — an icon's rasterized frame
+  is always square, so this mostly matters when only one axis is set.
+- An unknown name (not in the currently-bundled sets) is a disclosed warning (`error` on the
+  node, surfaced via `eprintln!` like every other semantic-pass warning), not a silent blank.
+- Accepts the same generic event bindings every widget does — `onClick`, `onMouseDown`,
+  `onMouseUp`, `onKeyDown`, `onKeyUp`, `onKeyPress` — no `Icon`-specific dispatch code exists;
+  `apply_generic_bindings` doesn't special-case any widget kind.
+- **`Dropdown`'s own caret and `Date`/`Time`/`DateTime`'s own closed-box icon** are drawn as
+  `FaChevronUp` (open) / `FaChevronDown` (closed) from this same embedded library. **`TreeView`'s
+  own disclosure indicator** uses a different, file-tree-conventional pairing instead —
+  `FaChevronDown` (expanded) / `FaChevronRight` (collapsed) — since "closed points at its hidden
+  content, open points down into it" reads better for a tree than the up/down-for-open/closed
+  convention those other widgets use. All three glyphs are rasterized once at a fixed neutral
+  color (`CHEVRON_COLOR`, gray-700) and stashed on `Ui::chevron_up`/`chevron_down`/`chevron_right`
+  before the first paint, since `nowui-core` can't call `nowui-icons` itself. `nowui-runtime`'s
+  `run_ast` does this for any app built via `run`/`run_path`; `nowui-designer` builds its `Ui`s by
+  hand (`Semantic::build` directly, not `run_ast`) so it duplicates the same population itself, in
+  both `chrome.rs`'s `Chrome::load` (the designer's own chrome, e.g. its project-explorer
+  `TreeView`) and `preview.rs`'s `PreviewDoc::reload_with_overrides` (whatever `.nowui` file is
+  being live-previewed) — each with its own local `CHEVRON_COLOR` copy, since `nowui-runtime`'s is
+  private. A fixed color rather than each widget's own `text-color` is a deliberate scope
+  simplification (matching precedent: a `Date`/`Time`/`DateTime` popup's own internals already use
+  one fixed palette regardless of the widget's own styling) — a real per-widget-tinted chevron
+  would mean rasterizing a fresh chevron per distinct color used in one tree, threaded per-node
+  rather than once per app. Falls back to the old plain-square/triangle glyph if the relevant
+  `Ui::chevron_*` field is `None` (e.g. a bare `nowui-core` test `Ui` with no runtime attached, or
+  a harness that forgot to populate it — the "black box" symptom this dual population now fixes).
+- **`TreeViewItem`'s own opt-in per-row icon** — `tree-icon-[FaFolder]` (any name from this same
+  embedded library) draws that glyph at the row's own left edge, right after the disclosure
+  triangle/checkbox and before the label (`Style::tree_icon`, `NodeKind::TreeViewItem::icon`).
+  Unlike the fixed chevron glyphs above, this is genuinely per-row/per-app — resolved every redraw
+  by `nowui-runtime`'s `resolve_tree_icons` (same `nowui_icons::icon_frame(name, color)` +
+  process-lifetime cache shape `resolve_icon_colors` already uses for the standalone `Icon`
+  widget), tinted with the row's own effective `text_color`. Empty (the default) draws nothing —
+  a generic `TreeView` has no built-in notion of "this row is a folder"; an app decides that.
+  `nowui-designer`'s own project explorer uses this for `FaFolder`/`FaFile` row icons.
 
 **`scroll-h`/`scroll-v`** — clips overflow along that axis, mouse wheel pans it:
 
@@ -846,6 +1102,21 @@ Two properties are load-bearing and shape everything else in this document:
 - **`winit`** (**0.30**) — windowing + event loop.
 - **`softbuffer`** (0.4) — presents the rasterized `Pixmap` to the OS window, `Backend::Cpu` only.
 - **`syn` / `quote` / `proc-macro2`** (2 / 1 / 1) — power the `#[derive(NowUiState)]` proc-macro.
+- **`image`** (0.25) — png/gif/jpeg/bmp/webp decoding for `nowui-image`, the shared,
+  renderer-agnostic `Image` widget preprocessing crate (no `nowui-core` dependency, same shape as
+  `nowui-text`).
+- **`ureq`** (3, rustls-only feature set — no cookies/json/multipart/native-tls) — the
+  `nowui-runtime`-only, synchronous HTTP client behind `network_image.rs`'s background-thread
+  fetch for `Image`'s `http(s)://` sources. Deliberately not `reqwest`/`tokio` — a plain blocking
+  GET on its own `std::thread` needs no async runtime.
+- **`resvg`/`usvg`** (0.47, `default-features = false` — no `text`/`system-fonts`, since every
+  bundled icon is plain path/shape geometry with no text elements) — `nowui-icons`-only SVG
+  parsing and rasterization for the `Icon` widget, built on `tiny-skia` (a *different* `tiny-skia`
+  version than `nowui-render`'s own — resvg pulls in its own; the two never need to interoperate,
+  since `nowui-icons` only ever exports plain `Vec<u8>` RGBA bytes across its own crate boundary).
+  Not a `nowui-core` dependency — see the `Icon` widget section above for why.
+- **`serde_json`** (1) — `nowui-icons-gen`-only, to parse the `GenIcon({...})` JSON blobs
+  react-icons' own generated JS modules embed (see the `Icon` widget section above).
 
 **winit's version is load-bearing.** The app harness uses `ApplicationHandler` + `run_app`, which
 live in `winit::application` / `winit::event_loop` as of **0.30** — they do not exist on 0.29 or

@@ -99,6 +99,36 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_ternary_interpolation_in_a_backtick_template() {
+        let src = r#"layout: T { Button `${state.isSaving == true ? "Saving..." : "Save"}` }"#;
+        let ast = parse(src).expect("should parse");
+        let Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
+        let Node::Widget { string_args, .. } = &children[0] else { panic!() };
+        assert_eq!(string_args[0].parts.len(), 1);
+        let TplPart::Expr(Expr::Ternary(cond, then_branch, else_branch)) = &string_args[0].parts[0] else {
+            panic!("expected a ternary Expr part, got {:?}", string_args[0].parts[0]);
+        };
+        assert_eq!(
+            **cond,
+            Expr::Cmp(Box::new(Expr::Path(vec!["state".into(), "isSaving".into()])), CmpOp::Eq, Box::new(Expr::Bool(true)))
+        );
+        assert_eq!(**then_branch, Expr::Str("Saving...".into()));
+        assert_eq!(**else_branch, Expr::Str("Save".into()));
+    }
+
+    #[test]
+    fn a_bare_path_interpolation_still_lowers_to_tplpart_var() {
+        // The common case (no `?`/comparison at all) must keep producing
+        // the simple `Var(String)` shape, not get wrapped in `Expr::Path`
+        // — `interp()`'s own job is to special-case exactly this.
+        let src = "layout: T { Text `${state.counter.count}` }";
+        let ast = parse(src).expect("should parse");
+        let Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
+        let Node::Widget { string_args, .. } = &children[0] else { panic!() };
+        assert_eq!(string_args[0].parts, vec![TplPart::Var("state.counter.count".into())]);
+    }
+
+    #[test]
     fn parses_if_else_if_else_chain() {
         let src = r#"
             layout: T {

@@ -123,12 +123,23 @@ fn import_directive() -> impl Parser<char, Node, Error = Simple<char>> + Clone {
         .map(|(chars, _): (Vec<char>, _)| Node::Import { path: chars.into_iter().collect::<String>().trim().to_string() })
 }
 
-/// `${name}` or `${a.b.c}` (a dotted state path, e.g. `${state.counter.count}`).
+/// `${name}` / `${a.b.c}` (a dotted state path, e.g. `${state.counter.count}`)
+/// — the common case, kept as the simple `TplPart::Var` shape it always
+/// was — or a full `expr()`, most usefully a ternary (`${cond ? "a" : "b"}`,
+/// see `Expr::Ternary`). Anything that isn't a bare dotted path is kept as
+/// `TplPart::Expr` instead, un-lowered — `nowui-core` can't hold a raw
+/// `Expr` (see its own "no chumsky"/no-`nowui-syntax`-dependency hard
+/// rule), so a template containing one of these is resolved from its
+/// original AST form by `nowui-runtime`'s `Semantic::template_exprs` side
+/// table instead (see that field's own doc comment).
 fn interp() -> impl Parser<char, TplPart, Error = Simple<char>> + Clone {
     just("${")
-        .ignore_then(text::ident().separated_by(just('.')).at_least(1))
+        .ignore_then(expr())
         .then_ignore(just('}'))
-        .map(|segs: Vec<String>| TplPart::Var(segs.join(".")))
+        .map(|e| match e {
+            Expr::Path(segs) => TplPart::Var(segs.join(".")),
+            other => TplPart::Expr(other),
+        })
 }
 
 /// A backtick string literal with embedded `${...}`. Empty `` is allowed.
@@ -186,8 +197,9 @@ fn quoted_string() -> impl Parser<char, String, Error = Simple<char>> + Clone {
         .then_ignore(just('"'))
 }
 
-/// A boolean/comparison expression — an `if` condition or a `for` iterable.
-/// Precedence, loosest to tightest: `||` < `&&` < comparison < unary `!` <
+/// A boolean/comparison expression — an `if` condition, a `for` iterable, or
+/// (via `interp()`) a backtick template's `${...}` interpolation. Precedence,
+/// loosest to tightest: ternary `?:` < `||` < `&&` < comparison < unary `!` <
 /// atom (literal, dotted path, or a parenthesized sub-expression). A single
 /// comparison per level (`a < b < c` isn't chained) matches how most small
 /// expression languages avoid the ambiguity of what chained comparisons
@@ -230,9 +242,21 @@ fn expr() -> impl Parser<char, Expr, Error = Simple<char>> + Clone {
             .then(pad(just("&&")).ignore_then(cmp).repeated())
             .map(|(first, rest)| rest.into_iter().fold(first, |acc, r| Expr::And(Box::new(acc), Box::new(r))));
 
-        and.clone()
+        let or = and
+            .clone()
             .then(pad(just("||")).ignore_then(and).repeated())
-            .map(|(first, rest)| rest.into_iter().fold(first, |acc, r| Expr::Or(Box::new(acc), Box::new(r))))
+            .map(|(first, rest)| rest.into_iter().fold(first, |acc, r| Expr::Or(Box::new(acc), Box::new(r))));
+
+        // `cond ? then : else` — the loosest-binding operator, so
+        // `a || b ? c : d` parses as `(a || b) ? c : d`. `then`/`else` are
+        // themselves full `expr()`s (via the outer `recursive`), so a
+        // nested ternary or dotted-path branch both work.
+        or.clone()
+            .then(pad(just('?')).ignore_then(expr.clone()).then(pad(just(':')).ignore_then(expr.clone())).or_not())
+            .map(|(cond, rest)| match rest {
+                Some((then_e, else_e)) => Expr::Ternary(Box::new(cond), Box::new(then_e), Box::new(else_e)),
+                None => cond,
+            })
     })
 }
 

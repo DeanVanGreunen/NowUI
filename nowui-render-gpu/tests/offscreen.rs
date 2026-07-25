@@ -232,6 +232,19 @@ fn nested_opacity_composes_multiplicatively_matching_the_cpu_reference() {
 }
 
 #[test]
+fn draws_an_image_matching_the_cpu_reference() {
+    // A solid-red 2x2 source frame stretched to a 40x40 destination rect.
+    let frame = nowui_image::Frame { width: 2, height: 2, rgba: vec![RED.r, RED.g, RED.b, 255].repeat(4), delay_ms: 0 };
+    let draw = |p: &mut dyn Painter| p.draw_image(&frame, Rect::new(20.0, 20.0, 40.0, 40.0));
+    let gpu = render_gpu(W, H, |p| draw(p));
+    let cpu = render_cpu(W, H, |p| draw(p));
+
+    assert_close(pixel_at(&gpu, W, 40, 40), pixel_at(&cpu, W, 40, 40), TOL, "inside the drawn image");
+    assert_close(pixel_at(&gpu, W, 40, 40), (RED.r, RED.g, RED.b), TOL, "gpu image matches the intended color");
+    assert_close(pixel_at(&gpu, W, 5, 5), (WHITE.r, WHITE.g, WHITE.b), TOL, "outside the image, still background");
+}
+
+#[test]
 fn draws_text_matching_the_cpu_reference_in_size_and_position() {
     let style = nowui_core::TextStyle {
         color: Color { r: 0, g: 0, b: 0, a: 255 },

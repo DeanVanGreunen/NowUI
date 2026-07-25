@@ -42,6 +42,13 @@ pub const EVENT_BINDING_KEYS: &[&str] = &[
     // `NodeKind::TreeView`'s own doc comment for why.
     "onNodeCollapsed",
     "onNodeUncollapsed",
+    // `TreeView`: fires on the `TreeViewItem` whose own row's add-file/
+    // add-folder action icon (the `folder-actions` bare style flag — see
+    // `Style::show_folder_actions`/`NodeKind::TreeViewItem::
+    // show_folder_actions`) was just clicked. `event.node` is that item,
+    // same mechanism as `onNodeCollapsed` above.
+    "onAddFile",
+    "onAddFolder",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -109,9 +116,49 @@ pub enum NodeKind {
     /// not reachable through normal rect-based hit-testing, so
     /// `nowui-runtime`'s click handler checks `find_open_dropdown_popup_at`
     /// before falling back to the ordinary hit test.
+    ///
+    /// `options`/`option_ids`/`option_disabled` are the actual rendered
+    /// list, in order, always the same length — `option_ids[i]` is
+    /// `options[i]`'s identity (a `DropdownItem`'s own `id`). Rebuilt from
+    /// `static_items` plus a live `{values: state.path}` binding (a
+    /// `Vec<DropdownItem>` — `{label, id}` — see `nowui-runtime`'s
+    /// `resolve_dropdown_values`) every redraw when that binding is
+    /// present; otherwise built once, at node-creation time, from
+    /// `static_items` and never touched again.
+    ///
+    /// An option is **disabled** (greyed out, unselectable by click, but
+    /// still eligible to be the *initial* selection via `default-selected`
+    /// — same "a disabled placeholder `<option>` can still be the default"
+    /// convention a real HTML `<select>`/React already has) when its own
+    /// `id` is blank (`` `` ``, `DropdownItem`'s own first backtick left
+    /// empty — a common "-- choose one --" placeholder pattern) or, for a
+    /// static item only, its own `DropdownItem` declared the bare
+    /// `disabled` flag explicitly. A `values`-bound item can only be
+    /// disabled via a blank id — the plain `DropdownItem` struct a
+    /// `values` binding expects (`{label, id}`) has no `disabled` field of
+    /// its own to opt into.
     Dropdown {
         placeholder: String,
         options: Vec<String>,
+        option_ids: Vec<String>,
+        option_disabled: Vec<bool>,
+        /// `(id, label, disabled)` from literal `DropdownItem` children
+        /// written directly in `.nowui` source (see `nowui-runtime`'s
+        /// `semantic.rs` `"Dropdown"` primitive arm) — always rendered
+        /// *above* whatever a `values` binding contributes, every time the
+        /// list is rebuilt. `disabled` here is the item's own *explicit*
+        /// `disabled` flag only — the blank-id rule is applied uniformly
+        /// (static or dynamic) wherever `options`/`option_ids`/
+        /// `option_disabled` are actually built.
+        static_items: Vec<(String, String, bool)>,
+        /// The `id` of whichever static `DropdownItem` declared the bare
+        /// `default-selected` flag, if any — the initial `selected` index,
+        /// and what a `values`-driven rebuild falls back to selecting when
+        /// the previously-selected id no longer exists in the new list.
+        /// `None` for a `values`-bound item — the plain `DropdownItem`
+        /// struct a `values` binding expects (`{label, id}`) has no such
+        /// field to carry one.
+        default_selected_id: Option<String>,
         selected: Option<usize>,
         open: bool,
     },
@@ -230,6 +277,57 @@ pub enum NodeKind {
         collapsed: bool,
         selected: bool,
         checkbox: bool,
+        /// `folder-actions` bare flag — draws the add-file/add-folder
+        /// action icons (`Ui::icon_add_file`/`icon_add_folder`) at the
+        /// row's own right edge, right next to the label. See `Style::
+        /// show_folder_actions`'s own doc comment.
+        show_folder_actions: bool,
+        /// The rasterized glyph named by `Style::tree_icon`, if any —
+        /// refreshed every redraw by `nowui-runtime`'s `resolve_tree_icons`
+        /// (this crate can't call `nowui-icons` itself). `None` while
+        /// `tree_icon` is empty, or before the first resolve pass has run.
+        icon: Option<nowui_image::Frame>,
+    },
+    /// A local file, `#`/relative-path-resolved image, or a `http://`/
+    /// `https://` network URL. `source` is kept verbatim (the literal
+    /// backtick text) for diagnostics/reload; the decoded pixels live in
+    /// `decoded` once loading succeeds — `None` while still loading
+    /// (network) or if decoding failed (`error` then holds why, painted as
+    /// nothing rather than panicking).
+    ///
+    /// `current_frame`/`frame_elapsed_ms` are this node's own GIF playback
+    /// position — advanced each redraw by `nowui-runtime` against real
+    /// elapsed time, wrapping back to frame 0 only when `Style::
+    /// loop_playback` (the bare `loop` flag) is set; otherwise playback
+    /// just holds on the last frame. Meaningless (`decoded.frames.len() ==
+    /// 1`) for anything but an animated GIF.
+    Image {
+        source: String,
+        decoded: Option<nowui_image::DecodedImage>,
+        current_frame: usize,
+        frame_elapsed_ms: f32,
+        error: Option<String>,
+    },
+    /// A single icon from the embedded `nowui-icons` react-icons library
+    /// (`Icon `FaUser``, `Icon `MdSettings``, ... — the exact export name
+    /// react-icons itself uses for that icon). `nowui-icons` rasterizes it
+    /// once, at node-build time, into `decoded` — a single `nowui_image::
+    /// Frame` (never animated, unlike `Image`, so no `current_frame`/
+    /// `frame_elapsed_ms` — reusing `Image`'s exact fields here would be
+    /// misleading). `error` holds why (an unknown icon name, or a malformed
+    /// embedded SVG — shouldn't happen for a name that exists in the
+    /// library, but not a panic either way) when `decoded` is `None`.
+    ///
+    /// Recolored to `Style::line_color` (falling back to `Style::
+    /// text_color`, then a default near-black — see `nowui-runtime`'s
+    /// `semantic.rs`) at that same build time; changing the color
+    /// dynamically after the node exists doesn't re-tint an
+    /// already-rasterized icon, the same documented limitation `Image`
+    /// already has for its own decode-once behavior.
+    Icon {
+        name: String,
+        decoded: Option<nowui_image::Frame>,
+        error: Option<String>,
     },
 }
 
@@ -273,6 +371,27 @@ pub struct Node {
     /// `value_path`. Empty (unbound) on every other widget kind.
     pub min_year_path: Vec<String>,
     pub max_year_path: Vec<String>,
+    /// `{values: state.path}` on `Dropdown` — a live `Vec<DropdownItem>`
+    /// (`{label, id}`, matching whatever the bound `NowUiState` field's own
+    /// item type derives) resolved every redraw by `nowui-runtime`'s
+    /// `resolve_dropdown_values` into `NodeKind::Dropdown::options`/
+    /// `option_ids`, appended after `static_items`. Empty (unbound) on
+    /// every other widget kind, and on a `Dropdown` with only static
+    /// `DropdownItem` children / legacy string options.
+    pub values_path: Vec<String>,
+    /// `{disabled: state.path}` — generic across every widget kind (any
+    /// widget can carry one, same "unused if the kind doesn't read it"
+    /// convention `value_path` already has), a live `bool` resolved every
+    /// redraw by `nowui-runtime`'s `resolve_disabled` into `Node::disabled`
+    /// below. Empty (unbound) means never disabled.
+    pub disabled_path: Vec<String>,
+    /// This frame's resolved disabled state (from `disabled_path`, or
+    /// `false` if unbound) — feeds `compute_effective`'s `disabled:`
+    /// variant overlay (see `StyleVariants::disabled`) and gates click
+    /// dispatch (`nowui-runtime`'s `App::handle_click`/`dispatch_event`
+    /// both no-op entirely on a disabled node, same as a real HTML
+    /// `disabled` attribute).
+    pub disabled: bool,
     /// `{onClick: ..., onMouseMove: ..., ...}` — see `EVENT_BINDING_KEYS`.
     /// Parsed and stored generically on every widget by the semantic pass;
     /// dispatched each frame by `nowui-runtime`'s `App::dispatch_event` to
@@ -324,10 +443,48 @@ impl Node {
             value_path: Vec::new(),
             min_year_path: Vec::new(),
             max_year_path: Vec::new(),
+            values_path: Vec::new(),
+            disabled_path: Vec::new(),
+            disabled: false,
             events: HashMap::new(),
             templates: Vec::new(),
             dirty: true,
             on_load_delay_secs: 0.0,
+        }
+    }
+
+    /// For a `NodeKind::Dropdown`, selects the option whose `id` (its real
+    /// identity — a `DropdownItem`'s own `id`, or the label itself for a
+    /// legacy plain-string option, see `NodeKind::Dropdown`'s own doc
+    /// comment) matches `id`. Returns `false` (no-op) if this node isn't a
+    /// `Dropdown`, or no option has that id — lets a handler (`event.node`
+    /// is the `Dropdown` itself when one of its own events fires) change
+    /// the selection programmatically, not just read it.
+    pub fn select_dropdown_by_id(&mut self, id: &str) -> bool {
+        let NodeKind::Dropdown { option_ids, selected, .. } = &mut self.kind else { return false };
+        match option_ids.iter().position(|i| i == id) {
+            Some(idx) => {
+                *selected = Some(idx);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Same as `select_dropdown_by_id`, but matches against the option's
+    /// display label (`options`) instead of its id — useful for a legacy
+    /// plain-string `Dropdown` authored via extra backticks, where the
+    /// label *is* the only identity an option has (though `option_ids[i]
+    /// == options[i]` there too, so `select_dropdown_by_id` works
+    /// identically in that case).
+    pub fn select_dropdown_by_value(&mut self, value: &str) -> bool {
+        let NodeKind::Dropdown { options, selected, .. } = &mut self.kind else { return false };
+        match options.iter().position(|o| o == value) {
+            Some(idx) => {
+                *selected = Some(idx);
+                true
+            }
+            None => false,
         }
     }
 }
@@ -389,6 +546,32 @@ pub struct Ui {
     /// Reset to `((0,0), (0,0))` whenever no picker popup is open.
     pub page_scroll_min: Point,
     pub page_scroll_max: Point,
+    /// A rasterized `FaChevronUp`/`FaChevronDown`/`FaChevronRight` glyph,
+    /// supplied once by the runtime before the first paint (see `nowui-
+    /// runtime`'s `run_ast`, and `nowui-designer`'s own equivalent
+    /// population in `chrome.rs`) — read by `paint`'s `Dropdown`/`Date`/
+    /// `Time`/`DateTime` closed-box indicator (`chevron_up`/`chevron_down`,
+    /// open/closed) and `TreeView`'s disclosure indicator (`chevron_down`/
+    /// `chevron_right`, expanded/collapsed — the conventional file-tree
+    /// pairing, distinct from the up/down one those other widgets use)
+    /// instead of their old plain-square glyph. `None` (the `Default`
+    /// value) falls back to that plain-square glyph — this crate can't
+    /// rasterize an icon itself (see its own "no chumsky/tiny-skia/vello"
+    /// hard rule: `nowui-icons` pulls in `resvg`/`tiny-skia` transitively),
+    /// so it's handed an already-rasterized `nowui_image::Frame`, the same
+    /// shape `Painter::draw_image` already consumes for `Image`/`Icon`.
+    /// Same "runtime-owned state paint reads, not part of the widget tree"
+    /// category as `cursor`/`mouse_down` above.
+    pub chevron_up: Option<nowui_image::Frame>,
+    pub chevron_down: Option<nowui_image::Frame>,
+    pub chevron_right: Option<nowui_image::Frame>,
+    /// A rasterized `FaFileCirclePlus`/`FaFolderPlus` glyph, same population
+    /// convention as `chevron_up`/`chevron_down`/`chevron_right` above —
+    /// read by `paint`'s `TreeViewItem` row for its `show_folder_actions`
+    /// add-file/add-folder action icons, falling back to a small hand-drawn
+    /// plus-in-square glyph when `None`.
+    pub icon_add_file: Option<nowui_image::Frame>,
+    pub icon_add_folder: Option<nowui_image::Frame>,
 }
 
 impl Ui {
@@ -400,6 +583,68 @@ impl Ui {
         let id = NodeId(self.nodes.len() as u32);
         self.nodes.push(node);
         id
+    }
+
+    /// Frees the heap payload of every arena node **not** currently
+    /// reachable from a layer root (or `focus`) — the mark-and-sweep answer
+    /// to this crate's own long-documented "no node-removal/GC" limitation:
+    /// a `for`/`if` dynamic region rebuild (`nowui-runtime`'s `Semantic::
+    /// refresh_dynamic_regions`) never freed its old, now-orphaned subtree
+    /// before, so a frequently-changing region (a live search-result list,
+    /// a file explorer whose active-row highlight changes on every click,
+    /// ...) leaked a little more arena memory on every single rebuild for
+    /// as long as the app kept running.
+    ///
+    /// Reachable nodes are walked (depth-first via `Node::children`,
+    /// starting from every `Layer::root` plus `focus`) and left completely
+    /// untouched. Every *unreachable* node's own `Node` is overwritten with
+    /// a minimal, empty one (`NodeKind::Container`, default `Style`, no
+    /// children/events/templates/value bindings) — dropping whatever heap
+    /// allocations it held (label strings, an `Image`'s decoded pixel
+    /// buffer, a `TreeView`'s whole abandoned subtree's own `Vec<NodeId>`
+    /// children lists, ...).
+    ///
+    /// Deliberately does **not** shrink `self.nodes` or reuse a swept
+    /// node's own `NodeId` for a future `push` — every `NodeId` this arena
+    /// ever hands out stays permanently associated with either its real
+    /// node or an inert, empty tombstone, never silently reassigned to a
+    /// *different* later node. That's what makes this safe to call with
+    /// other `NodeId`s still held across it (`nowui-runtime`'s `Semantic::
+    /// node_spans`/`template_exprs`, `nowui-designer`'s `selected_node`,
+    /// a test's own cached id, ...): a stale one just ends up pointing at
+    /// an empty `Container` instead of either a dangling index or — the
+    /// genuinely dangerous alternative a reuse-based scheme risks — a
+    /// *different, unrelated* live node that happened to land in the same
+    /// slot. The tradeoff is that `self.nodes.len()` itself never shrinks
+    /// (Rust can't cheaply remove a middle `Vec` element without shifting
+    /// every index after it, which would invalidate every other `NodeId`
+    /// in one pass) — for the actual cost this exists to reclaim (a
+    /// rebuilt region's own abandoned subtree's *content*, not the fixed
+    /// per-slot arena overhead), that's the right trade.
+    ///
+    /// Cheap enough to call every redraw (a single flat pass over `self.
+    /// nodes`, no allocation beyond one `bool` per node) — `nowui_runtime::
+    /// App::redraw` and `nowui-designer`'s own `Chrome::refresh` both do,
+    /// right after `Semantic::refresh_dynamic_regions` (exactly when any
+    /// new garbage was just created, if this redraw created any at all).
+    pub fn gc(&mut self) {
+        let mut reachable = vec![false; self.nodes.len()];
+        let mut stack: Vec<NodeId> = self.layers.iter().map(|l| l.root).collect();
+        stack.extend(self.focus);
+        while let Some(id) = stack.pop() {
+            let idx = id.0 as usize;
+            let Some(slot) = reachable.get_mut(idx) else { continue };
+            if *slot {
+                continue;
+            }
+            *slot = true;
+            stack.extend(self.nodes[idx].children.iter().copied());
+        }
+        for (idx, node) in self.nodes.iter_mut().enumerate() {
+            if !reachable[idx] {
+                *node = Node::new(NodeKind::Container, Style::default());
+            }
+        }
     }
 
     pub fn get(&self, id: NodeId) -> &Node {

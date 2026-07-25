@@ -92,6 +92,14 @@ pub enum Expr {
     Cmp(Box<Expr>, CmpOp, Box<Expr>),
     And(Box<Expr>, Box<Expr>),
     Or(Box<Expr>, Box<Expr>),
+    /// `cond ? then : else` — the loosest-binding operator (parsed after
+    /// `||`), so `a || b ? c : d` parses as `(a || b) ? c : d`, matching
+    /// how most C-family languages precedence-order the two. Currently only
+    /// reachable from a backtick template's `${...}` interpolation (see
+    /// `TplPart::Expr`) — `if`/`for` conditions can syntactically contain
+    /// one too (this is the same shared `expr()` parser), but nothing
+    /// downstream gives that a meaningful use yet.
+    Ternary(Box<Expr>, Box<Expr>, Box<Expr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,14 +171,16 @@ impl Template {
         self.parts.is_empty()
     }
 
-    /// Flatten to a display string, leaving `${var}` markers intact. Used only
-    /// where a raw form is convenient (e.g. binding string values).
+    /// Flatten to a display string, leaving `${var}`/`${expr}` markers
+    /// intact. Used only where a raw form is convenient (e.g. binding
+    /// string values) — never resolved output.
     pub fn render_flat(&self) -> String {
         self.parts
             .iter()
             .map(|p| match p {
                 TplPart::Lit(s) => s.clone(),
                 TplPart::Var(v) => format!("${{{v}}}"),
+                TplPart::Expr(_) => "${...}".to_string(),
             })
             .collect()
     }
@@ -179,5 +189,21 @@ impl Template {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TplPart {
     Lit(String),
+    /// A bare dotted path (`${state.counter.count}`) — kept as its own
+    /// variant, distinct from the more general `Expr` below, purely so the
+    /// overwhelmingly common case keeps its existing simple `Vec<String>`
+    /// shape everywhere downstream (`nowui-core`'s own `TemplatePart::Var`
+    /// mirrors it directly) instead of every consumer having to pattern-
+    /// match out a trivial `Expr::Path` just to get the same thing.
     Var(String),
+    /// Anything else a backtick's `${...}` can hold once it's a full
+    /// `expr()` — currently only reachable via a ternary
+    /// (`${cond ? "a" : "b"}`, see `Expr::Ternary`), since that's the only
+    /// non-bare-path form `interp()` actually produces. `nowui-core` can't
+    /// hold a raw `Expr` (see its own "no chumsky"/no-`nowui-syntax`-
+    /// dependency hard rule), so a template containing one of these is kept
+    /// as this original, un-lowered form in `nowui-runtime`'s own
+    /// `Semantic::template_exprs` side table instead of being lowered into
+    /// `nowui_core::TemplatePart` — see that field's own doc comment.
+    Expr(Expr),
 }

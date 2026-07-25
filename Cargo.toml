@@ -9,6 +9,10 @@ members = [
     "nowui-render-gpu",
     "nowui-runtime",
     "nowui-lsp",
+    "nowui-image",
+    "nowui-icons",
+    "nowui-icons-gen",
+    "nowui-bundle",
     "nowui-designer",
     "examples/counter-app",
 ]

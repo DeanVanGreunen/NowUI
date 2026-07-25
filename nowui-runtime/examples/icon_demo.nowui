@@ -1,0 +1,40 @@
+// `Icon` demo — the embedded react-icons library (fa, fa6, md, bs, io5 sets
+// — see `nowui-icons-gen`), recolored via `line-color`/`fill-color`
+// (aliases for the same field)/`text-color` and rasterized once per
+// (name, color) pair at 128x128 (see `nowui-icons`'s `DEFAULT_RASTER_SIZE`),
+// then scaled to whatever `w-[...]`/`h-[...]` the widget is given — same
+// "rasterize once, scale at paint time" contract `Image` already uses.
+layout: App w-[fill] h-[fill] bg-gray-100 col gap-6 p-6 scroll-v {
+  Text `Icon widget demo` text-lg font-semibold
+
+  Text `Default color (falls back to text-color, black by default)` text-gray-600 text-sm
+  Container row gap-4 {
+    Icon `FaUser` w-[48px] h-[48px]
+    Icon `FaHeart` w-[48px] h-[48px]
+    Icon `MdSettings` w-[48px] h-[48px]
+    Icon `BsStar` w-[48px] h-[48px]
+    Icon `IoRocket` w-[48px] h-[48px]
+  }
+
+  Text `line-color overrides text-color` text-gray-600 text-sm
+  Container row gap-4 {
+    Icon `FaUser` w-[48px] h-[48px] line-color-[#dc2626]
+    Icon `FaHeart` w-[48px] h-[48px] line-color-[#16a34a]
+    Icon `MdSettings` w-[48px] h-[48px] line-color-[#2563eb]
+  }
+
+  Text `Hover to recolor — a literal hover:fill-color-[...]` text-gray-600 text-sm
+  Icon `FaHeart` w-[64px] h-[64px] fill-color-[#111827] hover:fill-color-[#facc15]
+
+  Text `Hover to recolor — a dynamic hover:fill-color-[${state.hover_color}], toggled on click` text-gray-600 text-sm
+  Container row gap-4 items-center {
+    Icon `FaHeart` w-[64px] h-[64px] fill-color-[#111827] hover:fill-color-[${state.hover_color}] {onClick: state.toggle_hover_color}
+    Text `hover_color: ${state.hover_color}` text-gray-700
+  }
+
+  Text `Clickable icon — every widget's ordinary event bindings work on Icon too` text-gray-600 text-sm
+  Container row gap-4 items-center {
+    Icon `FaHeart` w-[64px] h-[64px] line-color-[#dc2626] {onClick: state.increment}
+    Text `Clicked ${state.clicks} times` text-gray-700
+  }
+}

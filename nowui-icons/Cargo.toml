@@ -1,0 +1,18 @@
+[package]
+name = "nowui-icons"
+version = "0.1.0"
+edition = "2021"
+description = "Embedded react-icons SVG library + SVG-to-RGBA rasterization for NowUI's Icon widget."
+license = "MIT"
+repository = "https://github.com/DeanVanGreunen/NowUI"
+
+# Same "shared preprocessing, no renderer/model coupling" shape as
+# `nowui-image`/`nowui-text` — no `nowui-core` dependency. Reuses
+# `nowui-image`'s `Frame`/`DecodedImage` types (rasterizing an SVG produces
+# the exact same shape `Painter::draw_image` already consumes) and its
+# `.nowdat` format (the icon library itself ships as one embedded archive,
+# same container `nowui-bundle` packs local `Image` assets into).
+[dependencies]
+nowui-image = { path = "../nowui-image", version = "0.1.0" }
+resvg = { version = "0.47.0", default-features = false }
+usvg = { version = "0.47.0", default-features = false }

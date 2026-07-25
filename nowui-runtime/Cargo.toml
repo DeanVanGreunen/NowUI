@@ -20,7 +20,15 @@ nowui-core = { path = "../nowui-core", version = "0.1.0" }
 nowui-text = { path = "../nowui-text", version = "0.1.0" }
 nowui-render = { path = "../nowui-render", version = "0.1.0" }
 nowui-render-gpu = { path = "../nowui-render-gpu", version = "0.1.0" }
+nowui-image = { path = "../nowui-image", version = "0.1.0" }
+nowui-icons = { path = "../nowui-icons", version = "0.1.0" }
 winit = { workspace = true }
 softbuffer = { workspace = true }
 tiny-skia = { workspace = true }
 vello = { workspace = true }
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+# Only to construct a real, valid tiny PNG file on disk in `semantic.rs`'s
+# own Image-decoding test — `nowui-image` itself has no encoder.
+image = { version = "0.25", default-features = false, features = ["png"] }

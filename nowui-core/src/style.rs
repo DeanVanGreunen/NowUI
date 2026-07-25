@@ -168,7 +168,8 @@ pub struct Transition {
 /// aren't clobbered when a hover style is applied on top.
 ///
 /// Only variants backed by real, already-tracked runtime state are
-/// supported: `hover:`/`focus:`/`active:` (cursor/focus/mouse-down) and
+/// supported: `hover:`/`focus:`/`active:` (cursor/focus/mouse-down),
+/// `disabled:` (`{disabled: state.path}` — see `Node::disabled_path`), and
 /// responsive `sm:`/`md:`/`lg:`/`xl:`/`2xl:` (viewport width). `dark:`,
 /// `group-*`/`peer-*`, and stacked variants (`sm:hover:x`) are not — there's
 /// no theme or group-state model in this engine to drive them.
@@ -177,6 +178,14 @@ pub struct StyleVariants {
     pub hover: Option<Box<Style>>,
     pub focus: Option<Box<Style>>,
     pub active: Option<Box<Style>>,
+    /// Applied *after*, and so overriding, `hover`/`focus`/`active` — see
+    /// `compute_effective`'s own comment on ordering. A disabled widget
+    /// doesn't meaningfully respond to hover/focus/press in real UIs
+    /// either, but this engine doesn't suppress those states themselves
+    /// (the mouse can still be *over* a disabled button); it just makes
+    /// sure `disabled:`'s own styling always wins for whatever fields it
+    /// touches.
+    pub disabled: Option<Box<Style>>,
     /// `(min_width_px, cumulatively-resolved style)`, ascending by min-width.
     pub responsive: Vec<(u32, Style)>,
 }
@@ -213,6 +222,44 @@ pub struct Style {
     /// displayed/parsed value string and their spinner popup's third column.
     /// Ignored by every other widget kind, same convention as `multiline`.
     pub with_seconds: bool,
+    /// `loop` bare flag: an animated GIF `Image` restarts from frame 0 once
+    /// it reaches its last frame, instead of holding on that last frame.
+    /// Ignored by every other widget kind (including a static `Image`),
+    /// same convention as `multiline`/`with_seconds`.
+    pub loop_playback: bool,
+    /// `default-selected` bare flag: a literal `DropdownItem` child marked
+    /// with this is the `Dropdown`'s initial selection (and what a
+    /// `values`-driven rebuild falls back to selecting if the previously
+    /// selected id no longer exists — see `NodeKind::Dropdown::
+    /// default_selected_id`). Ignored by every other widget kind, same
+    /// convention as `multiline`/`with_seconds`/`loop_playback`.
+    pub default_selected: bool,
+    /// `disabled` bare flag on a `DropdownItem`: greys out its text and
+    /// makes it unselectable by click — same effective treatment a blank
+    /// `` `` `` id already gets automatically (see `NodeKind::Dropdown`'s
+    /// own doc comment), just opt-in rather than implied. Ignored by every
+    /// other widget kind.
+    pub disabled: bool,
+    /// `folder-actions` bare flag: a `TreeViewItem` draws two extra small
+    /// hand-drawn action icons (add-file, add-folder — see `Ui::
+    /// icon_add_file`/`icon_add_folder`) at its own row's right edge, next
+    /// to the label, same "row content painted directly, not a real arena
+    /// child" category the disclosure triangle/checkbox already are.
+    /// Ignored by every other widget kind, same convention as
+    /// `multiline`/`with_seconds`/`loop_playback`/`default_selected`.
+    pub show_folder_actions: bool,
+    /// `tree-icon-[FaFolder]` on a `TreeViewItem`: the name of an embedded
+    /// react-icons glyph (same library/lookup the `Icon` widget uses) drawn
+    /// at the row's own left edge, right after the disclosure triangle/
+    /// checkbox and before the label. Empty (the default) draws nothing —
+    /// this is opt-in, not automatic per-row iconography (a generic
+    /// `TreeView` has no built-in notion of "this row is a folder"; an app
+    /// author decides that, same as `Style::show_folder_actions`). Ignored
+    /// by every other widget kind. The named icon is rasterized by
+    /// `nowui-runtime`'s `resolve_tree_icons` (mirroring `Icon`'s own
+    /// `resolve_icon_colors`) into `NodeKind::TreeViewItem::icon`, since
+    /// this crate can't call `nowui-icons` itself.
+    pub tree_icon: String,
     pub bg: Option<Color>,
     pub text_color: Color,
     pub text_align: TextAlign,
@@ -238,6 +285,13 @@ pub struct Style {
     pub gap_y: Option<f32>,
     pub border_width: Edges,
     pub border_color: Option<Color>,
+    /// `line-color-[#rrggbb]` — an `Icon`'s own tint color, falling back to
+    /// `text_color` (then a default near-black) when unset. Named
+    /// separately from `border_color`/`text_color` since neither of those
+    /// names fit an icon's single-color fill, but the "falls back to
+    /// text_color when unset" convention itself matches `Checkbox`'s own
+    /// `border_color`. Ignored by every other widget kind.
+    pub line_color: Option<Color>,
     pub opacity: f32,
     /// `z-index-[N]`: paint order among *sibling* nodes only (there's no
     /// global stacking-context tree — a low-z child of a high-z sibling still
@@ -283,6 +337,11 @@ impl Default for Style {
             cursor: CursorIcon::default(),
             multiline: false,
             with_seconds: false,
+            loop_playback: false,
+            default_selected: false,
+            disabled: false,
+            show_folder_actions: false,
+            tree_icon: String::new(),
             bg: None,
             text_color: Color::BLACK,
             text_align: TextAlign::Left,
@@ -298,6 +357,7 @@ impl Default for Style {
             gap_y: None,
             border_width: Edges::default(),
             border_color: None,
+            line_color: None,
             opacity: 1.0,
             z_index: 0,
             transform: Transform2D::default(),
@@ -425,6 +485,7 @@ fn overlay_touched_fields(working: &mut Style, unvaried: &Style, variant: &Style
         gap_y,
         border_width,
         border_color,
+        line_color,
         opacity,
         z_index,
         transform,
@@ -446,6 +507,7 @@ pub fn compute_effective(
     hovered: bool,
     focused: bool,
     pressed: bool,
+    disabled: bool,
 ) -> Style {
     let mut working = base.clone();
 
@@ -480,6 +542,14 @@ pub fn compute_effective(
             overlay_touched_fields(&mut working, base, v);
         }
     }
+    // Applied last, deliberately after hover/focus/active, so a
+    // `disabled:`'s own styling always wins for whatever fields it
+    // touches — see `StyleVariants::disabled`'s own doc comment.
+    if disabled {
+        if let Some(v) = &base.variants.disabled {
+            overlay_touched_fields(&mut working, base, v);
+        }
+    }
 
     working
 }
@@ -491,6 +561,14 @@ pub fn compute_effective(
 pub fn dropdown_metrics(font_size: f32) -> (f32, f32) {
     (font_size * 1.3 + 16.0, font_size * 1.3 + 12.0)
 }
+
+/// A `Dropdown`'s open popup never grows taller than this — beyond it, the
+/// popup clips and becomes vertically scrollable (mouse wheel, plus a thin
+/// scrollbar — same visual convention `scroll-v` containers already use)
+/// instead of just growing to fit every option. Shared by `paint`
+/// (clip/scrollbar) and the runtime's click hit math/wheel routing, so both
+/// agree on exactly where the popup's own visible edge is.
+pub const DROPDOWN_POPUP_MAX_H: f32 = 300.0;
 
 /// `Slider`/`ProgressBar` have no text content to hug-size against, so they
 /// fall back to a fixed default length when `Sizing::Hug` — same convention

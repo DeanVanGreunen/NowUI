@@ -16,6 +16,7 @@ mod chrome;
 mod editor;
 mod preview;
 mod state;
+mod tabs;
 mod virtual_fs;
 mod watcher;
 
@@ -23,8 +24,8 @@ use std::process::ExitCode;
 
 use app::DesignerApp;
 use preview::PreviewDoc;
-use state::{DesignerState, VfsNode};
-use virtual_fs::{VirtualFs, DEFAULT_MAX_DEPTH};
+use state::DesignerState;
+use virtual_fs::VirtualFs;
 use winit::event_loop::{ControlFlow, EventLoop};
 
 fn main() -> ExitCode {
@@ -55,17 +56,8 @@ fn main() -> ExitCode {
     // opened.
     let project_root = entry_path.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| std::path::PathBuf::from("."));
     let vfs = VirtualFs::new(project_root);
-    let tree = match vfs.scan(DEFAULT_MAX_DEPTH) {
-        Ok(entry) => match &entry {
-            virtual_fs::VfsEntry::Dir { children, .. } => children.iter().map(VfsNode::from_entry).collect(),
-            other => vec![VfsNode::from_entry(other)],
-        },
-        Err(e) => {
-            eprintln!("nowui-designer: failed to scan the project folder: {e}");
-            Vec::new()
-        }
-    };
-    let state = DesignerState { tree };
+    let tree = app::scan_tree(&vfs);
+    let state = DesignerState { tree, creating_hint: app::IDLE_HINT.to_string(), ..Default::default() };
 
     let mut chrome = match chrome::Chrome::load(&state) {
         Ok(c) => c,
@@ -81,7 +73,7 @@ fn main() -> ExitCode {
 
     let event_loop = EventLoop::new().expect("event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
-    let mut app = DesignerApp::new(chrome, doc, state);
+    let mut app = DesignerApp::new(chrome, doc, state, vfs);
     match event_loop.run_app(&mut app) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {

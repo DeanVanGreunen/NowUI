@@ -240,8 +240,9 @@ fn paint_node(ui: &Ui, id: NodeId, painter: &mut dyn Painter, popups: &mut Vec<N
             label_rect.w -= 14.0; // leave room for the caret indicator
             painter.draw_text(&label, label_rect, &label_style);
 
-            // Caret indicator: a small filled square (no path primitive for a
-            // real triangle — matches the Checkbox widget's own crude-box style).
+            // Caret indicator: `FaChevronUp`/`FaChevronDown` when the icon
+            // library is linked in (see `Ui::chevron_up`/`chevron_down`'s
+            // own doc comment), a plain filled square otherwise.
             let caret_size = (style.font_size * 0.4).max(4.0);
             let caret = Rect::new(
                 box_rect.x + box_rect.w - caret_size - 8.0,
@@ -249,7 +250,10 @@ fn paint_node(ui: &Ui, id: NodeId, painter: &mut dyn Painter, popups: &mut Vec<N
                 caret_size,
                 caret_size,
             );
-            painter.fill_rect(caret, style.text_color, Edges::default());
+            match if *open { ui.chevron_up.as_ref() } else { ui.chevron_down.as_ref() } {
+                Some(frame) => painter.draw_image(frame, caret),
+                None => painter.fill_rect(caret, style.text_color, Edges::default()),
+            }
 
             // Deferred: see `paint_dropdown_popup` — floats on top of
             // everything once the whole tree has painted, rather than being
@@ -274,7 +278,8 @@ fn paint_node(ui: &Ui, id: NodeId, painter: &mut dyn Painter, popups: &mut Vec<N
         NodeKind::Date { value, placeholder, open, .. }
         | NodeKind::Time { value, placeholder, open, .. }
         | NodeKind::DateTime { value, placeholder, open, .. } => {
-            paint_picker_box(painter, content_rect, style, value, placeholder);
+            let chevron = if *open { ui.chevron_up.as_ref() } else { ui.chevron_down.as_ref() };
+            paint_picker_box(painter, content_rect, style, value, placeholder, chevron);
             // Deferred: see `paint_date_popup`/`paint_time_popup`/
             // `paint_datetime_popup` — floats on top of everything once the
             // whole tree has painted, same as `Dropdown`'s popup.
@@ -291,8 +296,47 @@ fn paint_node(ui: &Ui, id: NodeId, painter: &mut dyn Painter, popups: &mut Vec<N
         // children-recursion below — `TreeView` itself carries no visible
         // content of its own.
         NodeKind::TreeView { .. } => {}
-        NodeKind::TreeViewItem { label, collapsed, checkbox, selected, .. } => {
-            paint_tree_view_item(painter, content_rect, style, &text_style, label, *collapsed, *checkbox, *selected, !node.children.is_empty());
+        NodeKind::TreeViewItem { label, collapsed, checkbox, selected, show_folder_actions, icon, .. } => {
+            // The conventional file-tree pairing — closed points *at* the
+            // content it's hiding (right), open points *down* into it —
+            // distinct from `Dropdown`'s own up/down-for-open/closed
+            // convention above.
+            let chevron = if *collapsed { ui.chevron_right.as_ref() } else { ui.chevron_down.as_ref() };
+            paint_tree_view_item(
+                painter,
+                content_rect,
+                style,
+                &text_style,
+                label,
+                *collapsed,
+                *checkbox,
+                *selected,
+                !node.children.is_empty(),
+                chevron,
+                *show_folder_actions,
+                ui.icon_add_file.as_ref(),
+                ui.icon_add_folder.as_ref(),
+                icon.as_ref(),
+            );
+        }
+        // Not yet decoded (still loading) or failed to decode: nothing to
+        // draw — no placeholder box, matching an empty `Container`'s own
+        // "no bg means nothing extra painted" behavior.
+        NodeKind::Image { decoded, current_frame, .. } => {
+            if let Some(img) = decoded {
+                if let Some(frame) = img.frames.get(*current_frame) {
+                    painter.draw_image(frame, content_rect);
+                }
+            }
+        }
+        // Same "nothing extra painted while unresolved" convention as
+        // `Image` above — already recolored/rasterized at node-build time
+        // (see `NodeKind::Icon`'s own doc comment), so painting it is just
+        // one `draw_image` call, no per-frame color logic here.
+        NodeKind::Icon { decoded, .. } => {
+            if let Some(frame) = decoded {
+                painter.draw_image(frame, content_rect);
+            }
         }
     }
 
@@ -351,17 +395,37 @@ fn paint_node(ui: &Ui, id: NodeId, painter: &mut dyn Painter, popups: &mut Vec<N
     }
 }
 
+/// A disabled option's text color (a blank id, or an explicit `disabled`
+/// flag — see `NodeKind::Dropdown`'s own doc comment) — a fixed neutral
+/// gray regardless of the widget's own `text-color`, same "greyed out"
+/// convention a real HTML `<select>`'s own disabled `<option>` renders
+/// with.
+const DROPDOWN_DISABLED_TEXT: Color = Color { r: 156, g: 163, b: 175, a: 255 }; // Tailwind gray-400
+
 /// Draws an open `Dropdown`'s option list directly below its box, in screen
 /// space — called after the whole tree has painted (see `paint`), so no
 /// ancestor's clip or layout is in effect: it floats over everything and
 /// doesn't push sibling content around.
+///
+/// Clipped to `DROPDOWN_POPUP_MAX_H` — a list taller than that scrolls
+/// (`Node::scroll_offset.y`, driven by the runtime's `MouseWheel` handler,
+/// same field every `scroll-y` container's own content already uses) with
+/// a thin scrollbar, same visual convention `paint_scrollbars` already
+/// draws for those containers (reimplemented inline here rather than
+/// reused directly, since that helper is gated on `Style::scroll_y`, which
+/// a `Dropdown` itself never sets).
 fn paint_dropdown_popup(ui: &Ui, id: NodeId, painter: &mut dyn Painter) {
     let node = ui.get(id);
     let style = &node.style;
-    let NodeKind::Dropdown { options, selected, .. } = &node.kind else { return };
+    let NodeKind::Dropdown { options, option_disabled, selected, .. } = &node.kind else { return };
 
     let (_, option_h) = crate::style::dropdown_metrics(style.font_size);
-    let popup_rect = Rect::new(node.computed.x, node.computed.y + node.computed.h, node.computed.w, option_h * options.len() as f32);
+    let content_h = option_h * options.len() as f32;
+    let popup_h = content_h.min(crate::style::DROPDOWN_POPUP_MAX_H);
+    let popup_rect = Rect::new(node.computed.x, node.computed.y + node.computed.h, node.computed.w, popup_h);
+    let scrollable = content_h > popup_h + 0.5;
+    let max_scroll = (content_h - popup_h).max(0.0);
+    let scroll_y = node.scroll_offset.y.clamp(0.0, max_scroll);
 
     let bg = style.bg.unwrap_or(Color::WHITE);
     let border = style.border_color.unwrap_or(Color::rgb(209, 213, 219));
@@ -375,15 +439,30 @@ fn paint_dropdown_popup(ui: &Ui, id: NodeId, painter: &mut dyn Painter) {
         weight: style.font_weight,
         letter_spacing: style.letter_spacing,
     };
+    let disabled_text_style = TextStyle { color: DROPDOWN_DISABLED_TEXT, ..text_style };
 
-    let mut y = popup_rect.y;
+    painter.push_clip(popup_rect);
+    let mut y = popup_rect.y - scroll_y;
     for (i, opt) in options.iter().enumerate() {
         let opt_rect = Rect::new(popup_rect.x, y, popup_rect.w, option_h);
         if Some(i) == *selected {
             painter.fill_rect(opt_rect, Color::rgb(243, 244, 246), Edges::default());
         }
-        painter.draw_text(opt, opt_rect.inset(Edges::all(8.0)), &text_style);
+        let row_text_style = if option_disabled[i] { &disabled_text_style } else { &text_style };
+        painter.draw_text(opt, opt_rect.inset(Edges::all(8.0)), row_text_style);
         y += option_h;
+    }
+    painter.pop_clip();
+
+    if scrollable {
+        let thumb_color = style.border_color.unwrap_or(SCROLLBAR_THUMB_DEFAULT);
+        let track_color = style.border_color.map(|c| Color { a: 40, ..c }).unwrap_or(SCROLLBAR_TRACK_DEFAULT);
+        let track = Rect::new(popup_rect.x + popup_rect.w - SCROLLBAR_THICKNESS, popup_rect.y, SCROLLBAR_THICKNESS, popup_rect.h);
+        painter.fill_rect(track, track_color, Edges::default());
+        let thumb_h = (popup_rect.h * (popup_rect.h / content_h)).clamp(20.0, popup_rect.h);
+        let thumb_y = popup_rect.y + (scroll_y / max_scroll) * (popup_rect.h - thumb_h);
+        let thumb = Rect::new(track.x, thumb_y, SCROLLBAR_THICKNESS, thumb_h);
+        painter.fill_rect(thumb, thumb_color, Edges::all(SCROLLBAR_THICKNESS / 2.0));
     }
 }
 
@@ -435,7 +514,14 @@ fn paint_menu_popup(ui: &Ui, id: NodeId, painter: &mut dyn Painter) {
 /// run before this match arm) is the *only* thing drawing the box, so every
 /// `p-*`/`h-*`/`bg-*`/`border-*`/`rounded-*` class works exactly as it would
 /// on a `TextInput`.
-fn paint_picker_box(painter: &mut dyn Painter, content_rect: Rect, style: &crate::style::Style, value: &str, placeholder: &str) {
+fn paint_picker_box(
+    painter: &mut dyn Painter,
+    content_rect: Rect,
+    style: &crate::style::Style,
+    value: &str,
+    placeholder: &str,
+    chevron: Option<&nowui_image::Frame>,
+) {
     let label = if value.is_empty() { placeholder } else { value };
     let label_style = TextStyle {
         color: style.text_color,
@@ -448,12 +534,17 @@ fn paint_picker_box(painter: &mut dyn Painter, content_rect: Rect, style: &crate
     label_rect.w -= 20.0; // leave room for the icon glyph
     painter.draw_text(label, vcenter_text(label_rect, style.font_size), &label_style);
 
-    // Icon glyph: a small filled square (no path primitive for a real
-    // calendar/clock icon — same crude-box convention as Dropdown's caret).
+    // Icon glyph: `FaChevronUp`/`FaChevronDown` (`chevron`'s caller already
+    // picked the right one for this box's open/closed state) when the icon
+    // library is linked in, a plain filled square otherwise — same
+    // fallback convention `Dropdown`'s own caret uses.
     let icon_size = (style.font_size * 0.4).max(4.0);
     let icon =
         Rect::new(content_rect.x + content_rect.w - icon_size, content_rect.y + (content_rect.h - icon_size) / 2.0, icon_size, icon_size);
-    painter.fill_rect(icon, style.text_color, Edges::default());
+    match chevron {
+        Some(frame) => painter.draw_image(frame, icon),
+        None => painter.fill_rect(icon, style.text_color, Edges::default()),
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -851,12 +942,12 @@ fn char_prefix_width(painter: &mut dyn Painter, shown: &str, char_count: usize, 
 /// line_height(style.font_size)` slice of `content_rect`; the rest (if
 /// expanded and non-collapsed) belongs to its children, laid out by
 /// `layout::arrange_tree_view_item` and painted separately via the generic
-/// children-recursion. No dedicated "chevron"/"triangle" `Painter` primitive
-/// exists (the trait only has rects/text/clip/transform), so the disclosure
-/// indicator is a small filled square when expanded, hollow (stroked) when
-/// collapsed — same hand-drawn-primitive convention `Checkbox`'s own
-/// checkmark already uses, just a different shape standing in for a
-/// chevron.
+/// children-recursion. The disclosure indicator is `FaChevronDown`/
+/// `FaChevronRight` (`chevron`, already picked by the caller from `Ui::
+/// chevron_down`/`chevron_right` based on `collapsed`) when the icon
+/// library is linked in; a small filled square (expanded) / hollow stroked
+/// square (collapsed) otherwise — same hand-drawn-primitive fallback `Dropdown`'s
+/// own caret uses.
 #[allow(clippy::too_many_arguments)]
 fn paint_tree_view_item(
     painter: &mut dyn Painter,
@@ -868,9 +959,18 @@ fn paint_tree_view_item(
     checkbox: bool,
     selected: bool,
     has_children: bool,
+    chevron: Option<&nowui_image::Frame>,
+    show_folder_actions: bool,
+    icon_add_file: Option<&nowui_image::Frame>,
+    icon_add_folder: Option<&nowui_image::Frame>,
+    tree_icon: Option<&nowui_image::Frame>,
 ) {
     let own_row_h = crate::text_input::line_height(style.font_size);
     let row_rect = Rect { h: own_row_h, ..content_rect };
+
+    if show_folder_actions {
+        paint_tree_action_icons(painter, row_rect, own_row_h, style, icon_add_file, icon_add_folder);
+    }
 
     if has_children {
         let size = (own_row_h - 4.0).clamp(4.0, 8.0);
@@ -880,14 +980,19 @@ fn paint_tree_view_item(
             size,
             size,
         );
-        if collapsed {
-            painter.stroke_rect(indicator, style.text_color, 1.0, Edges::default());
-        } else {
-            painter.fill_rect(indicator, style.text_color, Edges::default());
+        match chevron {
+            Some(frame) => painter.draw_image(frame, indicator),
+            None if collapsed => painter.stroke_rect(indicator, style.text_color, 1.0, Edges::default()),
+            None => painter.fill_rect(indicator, style.text_color, Edges::default()),
         }
     }
 
     let mut label_x = row_rect.x + crate::layout::TREE_TRIANGLE_W;
+    if let Some(frame) = tree_icon {
+        let icon_rect = Rect::new(label_x, row_rect.y + (own_row_h - crate::layout::TREE_ICON_W) / 2.0, crate::layout::TREE_ICON_W, crate::layout::TREE_ICON_W);
+        painter.draw_image(frame, icon_rect);
+        label_x += crate::layout::TREE_ICON_W + crate::layout::TREE_ICON_GAP;
+    }
     if checkbox {
         let box_size = style.font_size;
         let box_rect = Rect::new(label_x, row_rect.y + (own_row_h - box_size) / 2.0, box_size, box_size);
@@ -907,8 +1012,39 @@ fn paint_tree_view_item(
         label_x += box_size + 6.0;
     }
 
-    let label_rect = Rect { x: label_x, w: (row_rect.x + row_rect.w - label_x).max(0.0), ..row_rect };
+    let actions_w = if show_folder_actions { crate::layout::TREE_ACTIONS_W } else { 0.0 };
+    let label_rect = Rect { x: label_x, w: (row_rect.x + row_rect.w - actions_w - label_x).max(0.0), ..row_rect };
     painter.draw_text(label, label_rect, text_style);
+}
+
+/// Draws the `folder-actions` add-file/add-folder icons at `row_rect`'s own
+/// right edge — see `Style::show_folder_actions`'s own doc comment. Falls
+/// back to a small hand-drawn plus-in-square glyph per icon when the icon
+/// library isn't linked in, same fallback convention the disclosure
+/// triangle/checkbox above already use.
+fn paint_tree_action_icons(
+    painter: &mut dyn Painter,
+    row_rect: Rect,
+    own_row_h: f32,
+    style: &crate::style::Style,
+    icon_add_file: Option<&nowui_image::Frame>,
+    icon_add_folder: Option<&nowui_image::Frame>,
+) {
+    use crate::layout::{TREE_ACTION_GAP, TREE_ACTION_ICON_W};
+    let y = row_rect.y + (own_row_h - TREE_ACTION_ICON_W) / 2.0;
+    let folder_rect = Rect::new(row_rect.x + row_rect.w - TREE_ACTION_ICON_W, y, TREE_ACTION_ICON_W, TREE_ACTION_ICON_W);
+    let file_rect = Rect::new(folder_rect.x - TREE_ACTION_GAP - TREE_ACTION_ICON_W, y, TREE_ACTION_ICON_W, TREE_ACTION_ICON_W);
+
+    let draw = |painter: &mut dyn Painter, rect: Rect, icon: Option<&nowui_image::Frame>| match icon {
+        Some(frame) => painter.draw_image(frame, rect),
+        None => {
+            let bar = (rect.w * 0.15).max(1.0);
+            painter.fill_rect(Rect::new(rect.x, rect.y + (rect.h - bar) / 2.0, rect.w, bar), style.text_color, Edges::default());
+            painter.fill_rect(Rect::new(rect.x + (rect.w - bar) / 2.0, rect.y, bar, rect.h), style.text_color, Edges::default());
+        }
+    };
+    draw(painter, file_rect, icon_add_file);
+    draw(painter, folder_rect, icon_add_folder);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1111,13 +1247,18 @@ const SCROLLBAR_THUMB_DEFAULT: Color = Color { r: 0, g: 0, b: 0, a: 110 };
 /// version of the same color tints the track) when set, falling back to a
 /// neutral gray otherwise — no dedicated `scrollbar-*` classes were added.
 fn paint_scrollbars(painter: &mut dyn Painter, rect: Rect, style: &crate::style::Style, content: Size, offset: Point) {
+    const MIN_THUMB: f32 = 20.0;
     let thumb_color = style.border_color.unwrap_or(SCROLLBAR_THUMB_DEFAULT);
     let track_color = style.border_color.map(|c| Color { a: 40, ..c }).unwrap_or(SCROLLBAR_TRACK_DEFAULT);
 
     if style.scroll_y && content.h > rect.h + 0.5 {
         let track = Rect::new(rect.x + rect.w - SCROLLBAR_THICKNESS, rect.y, SCROLLBAR_THICKNESS, rect.h);
         painter.fill_rect(track, track_color, Edges::default());
-        let thumb_h = (rect.h * (rect.h / content.h)).clamp(20.0, rect.h);
+        // `rect.h` can be smaller than `MIN_THUMB` (e.g. a `scroll-*` container
+        // whose own hug-height is just padding) — clamp the lower bound down
+        // to `rect.h` too in that case (same guard `paint_page_scrollbars`
+        // already applies) rather than panicking on `min > max`.
+        let thumb_h = (rect.h * (rect.h / content.h)).clamp(MIN_THUMB.min(rect.h), rect.h);
         let max_offset = (content.h - rect.h).max(1.0);
         let thumb_y = rect.y + (offset.y.clamp(0.0, max_offset) / max_offset) * (rect.h - thumb_h);
         let thumb = Rect::new(track.x, thumb_y, SCROLLBAR_THICKNESS, thumb_h);
@@ -1126,7 +1267,7 @@ fn paint_scrollbars(painter: &mut dyn Painter, rect: Rect, style: &crate::style:
     if style.scroll_x && content.w > rect.w + 0.5 {
         let track = Rect::new(rect.x, rect.y + rect.h - SCROLLBAR_THICKNESS, rect.w, SCROLLBAR_THICKNESS);
         painter.fill_rect(track, track_color, Edges::default());
-        let thumb_w = (rect.w * (rect.w / content.w)).clamp(20.0, rect.w);
+        let thumb_w = (rect.w * (rect.w / content.w)).clamp(MIN_THUMB.min(rect.w), rect.w);
         let max_offset = (content.w - rect.w).max(1.0);
         let thumb_x = rect.x + (offset.x.clamp(0.0, max_offset) / max_offset) * (rect.w - thumb_w);
         let thumb = Rect::new(thumb_x, track.y, thumb_w, SCROLLBAR_THICKNESS);
@@ -1223,6 +1364,7 @@ mod tests {
         text_bounds: Vec<Rect>,
         text_colors: Vec<Color>,
         clips: Vec<Rect>,
+        images: Vec<Rect>,
     }
     impl Painter for FullRecordingPainter {
         fn fill_rect(&mut self, rect: Rect, color: Color, _: Edges) {
@@ -1238,6 +1380,127 @@ mod tests {
             self.clips.push(rect);
         }
         fn pop_clip(&mut self) {}
+        fn draw_image(&mut self, _frame: &nowui_image::Frame, bounds: Rect) {
+            self.images.push(bounds);
+        }
+    }
+
+    #[test]
+    fn image_node_draws_its_current_frame_at_its_content_rect() {
+        let mut ui = Ui::new();
+        let kind = NodeKind::Image {
+            source: "test.png".to_string(),
+            decoded: Some(nowui_image::DecodedImage {
+                width: 10,
+                height: 10,
+                frames: vec![nowui_image::Frame { width: 10, height: 10, rgba: vec![0; 400], delay_ms: 0 }],
+            }),
+            current_frame: 0,
+            frame_elapsed_ms: 0.0,
+            error: None,
+        };
+        let id = ui.push(Node::new(kind, Style::default()));
+        ui.get_mut(id).computed = Rect::new(5.0, 5.0, 100.0, 50.0);
+        ui.add_layer(id, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.images, vec![Rect::new(5.0, 5.0, 100.0, 50.0)]);
+    }
+
+    fn dropdown_kind(n_options: usize) -> NodeKind {
+        let options: Vec<String> = (0..n_options).map(|i| format!("Option {i}")).collect();
+        let option_ids: Vec<String> = (0..n_options).map(|i| format!("id-{i}")).collect();
+        let mut option_disabled = vec![false; n_options];
+        if n_options > 1 {
+            option_disabled[1] = true;
+        }
+        NodeKind::Dropdown {
+            placeholder: "Choose".to_string(),
+            options,
+            option_ids,
+            option_disabled,
+            static_items: Vec::new(),
+            default_selected_id: None,
+            selected: None,
+            open: true,
+        }
+    }
+
+    #[test]
+    fn dropdown_popup_clips_and_shows_a_scrollbar_past_its_max_height() {
+        // Enough options that, at the default `dropdown_metrics` row
+        // height, the popup's *content* clearly exceeds `DROPDOWN_POPUP_
+        // MAX_H` — should clip to that height and draw a scrollbar, not
+        // just grow to fit every row.
+        let mut ui = Ui::new();
+        let id = ui.push(Node::new(dropdown_kind(30), Style::default()));
+        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 200.0, 30.0);
+        ui.add_layer(id, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        let popup_clip = painter.clips.last().expect("popup should push a clip");
+        assert!(
+            (popup_clip.h - crate::style::DROPDOWN_POPUP_MAX_H).abs() < 0.5,
+            "popup clip height should be clamped to DROPDOWN_POPUP_MAX_H, got {}",
+            popup_clip.h
+        );
+
+        // A scrollbar track fill (`SCROLLBAR_THICKNESS` wide, flush with the
+        // popup's own right edge) should appear since content overflows.
+        let expected_track_x = popup_clip.x + popup_clip.w - SCROLLBAR_THICKNESS;
+        assert!(
+            painter.fills.iter().any(|(r, _)| (r.x - expected_track_x).abs() < 0.5 && (r.w - SCROLLBAR_THICKNESS).abs() < 0.5),
+            "expected a scrollbar track fill at the popup's right edge"
+        );
+    }
+
+    #[test]
+    fn dropdown_popup_fits_without_a_scrollbar_when_content_is_short() {
+        let mut ui = Ui::new();
+        let id = ui.push(Node::new(dropdown_kind(2), Style::default()));
+        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 200.0, 30.0);
+        ui.add_layer(id, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        let popup_clip = painter.clips.last().expect("popup should still push a clip");
+        assert!(popup_clip.h < crate::style::DROPDOWN_POPUP_MAX_H, "a short list shouldn't be clamped to the max height");
+    }
+
+    #[test]
+    fn dropdown_popup_greys_out_disabled_option_text() {
+        let mut ui = Ui::new();
+        let id = ui.push(Node::new(dropdown_kind(3), Style::default()));
+        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 200.0, 30.0);
+        ui.add_layer(id, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        // Option 1 (index 1) was marked disabled by `dropdown_kind`.
+        let idx = painter.texts.iter().position(|t| t == "Option 1").expect("disabled option's text should still be drawn");
+        assert_eq!(painter.text_colors[idx], DROPDOWN_DISABLED_TEXT);
+        let other_idx = painter.texts.iter().position(|t| t == "Option 0").unwrap();
+        assert_ne!(painter.text_colors[other_idx], DROPDOWN_DISABLED_TEXT);
+    }
+
+    #[test]
+    fn an_image_still_loading_draws_nothing() {
+        let mut ui = Ui::new();
+        let kind = NodeKind::Image { source: "still-loading.png".to_string(), decoded: None, current_frame: 0, frame_elapsed_ms: 0.0, error: None };
+        let id = ui.push(Node::new(kind, Style::default()));
+        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 100.0, 50.0);
+        ui.add_layer(id, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert!(painter.images.is_empty());
     }
 
     #[test]
@@ -1691,5 +1954,126 @@ mod tests {
         let (first_rect, first_color) = painter.fills[0];
         assert_eq!(first_color, bg);
         assert_eq!(first_rect, Rect::new(0.0, 0.0, 800.0, 600.0), "prefilled across the entire physical window, not just the shifted root rect");
+    }
+
+    #[test]
+    fn scroll_container_thumb_does_not_panic_when_its_own_rect_is_smaller_than_the_min_thumb_size() {
+        // A `scroll-h`/`scroll-v` container whose own hug-size is smaller
+        // than `MIN_THUMB` (e.g. an empty row with only padding, h-hug ~16px
+        // — a real shape `nowui-designer`'s own tab-strip/layout-picker
+        // containers can take) used to panic in `f32::clamp` (`min > max`)
+        // since the thumb size was clamped to a fixed `20.0` lower bound
+        // regardless of how small the container itself was.
+        let style = Style { scroll_y: true, ..Default::default() };
+        let rect = Rect::new(0.0, 0.0, 100.0, 16.0);
+        let content = Size::new(100.0, 400.0);
+        let mut painter = TracingPainter::default();
+        paint_scrollbars(&mut painter, rect, &style, content, Point::default());
+
+        let style = Style { scroll_x: true, ..Default::default() };
+        let rect = Rect::new(0.0, 0.0, 16.0, 100.0);
+        let content = Size::new(400.0, 100.0);
+        let mut painter = TracingPainter::default();
+        paint_scrollbars(&mut painter, rect, &style, content, Point::default());
+    }
+
+    #[test]
+    fn tree_view_item_with_folder_actions_draws_two_icons_at_its_row_right_edge() {
+        let mut ui = Ui::new();
+        let frame = nowui_image::Frame { width: 10, height: 10, rgba: vec![0; 400], delay_ms: 0 };
+        ui.icon_add_file = Some(frame.clone());
+        ui.icon_add_folder = Some(frame);
+
+        let kind = NodeKind::TreeViewItem {
+            id: String::new(),
+            label: "widgets".to_string(),
+            collapsed: false,
+            selected: false,
+            checkbox: false,
+            show_folder_actions: true,
+            icon: None,
+        };
+        let id = ui.push(Node::new(kind, Style::default()));
+        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 200.0, 20.0);
+        ui.add_layer(id, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.images.len(), 2, "the add-file and add-folder icons each draw one image");
+        for rect in &painter.images {
+            assert!(rect.x + rect.w <= 200.0, "both icons stay within the row's own right edge");
+        }
+        // The folder icon (drawn second, at the very right edge) sits to the
+        // right of the file icon (drawn first).
+        assert!(painter.images[1].x > painter.images[0].x, "add-folder icon sits right of add-file icon");
+    }
+
+    #[test]
+    fn tree_view_item_without_folder_actions_draws_no_action_icons() {
+        let mut ui = Ui::new();
+        let kind = NodeKind::TreeViewItem {
+            id: String::new(),
+            label: "main.nowui".to_string(),
+            collapsed: false,
+            selected: false,
+            checkbox: false,
+            show_folder_actions: false,
+            icon: None,
+        };
+        let id = ui.push(Node::new(kind, Style::default()));
+        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 200.0, 20.0);
+        ui.add_layer(id, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert!(painter.images.is_empty(), "a plain (non-folder-actions) TreeViewItem draws no icons");
+    }
+
+    #[test]
+    fn tree_view_item_with_a_resolved_tree_icon_draws_it_before_the_label() {
+        let mut ui = Ui::new();
+        let frame = nowui_image::Frame { width: 10, height: 10, rgba: vec![0; 400], delay_ms: 0 };
+        let kind = NodeKind::TreeViewItem {
+            id: String::new(),
+            label: "widgets".to_string(),
+            collapsed: false,
+            selected: false,
+            checkbox: false,
+            show_folder_actions: false,
+            icon: Some(frame),
+        };
+        let id = ui.push(Node::new(kind, Style { tree_icon: "FaFolder".to_string(), ..Default::default() }));
+        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 200.0, 20.0);
+        ui.add_layer(id, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert_eq!(painter.images.len(), 1, "the resolved tree-icon frame draws once");
+        assert!(painter.images[0].x < painter.text_bounds[0].x, "the icon sits to the left of the label");
+    }
+
+    #[test]
+    fn tree_view_item_with_an_unresolved_tree_icon_name_draws_nothing_extra() {
+        let mut ui = Ui::new();
+        let kind = NodeKind::TreeViewItem {
+            id: String::new(),
+            label: "widgets".to_string(),
+            collapsed: false,
+            selected: false,
+            checkbox: false,
+            show_folder_actions: false,
+            icon: None, // `tree_icon` is set but never resolved (e.g. no runtime attached).
+        };
+        let id = ui.push(Node::new(kind, Style { tree_icon: "FaFolder".to_string(), ..Default::default() }));
+        ui.get_mut(id).computed = Rect::new(0.0, 0.0, 200.0, 20.0);
+        ui.add_layer(id, "main");
+
+        let mut painter = FullRecordingPainter::default();
+        paint(&ui, &mut painter);
+
+        assert!(painter.images.is_empty(), "no fallback glyph is drawn — unlike the disclosure triangle/checkbox, an unresolved tree-icon just draws nothing");
     }
 }

@@ -97,6 +97,22 @@ fn arrange_menu_popups(ui: &mut Ui, id: NodeId, sizes: &HashMap<NodeId, Size>) {
 /// column width, and how far each nesting level indents its children.
 pub const TREE_TRIANGLE_W: f32 = 14.0;
 pub const TREE_INDENT: f32 = 16.0;
+/// `folder-actions` row: the add-file/add-folder icon size and the gap
+/// between them, at the row's own right edge (`paint::paint_tree_view_item`,
+/// and the click-zone math in both `nowui-runtime`'s `App::handle_click` and
+/// `nowui-designer`'s own `handle_tree_click`).
+pub const TREE_ACTION_ICON_W: f32 = 14.0;
+pub const TREE_ACTION_GAP: f32 = 4.0;
+/// Total width reserved for both action icons plus the gap before them and
+/// between them — `2 * TREE_ACTION_ICON_W + 2 * TREE_ACTION_GAP` (one gap
+/// separating the label from the first icon, one between the two icons).
+pub const TREE_ACTIONS_W: f32 = 2.0 * TREE_ACTION_ICON_W + 2.0 * TREE_ACTION_GAP;
+/// `tree-icon-[...]` row: the icon's own square size plus the gap between it
+/// and the label that follows — reserved in `measure()`'s own `TreeViewItem`
+/// arm whenever `Style::tree_icon` is non-empty, and used by `paint::
+/// paint_tree_view_item` to position both the icon and the label after it.
+pub const TREE_ICON_W: f32 = 14.0;
+pub const TREE_ICON_GAP: f32 = 6.0;
 
 fn axis_is_row(d: Direction) -> bool {
     matches!(d, Direction::Row | Direction::RowReverse)
@@ -136,6 +152,62 @@ fn measure(ui: &mut Ui, id: NodeId, painter: &mut dyn Painter, sizes: &mut HashM
             let m = painter.measure_text(label, style.font_size);
             Size::new(m.x + style.font_size + 6.0, m.y)
         }
+        // `w-[auto]`/`h-[auto]` (both parsed to `Sizing::Hug` — see
+        // `semantic::parse_sizing`'s own comment) scale from the image's
+        // natural aspect ratio *only* when the other axis is a concrete
+        // `Sizing::Fixed` pixel value, already known at this measure pass —
+        // `w-[auto] h-[50%]` (a `Percent`/`Fill` other axis, only resolved
+        // during `arrange` against the parent's own size) isn't attempted
+        // here; both axes auto, or the scalable axis's own partner not
+        // fixed, falls back to the image's raw natural size unscaled — a
+        // documented scope limit, not a silent wrong answer. Not yet
+        // decoded (still loading) or failed to decode: zero size, same as
+        // an empty `Container`.
+        crate::arena::NodeKind::Image { decoded, .. } => match decoded.as_ref().map(|d| Size::new(d.width as f32, d.height as f32)) {
+            Some(natural) if natural.w > 0.0 && natural.h > 0.0 => {
+                let width_auto = matches!(style.width, Sizing::Hug);
+                let height_auto = matches!(style.height, Sizing::Hug);
+                if width_auto && !height_auto {
+                    match style.height {
+                        Sizing::Fixed(h) => Size::new(natural.w * (h / natural.h), h),
+                        _ => natural,
+                    }
+                } else if height_auto && !width_auto {
+                    match style.width {
+                        Sizing::Fixed(w) => Size::new(w, natural.h * (w / natural.w)),
+                        _ => natural,
+                    }
+                } else {
+                    natural
+                }
+            }
+            _ => Size::default(),
+        },
+        // Same aspect-ratio-from-fixed-other-axis logic as `Image` just
+        // above (an `Icon`'s rasterized frame is always square, but the
+        // math is identical either way) — an unknown icon name or a failed
+        // rasterization (`decoded: None`) measures as zero size, same as
+        // an empty `Container`.
+        crate::arena::NodeKind::Icon { decoded, .. } => match decoded.as_ref().map(|f| Size::new(f.width as f32, f.height as f32)) {
+            Some(natural) if natural.w > 0.0 && natural.h > 0.0 => {
+                let width_auto = matches!(style.width, Sizing::Hug);
+                let height_auto = matches!(style.height, Sizing::Hug);
+                if width_auto && !height_auto {
+                    match style.height {
+                        Sizing::Fixed(h) => Size::new(natural.w * (h / natural.h), h),
+                        _ => natural,
+                    }
+                } else if height_auto && !width_auto {
+                    match style.width {
+                        Sizing::Fixed(w) => Size::new(w, natural.h * (w / natural.w)),
+                        _ => natural,
+                    }
+                } else {
+                    natural
+                }
+            }
+            _ => Size::default(),
+        },
         crate::arena::NodeKind::Dropdown { placeholder, options, selected, .. } => {
             // The open option list is a floating popup (see `paint.rs`), not
             // part of the flow — it never contributes to this node's own
@@ -181,14 +253,17 @@ fn measure(ui: &mut Ui, id: NodeId, painter: &mut dyn Painter, sizes: &mut HashM
         // explicit w-full/w-[…]").
         crate::arena::NodeKind::Container | crate::arena::NodeKind::DataGrid | crate::arena::NodeKind::TreeView { .. } => Size::default(),
         // Own row only: disclosure-triangle column + optional checkbox
-        // column + measured label. Height pinned to the same
-        // `text_input::line_height` estimate `arrange_tree_view_item` uses
-        // for its own-row height, so measure/arrange never disagree about
-        // where the indented children block starts.
-        crate::arena::NodeKind::TreeViewItem { label, checkbox, .. } => {
+        // column + measured label + optional trailing action-icons column.
+        // Height pinned to the same `text_input::line_height` estimate
+        // `arrange_tree_view_item` uses for its own-row height, so
+        // measure/arrange never disagree about where the indented children
+        // block starts.
+        crate::arena::NodeKind::TreeViewItem { label, checkbox, show_folder_actions, .. } => {
             let m = painter.measure_text(label, style.font_size);
             let checkbox_w = if *checkbox { style.font_size + 6.0 } else { 0.0 };
-            Size::new(TREE_TRIANGLE_W + checkbox_w + m.x, crate::text_input::line_height(style.font_size))
+            let actions_w = if *show_folder_actions { TREE_ACTIONS_W } else { 0.0 };
+            let icon_w = if style.tree_icon.is_empty() { 0.0 } else { TREE_ICON_W + TREE_ICON_GAP };
+            Size::new(TREE_TRIANGLE_W + checkbox_w + icon_w + m.x + actions_w, crate::text_input::line_height(style.font_size))
         }
     };
 

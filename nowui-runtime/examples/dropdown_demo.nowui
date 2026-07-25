@@ -1,0 +1,27 @@
+// `Dropdown` demo — real `DropdownItem` children only (the legacy plain-
+// string-backtick form is gone), a live `{values: state.path}` binding (a
+// `Vec<DropdownItem>`, re-rendered every redraw — see
+// `resolve_dropdown_values`), `default-selected`, `disabled` (explicit, or
+// implied by a blank id — see `NodeKind::Dropdown`'s own doc comment),
+// `onSelect` (fires with the selected item's own id/label on
+// `event.child_id`/`event.child_label`), `Node::select_dropdown_by_id` (a
+// Rust-side handler forcing the selection programmatically), and the
+// popup's own 300px max height + scrollbar once `people` grows past it.
+layout: App w-[fill] h-[fill] bg-gray-100 col gap-6 p-6 scroll-v {
+  Text `Dropdown widget demo` text-lg font-semibold
+
+  Text `"-- choose a person --" (blank id, implicitly disabled but still the default selection) and "-- staff below --" (explicitly disabled) are literal DropdownItem children, always pinned above whatever { values: state.people } contributes. Clicking the closed box always force-selects Bob via Node::select_dropdown_by_id. The list starts long enough to exceed the popup's 300px max height, so it scrolls (mouse wheel, or drag the thumb).` text-gray-600 text-sm w-[560px]
+
+  Dropdown `Choose a person` w-[280px] bg-white border rounded p-[10px] {
+    onSelect: state.on_select_person,
+    values: state.people,
+    onClick: state.force_select_bob
+  } {
+    DropdownItem `` `-- choose a person --` default-selected
+    DropdownItem `` `-- staff below --` disabled
+  }
+
+  Text `Selected: id=${state.last_selected_id}, label=${state.last_selected_label}` text-gray-700
+
+  Button `Add a random person` bg-blue-500 text-white rounded p-[10px] {onClick: state.add_person}
+}

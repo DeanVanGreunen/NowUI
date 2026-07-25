@@ -200,6 +200,48 @@ impl<'a> Painter for SkiaPainter<'a> {
         });
     }
 
+    fn draw_image(&mut self, frame: &nowui_image::Frame, bounds: Rect) {
+        if frame.width == 0 || frame.height == 0 || bounds.w <= 0.0 || bounds.h <= 0.0 {
+            return;
+        }
+        let opacity = self.active_opacity();
+        let clip = self.clips.last().cloned();
+        let pixmap = &mut *self.pixmap;
+        let (pw, ph) = (pixmap.width() as i32, pixmap.height() as i32);
+
+        // Nearest-neighbor stretch to `bounds` — the solver has already
+        // done any aspect-ratio-preserving scaling (`w-[auto]`/`h-[auto]`),
+        // so this only ever stretches uniformly, never distorts. Same
+        // per-pixel blend path `draw_text` already uses, so clipping/
+        // opacity/blending behave identically for text and images.
+        let x0 = bounds.x.max(0.0) as i32;
+        let y0 = bounds.y.max(0.0) as i32;
+        let x1 = (bounds.x + bounds.w).min(pw as f32) as i32;
+        let y1 = (bounds.y + bounds.h).min(ph as f32) as i32;
+        for py in y0..y1 {
+            let v = ((py as f32 - bounds.y) / bounds.h * frame.height as f32) as u32;
+            let v = v.min(frame.height - 1);
+            for px in x0..x1 {
+                let u = ((px as f32 - bounds.x) / bounds.w * frame.width as f32) as u32;
+                let u = u.min(frame.width - 1);
+                let idx = ((v * frame.width + u) * 4) as usize;
+                let [r, g, b, a] = [frame.rgba[idx], frame.rgba[idx + 1], frame.rgba[idx + 2], frame.rgba[idx + 3]];
+                let mut alpha = (a as f32 * opacity).round().clamp(0.0, 255.0) as u8;
+                if alpha == 0 {
+                    continue;
+                }
+                if let Some(mask) = &clip {
+                    let coverage = mask.data()[(py as u32 * mask.width() + px as u32) as usize];
+                    alpha = ((alpha as u16 * coverage as u16) / 255) as u8;
+                    if alpha == 0 {
+                        continue;
+                    }
+                }
+                blend_pixel(pixmap, px as u32, py as u32, r, g, b, alpha);
+            }
+        }
+    }
+
     fn push_clip(&mut self, rect: Rect) {
         let w = self.pixmap.width();
         let h = self.pixmap.height();
@@ -271,6 +313,56 @@ fn blend_pixel(pixmap: &mut Pixmap, x: u32, y: u32, r: u8, g: u8, b: u8, a: u8) 
     let out_b = ((b as f32 * sa + dst.blue() as f32 * inv).round().clamp(0.0, 255.0) as u8).min(out_a);
     if let Some(color) = tiny_skia::PremultipliedColorU8::from_rgba(out_r, out_g, out_b, out_a) {
         pixmap.pixels_mut()[idx] = color;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nowui_image::Frame;
+
+    #[test]
+    fn draw_image_stretches_a_solid_frame_onto_the_pixmap() {
+        let mut pixmap = Pixmap::new(20, 20).expect("pixmap alloc");
+        pixmap.fill(tiny_skia::Color::from_rgba8(0, 0, 0, 255));
+        let mut text = TextContext::new();
+
+        // A 2x2 solid-red source frame, stretched to a 10x10 destination rect.
+        let frame = Frame { width: 2, height: 2, rgba: vec![255, 0, 0, 255].repeat(4), delay_ms: 0 };
+
+        {
+            let mut painter = SkiaPainter::new(&mut pixmap, &mut text);
+            painter.draw_image(&frame, Rect::new(5.0, 5.0, 10.0, 10.0));
+        }
+
+        // Center of the stretched rect should be solid red.
+        let px = pixmap.pixel(10, 10).expect("pixel in bounds");
+        assert_eq!((px.red(), px.green(), px.blue(), px.alpha()), (255, 0, 0, 255));
+        // Outside the rect stays the original black background.
+        let outside = pixmap.pixel(2, 2).expect("pixel in bounds");
+        assert_eq!((outside.red(), outside.green(), outside.blue()), (0, 0, 0));
+    }
+
+    #[test]
+    fn draw_image_respects_the_active_clip() {
+        let mut pixmap = Pixmap::new(20, 20).expect("pixmap alloc");
+        pixmap.fill(tiny_skia::Color::from_rgba8(0, 0, 0, 255));
+        let mut text = TextContext::new();
+        let frame = Frame { width: 1, height: 1, rgba: vec![255, 0, 0, 255], delay_ms: 0 };
+
+        {
+            let mut painter = SkiaPainter::new(&mut pixmap, &mut text);
+            painter.push_clip(Rect::new(0.0, 0.0, 5.0, 5.0));
+            painter.draw_image(&frame, Rect::new(0.0, 0.0, 20.0, 20.0));
+            painter.pop_clip();
+        }
+
+        // Inside the clip: painted red.
+        let inside = pixmap.pixel(2, 2).expect("pixel in bounds");
+        assert_eq!((inside.red(), inside.green(), inside.blue()), (255, 0, 0));
+        // Outside the clip: still the untouched black background.
+        let outside = pixmap.pixel(15, 15).expect("pixel in bounds");
+        assert_eq!((outside.red(), outside.green(), outside.blue()), (0, 0, 0));
     }
 }
 

@@ -135,13 +135,73 @@ fn load_into(
         .map_err(|errors| format!("parse error(s) in `{}`:\n{errors:?}", path.display()))?;
 
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    for node in ast {
+    for mut node in ast {
         match node {
             Node::Import { path: rel } => load_into(&dir.join(&rel), out, visited, overrides, order)?,
-            other => out.push(other),
+            _ => {
+                resolve_image_paths(&mut node, dir);
+                out.push(node);
+            }
         }
     }
     Ok(())
+}
+
+/// Rewrites every `Image` widget's local (non-URL) source path to an
+/// absolute one, resolved against `dir` — the directory of the `.nowui`
+/// file this `Image` was actually written in, the same "relative to the
+/// *importing* file's own directory" convention `#`-imports already use
+/// (see this module's own doc comment). Done here, at load time, rather
+/// than in the semantic pass: by the time `#`-imports are flattened into
+/// one shared `Vec<Node>`, there's no per-node record of which original
+/// file it came from — this is the one point in the pipeline that still
+/// has that information for free, since it's already walking one file's
+/// own AST inside its own directory.
+///
+/// A network URL (`http://`/`https://`) is left untouched — resolved at
+/// render time by `nowui-runtime`'s own (not-yet-built) network loader,
+/// never bundled (see `NodeKind::Image`'s own doc comment). Only a source
+/// that's a single literal backtick part (no `${...}` interpolation) is
+/// rewritten; a templated source isn't a plain path at parse time at all,
+/// so there's nothing static here to resolve yet.
+fn resolve_image_paths(node: &mut Node, dir: &Path) {
+    match node {
+        Node::Widget { kind, string_args, children, .. } => {
+            if kind == "Image" {
+                if let Some(template) = string_args.first_mut() {
+                    if let [nowui_syntax::ast::TplPart::Lit(source)] = template.parts.as_mut_slice() {
+                        if !source.starts_with("http://") && !source.starts_with("https://") && !Path::new(source).is_absolute() {
+                            *source = dir.join(&source).to_string_lossy().into_owned();
+                        }
+                    }
+                }
+            }
+            for child in children {
+                resolve_image_paths(child, dir);
+            }
+        }
+        Node::If { branches, else_branch } => {
+            for (_, body) in branches {
+                for child in body {
+                    resolve_image_paths(child, dir);
+                }
+            }
+            for child in else_branch {
+                resolve_image_paths(child, dir);
+            }
+        }
+        Node::For { body, .. } => {
+            for child in body {
+                resolve_image_paths(child, dir);
+            }
+        }
+        Node::LayoutDef { children, .. } => {
+            for child in children {
+                resolve_image_paths(child, dir);
+            }
+        }
+        Node::Import { .. } => {}
+    }
 }
 
 #[cfg(test)]
@@ -153,6 +213,46 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("nowui_loader_test_{name}"));
         fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn image_relative_paths_resolve_against_the_nowui_file_that_wrote_them() {
+        let dir = scratch_dir("image_paths");
+        fs::write(dir.join("main.nowui"), "layout: App { Image `photo.png` w-[100px] h-[100px] }").unwrap();
+
+        let ast = load_and_resolve(&dir.join("main.nowui")).expect("should resolve");
+        let Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
+        let Node::Widget { string_args, .. } = &children[0] else { panic!() };
+        let expected = dir.join("photo.png").to_string_lossy().into_owned();
+        assert_eq!(string_args[0].render_flat(), expected, "relative source rewritten to an absolute path");
+    }
+
+    #[test]
+    fn image_relative_paths_resolve_against_the_importing_files_own_directory_not_the_entry_files() {
+        // `widgets/Card.nowui` references `icon.png` relative to *its own*
+        // directory (`widgets/`), not `main.nowui`'s — matching the exact
+        // same convention `#`-imports already use.
+        let dir = scratch_dir("image_paths_nested");
+        fs::create_dir_all(dir.join("widgets")).unwrap();
+        fs::write(dir.join("widgets/Card.nowui"), "layout: Card { Image `icon.png` w-[16px] h-[16px] }").unwrap();
+        fs::write(dir.join("main.nowui"), "# widgets/Card.nowui\nlayout: App { Card }").unwrap();
+
+        let ast = load_and_resolve(&dir.join("main.nowui")).expect("should resolve");
+        let Node::LayoutDef { children, .. } = &ast[0] else { panic!() }; // Card, inlined first
+        let Node::Widget { string_args, .. } = &children[0] else { panic!() };
+        let expected = dir.join("widgets").join("icon.png").to_string_lossy().into_owned();
+        assert_eq!(string_args[0].render_flat(), expected, "resolved against widgets/, where Card.nowui itself lives");
+    }
+
+    #[test]
+    fn image_network_urls_are_left_untouched() {
+        let dir = scratch_dir("image_url");
+        fs::write(dir.join("main.nowui"), "layout: App { Image `https://example.com/a.png` w-[100px] h-[100px] }").unwrap();
+
+        let ast = load_and_resolve(&dir.join("main.nowui")).expect("should resolve");
+        let Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
+        let Node::Widget { string_args, .. } = &children[0] else { panic!() };
+        assert_eq!(string_args[0].render_flat(), "https://example.com/a.png");
     }
 
     #[test]

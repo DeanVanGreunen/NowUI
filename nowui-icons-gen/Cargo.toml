@@ -1,0 +1,16 @@
+[package]
+name = "nowui-icons-gen"
+version = "0.1.0"
+edition = "2021"
+description = "Dev tool: regenerates nowui-icons/assets/icons.nowdat from an extracted react-icons npm package. Not shipped in any NowUI app binary."
+license = "MIT"
+repository = "https://github.com/DeanVanGreunen/NowUI"
+publish = false
+
+[[bin]]
+name = "nowui-icons-gen"
+path = "src/main.rs"
+
+[dependencies]
+nowui-image = { path = "../nowui-image", version = "0.1.0" }
+serde_json = "1"

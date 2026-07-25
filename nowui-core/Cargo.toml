@@ -12,3 +12,10 @@ repository = "https://github.com/DeanVanGreunen/NowUI"
 # need to depend on nowui-core (`#[derive(nowui_core::NowUiState)]`).
 [dependencies]
 nowui-macros = { path = "../nowui-macros", version = "0.1.0" }
+# Decoded pixel data lives on `NodeKind::Image` (model data, like `Style`),
+# so this is the one third-party asset-format dependency `nowui-core` does
+# take — it's a renderer-agnostic decode layer (see its own doc comment),
+# not a rendering backend, so it doesn't conflict with the "never
+# chumsky/tiny-skia/vello/wgpu" hard rule, which is specifically about
+# staying renderer-swappable.
+nowui-image = { path = "../nowui-image", version = "0.1.0" }

@@ -1,0 +1,22 @@
+// `Image` demo — see `image_demo.rs`'s own doc comment for what's built.
+// `scroll-v` on the root is required here: h-[fill] clips to the window's
+// own height, and this demo's stacked content is taller than most windows
+// — without it, the GIF row simply renders off the bottom with no way to
+// reach it (see CLAUDE.md's `scroll-h`/`scroll-v` section: NowUI never
+// scrolls a container automatically just because its content overflows,
+// the same as plain CSS `overflow: visible` by default).
+layout: App w-[fill] h-[fill] bg-gray-100 col gap-6 p-6 scroll-v {
+  Text `Image widget demo` text-lg font-semibold
+
+  Text `w-[auto] h-[150px] — width scales from the 2:1 natural aspect ratio` text-gray-600 text-sm
+  Image `assets/test-image.png` w-[auto] h-[150px] border
+
+  Text `w-[150px] h-[auto] — height scales from the 2:1 natural aspect ratio` text-gray-600 text-sm
+  Image `assets/test-image.png` w-[150px] h-[auto] border
+
+  Text `Fixed 100x100 — stretched, aspect ratio not preserved (both axes explicit)` text-gray-600 text-sm
+  Image `assets/test-image.png` w-[100px] h-[100px] border
+
+  Text `Animated GIF, looping — 3-frame red/green/blue cycle, 200ms per frame` text-gray-600 text-sm
+  Image `assets/test-image.gif` w-[80px] h-[80px] loop border
+}

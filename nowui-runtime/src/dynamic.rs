@@ -107,6 +107,13 @@ pub fn eval_expr(expr: &Expr, resolve: &mut dyn FnMut(&[String]) -> Option<State
             }
             Some(StateValue::Bool(eval_bool(r, resolve)))
         }
+        Expr::Ternary(cond, then_branch, else_branch) => {
+            if eval_bool(cond, resolve) {
+                eval_expr(then_branch, resolve)
+            } else {
+                eval_expr(else_branch, resolve)
+            }
+        }
     }
 }
 
@@ -354,6 +361,32 @@ mod tests {
         let mut r = resolver(&[]);
         assert!(!eval_bool(&Expr::And(Box::new(Expr::Bool(false)), Box::new(Expr::Bool(true))), &mut r));
         assert!(eval_bool(&Expr::Or(Box::new(Expr::Bool(true)), Box::new(Expr::Bool(false))), &mut r));
+    }
+
+    #[test]
+    fn ternary_picks_the_then_or_else_branch_by_condition() {
+        let mut r = resolver(&[]);
+        let ternary = |cond: bool| {
+            Expr::Ternary(
+                Box::new(Expr::Bool(cond)),
+                Box::new(Expr::Str("Saving...".to_string())),
+                Box::new(Expr::Str("Save".to_string())),
+            )
+        };
+        assert_eq!(eval_expr(&ternary(true), &mut r), Some(StateValue::Str("Saving...".to_string())));
+        assert_eq!(eval_expr(&ternary(false), &mut r), Some(StateValue::Str("Save".to_string())));
+    }
+
+    #[test]
+    fn ternary_branches_can_themselves_resolve_state_paths() {
+        let pairs = [("state.savingLabel", StateValue::Str("Please wait".to_string()))];
+        let mut r = resolver(&pairs);
+        let ternary = Expr::Ternary(
+            Box::new(Expr::Bool(true)),
+            Box::new(Expr::Path(vec!["state".into(), "savingLabel".into()])),
+            Box::new(Expr::Str("Save".to_string())),
+        );
+        assert_eq!(eval_expr(&ternary, &mut r), Some(StateValue::Str("Please wait".to_string())));
     }
 
     #[test]

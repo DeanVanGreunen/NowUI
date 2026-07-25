@@ -8,12 +8,21 @@
 use nowui_core::{NodeId, NodeKind, NowUiState, Rect, Ui};
 use nowui_runtime::semantic::Semantic;
 
+/// Matches `nowui-runtime`'s own private `CHEVRON_COLOR` (Tailwind
+/// gray-700) — duplicated here because the designer builds its `Ui` via
+/// `Semantic::build` directly rather than `nowui_runtime::run_ast`, so it
+/// must populate `Ui::chevron_up`/`chevron_down`/`chevron_right` itself.
+const CHEVRON_COLOR: [u8; 4] = [0x37, 0x41, 0x51, 255];
+
 pub struct Chrome {
     pub ui: Ui,
     semantic: Semantic,
-    /// The raw-source `TextInput` — the first one found anywhere in the
-    /// built tree (see `resources/designer.nowui`'s own comment: a
-    /// documented simplification, not a dedicated marker).
+    /// The new-file/-folder name prompt — the *first* `TextInput` found
+    /// anywhere in the built tree (it sits in the sidebar, the first
+    /// column — see `resources/designer.nowui`'s own comment: a documented
+    /// simplification, not a dedicated marker).
+    pub new_item_node: NodeId,
+    /// The raw-source editor — the *second* `TextInput` found.
     pub editor_node: NodeId,
 }
 
@@ -22,14 +31,21 @@ impl Chrome {
         let src = include_str!("../resources/designer.nowui");
         let ast = nowui_syntax::parse(src).map_err(|errors| format!("designer.nowui failed to parse: {errors:?}"))?;
         let mut semantic = Semantic::new(&ast);
-        let ui = semantic.build("App", state).ok_or_else(|| "designer.nowui has no `layout: App`".to_string())?;
-        let editor_node = ui
-            .nodes
-            .iter()
-            .position(|n| matches!(n.kind, NodeKind::TextInput { .. }))
-            .map(|i| NodeId(i as u32))
-            .ok_or_else(|| "designer.nowui has no TextInput for the editor".to_string())?;
-        Ok(Chrome { ui, semantic, editor_node })
+        let mut ui = semantic.build("App", state).ok_or_else(|| "designer.nowui has no `layout: App`".to_string())?;
+        // See `run_ast`'s own equivalent population in nowui-runtime/src/lib.rs —
+        // `nowui-core` can't rasterize these itself (no chumsky/tiny-skia/vello
+        // hard rule), so whichever harness builds the `Ui` must hand it
+        // already-rasterized chevron glyphs, or paint falls back to the
+        // plain-square/triangle glyph (the "black box" the explorer used to show).
+        ui.chevron_up = nowui_icons::icon_frame("FaChevronUp", CHEVRON_COLOR).ok();
+        ui.chevron_down = nowui_icons::icon_frame("FaChevronDown", CHEVRON_COLOR).ok();
+        ui.chevron_right = nowui_icons::icon_frame("FaChevronRight", CHEVRON_COLOR).ok();
+        ui.icon_add_file = nowui_icons::icon_frame("FaFileCirclePlus", CHEVRON_COLOR).ok();
+        ui.icon_add_folder = nowui_icons::icon_frame("FaFolderPlus", CHEVRON_COLOR).ok();
+        let mut text_inputs = ui.nodes.iter().enumerate().filter(|(_, n)| matches!(n.kind, NodeKind::TextInput { .. })).map(|(i, _)| NodeId(i as u32));
+        let new_item_node = text_inputs.next().ok_or_else(|| "designer.nowui has no TextInput for the new-item prompt".to_string())?;
+        let editor_node = text_inputs.next().ok_or_else(|| "designer.nowui has no TextInput for the editor".to_string())?;
+        Ok(Chrome { ui, semantic, new_item_node, editor_node })
     }
 
     /// Overwrite the editor's own buffer — used once at startup to seed it
@@ -65,6 +81,26 @@ impl Chrome {
         }
     }
 
+    /// The new-item prompt's own current buffer content (the name being
+    /// typed for a new file/folder).
+    pub fn new_item_text(&self) -> &str {
+        match &self.ui.get(self.new_item_node).kind {
+            NodeKind::TextInput { label, .. } => label,
+            _ => "",
+        }
+    }
+
+    /// Overwrite the new-item prompt's own buffer — used to clear it back
+    /// to empty once a creation is confirmed/cancelled, or focused with a
+    /// blank buffer when "+ File"/"+ Folder" is clicked.
+    pub fn set_new_item_text(&mut self, text: &str) {
+        if let NodeKind::TextInput { label, cursor, selection_anchor, .. } = &mut self.ui.get_mut(self.new_item_node).kind {
+            *label = text.to_string();
+            *cursor = nowui_core::text_input::char_len(label);
+            *selection_anchor = None;
+        }
+    }
+
     /// Re-expand any `if`/`for` region whose underlying state actually
     /// changed (e.g. the project tree got rescanned) and re-render every
     /// `${state.path}`/`{value: ...}`/`key-[${state.path}]` binding against
@@ -77,20 +113,37 @@ impl Chrome {
     /// dynamic bound.
     pub fn refresh(&mut self, state: &dyn NowUiState) {
         self.semantic.refresh_dynamic_regions(&mut self.ui, state);
+        // Frees whatever that rebuild just orphaned (e.g. the explorer's
+        // whole tree, rebuilt every time the active-file highlight changes
+        // — see `Ui::gc`'s own doc comment). `editor_node`/`new_item_node`
+        // are always structurally present outside any dynamic region, so
+        // they're always reachable and never swept.
+        self.ui.gc();
         nowui_runtime::resolve::resolve_values(&mut self.ui, state, None);
-        nowui_runtime::resolve::resolve_templates(&mut self.ui, state);
+        nowui_runtime::resolve::resolve_dropdown_values(&mut self.ui, state);
+        nowui_runtime::resolve::resolve_templates(&mut self.ui, state, &self.semantic.template_exprs);
         nowui_runtime::resolve::resolve_dynamic_styles(&mut self.ui, state);
+        nowui_runtime::resolve::resolve_tree_icons(&mut self.ui);
     }
 
     /// The rect the live preview should be composited into this frame —
-    /// currently just "the chrome root's own last child" (see
-    /// `resources/designer.nowui`'s own comment on why: no dedicated
-    /// marker mechanism yet, a documented simplification for this stage,
-    /// not the final design).
+    /// currently just "the chrome root's own last child's own last child"
+    /// (that outer child is the third column's `col` wrapper, holding the
+    /// layout-picker row above the actual preview slot — see
+    /// `resources/designer.nowui`'s own comment on why this is recognized
+    /// structurally rather than via a dedicated marker: a documented
+    /// simplification for this stage, not the final design).
     pub fn preview_slot_rect(&self) -> Rect {
         let root = self.ui.get(self.ui.layers[0].root);
-        let slot = *root.children.last().expect("designer.nowui's root must have at least one child");
-        self.ui.get(slot).computed
+        let column_id = *root.children.last().expect("designer.nowui's root must have at least one child");
+        let column = self.ui.get(column_id);
+        let slot_id = *column.children.last().expect("the third column must have at least one child (the preview slot)");
+        let slot = self.ui.get(slot_id);
+        // Inset by the slot container's own padding (`resources/
+        // designer.nowui`'s `p-6` breathing room around the preview) —
+        // the composited document should sit inside that padding, not
+        // ignore it and fill the container's full outer rect.
+        slot.computed.inset(slot.style.padding)
     }
 }
 
@@ -129,7 +182,13 @@ mod tests {
     #[test]
     fn refresh_renders_the_explorer_tree_from_live_state() {
         let state = crate::state::DesignerState {
-            tree: vec![crate::state::VfsNode { name: "main.nowui".to_string(), is_dir: false, truncated: false, children: Vec::new() }],
+            tree: vec![crate::state::VfsNode {
+                name: "main.nowui".to_string(),
+                path: "/project/main.nowui".to_string(),
+                is_dir: false,
+                ..Default::default()
+            }],
+            ..Default::default()
         };
         let mut chrome = Chrome::load(&state).expect("resources/designer.nowui should load");
         chrome.refresh(&state);

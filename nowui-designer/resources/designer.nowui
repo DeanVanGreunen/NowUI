@@ -1,34 +1,102 @@
-// Chrome, dogfooded — a title strip, a `TreeView`-based project explorer
-// (real, live `DesignerState.tree` data, walked via the recursive
-// `RenderVfsNode` layout below — see nowui-runtime's `dynamic::
-// substitute_named_arg` for the engine fix that makes a loop variable
-// passed as a *named arg* into a self-referential layout resolve live
-// state, not just the literal loop-variable name), a raw-source editor
-// (see `editor.rs` — click-to-position isn't wired yet, clicking always
-// puts the caret at the end), and one preview slot. No tabs/syntax-
-// highlighting/inspector yet (see nowui-designer/src/app.rs's own module
-// doc for the build-order this is following). The preview slot is
-// recognized *structurally* right now (the root's own LAST child, and the
-// editor as the first `TextInput` found anywhere in the tree) rather than
-// via a dedicated marker — a documented simplification for this stage, not
-// a permanent design; see `chrome.rs`'s `preview_slot_rect`/`editor_node`.
+// Chrome, dogfooded — a VS-Code-dark-theme-styled title strip, a
+// `TreeView`-based project explorer (real, live `DesignerState.tree` data,
+// walked via the recursive `RenderVfsNode` layout below — see
+// nowui-runtime's `dynamic::substitute_named_arg` for the engine fix that
+// makes a loop variable passed as a *named arg* into a self-referential
+// layout resolve live state, not just the literal loop-variable name), a
+// scrollable open-tab strip (`state.tabs`, one `Button` per open file —
+// clicking one switches tabs), a raw-source editor (see `editor.rs` —
+// click-to-position isn't wired yet, clicking always puts the caret at the
+// end), a `layout:` picker `Dropdown` (`state.layout_options` — only
+// non-empty once the active tab's own file has more than one *reachable*
+// layout, see `state::LayoutOption`'s own doc comment), and the preview
+// slot. No inspector yet (see nowui-designer/src/app.rs's own module doc
+// for the build-order this is following).
+//
+// Explorer rows show real `.nowui`-authored TreeViewItem widgets: a folder
+// icon (`tree-icon-[FaFolder]`) or file icon (`tree-icon-[FaFile]`) at the
+// row's own left edge, and a `bg-[${entry.bg_color}]`/`text-[${entry.
+// text_color}]` dynamic pair highlighting whichever row is the currently
+// active tab's own file (`#094771` bg / white text, VS Code's own selected-
+// row color — see `state::apply_active_highlight`). Creating a new file/
+// folder is no longer an always-visible inline icon (see the previous
+// revision's own `folder-actions` flag) — it's now the right-click context
+// menu below, matching a real file explorer's own convention.
+//
+// Two popups are always structurally present (see `DesignerState::
+// popup_left`'s own doc comment), parked off-screen while idle: the
+// new-item name prompt (Confirm/Cancel), and the right-click context menu
+// (New File.../New Folder.../Reveal in File Explorer). Both sit as `App`'s
+// own first two children, in that order — `app.rs`'s `handle_button_click`
+// matches their buttons positionally (new-item popup's 2, then context
+// menu's 3), ahead of the tab strip's own `Button`s; this file's own source
+// order must keep matching that assumption. The preview slot and the two
+// special `TextInput`s (the new-item prompt, and the editor) are recognized
+// *structurally* right now (the root's own LAST child's own LAST child; the
+// first and second `TextInput` found anywhere in the tree) rather than via
+// a dedicated marker — a documented simplification for this stage, not a
+// permanent design; see `chrome.rs`'s `preview_slot_rect`/`editor_node`/
+// `new_item_node`.
+//
+// Visual language: VS Code's own dark theme — `#252526` sidebar/chrome
+// panels, `#1e1e1e` editor background, `#cccccc`/`#d4d4d4` text, `#094771`
+// selected-row blue, `#2a2d2e` hover. The live preview slot itself stays
+// whatever the previewed app's own styling says — it's content, not chrome.
 
 layout: RenderVfsNode(entry) {
-  TreeViewItem `${entry.name}` {
-    for child in entry.children { RenderVfsNode entry=child }
+  if entry.is_dir {
+    TreeViewItem `${entry.name}` tree-icon-[FaFolder] bg-[${entry.bg_color}] text-[${entry.text_color}] rounded-[4px] {
+      for child in entry.children { RenderVfsNode entry=child }
+    }
+  } else {
+    TreeViewItem `${entry.name}` tree-icon-[FaFile] bg-[${entry.bg_color}] text-[${entry.text_color}] rounded-[4px]
   }
 }
 
-layout: App w-[fill] h-[fill] row {
-  Container w-[240px] h-[fill] bg-gray-900 p-3 gap-2 scroll-v {
-    Text `NowUI Designer` text-white font-semibold
-    TreeView text-white {
+layout: App w-[fill] h-[fill] row bg-[#1e1e1e] {
+  // New-item popup — see this file's own top comment.
+  Container position-absolute left-[${state.popup_left}] top-[${state.popup_top}] w-[320px] bg-[#252526] border border-[#454545] rounded-lg p-5 gap-3 z-index-100 {
+    Text `${state.popup_title}` text-[#cccccc] font-semibold text-lg
+    Text `${state.creating_hint}` text-[#969696] text-sm
+    TextInput `` `Name` w-[fill] p-2 border border-[#3c3c3c] rounded bg-[#3c3c3c] text-[#cccccc] text-sm
+    Container row gap-2 justify-end {
+      Button `Cancel` bg-[#3c3c3c] text-[#cccccc] p-2 rounded border border-[#454545] text-sm hover:bg-[#454545]
+      Button `Create` bg-[#0e639c] text-white p-2 rounded text-sm hover:bg-[#1177bb]
+    }
+  }
+
+  // Right-click context menu — see this file's own top comment.
+  Container position-absolute left-[${state.context_menu_left}] top-[${state.context_menu_top}] w-[220px] bg-[#3c3c3c] border border-[#454545] rounded p-[4px] gap-[2px] z-index-100 {
+    Button `New File...` w-[fill] bg-[#3c3c3c] text-[#cccccc] p-2 rounded text-sm hover:bg-[#04395e]
+    Button `New Folder...` w-[fill] bg-[#3c3c3c] text-[#cccccc] p-2 rounded text-sm hover:bg-[#04395e]
+    Button `Reveal in File Explorer` w-[fill] bg-[#3c3c3c] text-[#cccccc] p-2 rounded text-sm hover:bg-[#04395e]
+  }
+
+  Container w-[260px] h-[fill] bg-[#252526] p-5 gap-3 scroll-v {
+    Text `NOWUI` text-[#cccccc] font-semibold text-lg
+    TreeView text-[#cccccc] {
       for entry in state.tree { RenderVfsNode entry=entry }
     }
   }
-  Container w-[fill] h-[fill] bg-white border {
-    TextInput `` `Open a .nowui file to start editing` multi w-[fill] h-[fill] p-[10px]
+  Container w-[fill] h-[fill] bg-[#1e1e1e] col {
+    Container row scroll-h gap-1 p-2 bg-[#252526] h-[hug] {
+      for tab in state.tabs {
+        if tab.active {
+          Button `${tab.label}` bg-[#1e1e1e] text-white p-2 rounded
+        } else {
+          Button `${tab.label}` bg-[#2d2d2d] text-[#969696] p-2 rounded
+        }
+      }
+    }
+    TextInput `` `Open a .nowui file to start editing` multi w-[fill] h-[fill] p-[20px] text-[#d4d4d4] bg-[#1e1e1e]
   }
-  Container w-[fill] h-[fill] bg-gray-200 {
+  Container w-[fill] h-[fill] bg-gray-100 col {
+    Container row p-2 bg-[#252526] h-[hug] {
+      Dropdown `Select a layout` w-[320px] border border-[#454545] rounded bg-[#3c3c3c] text-[#cccccc] {
+        values: state.layout_options
+      }
+    }
+    Container w-[fill] h-[fill] p-6 {
+    }
   }
 }

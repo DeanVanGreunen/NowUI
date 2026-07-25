@@ -21,6 +21,14 @@ pub trait Painter {
     /// Draw `text` inside `bounds`, respecting alignment. Implementations that
     /// lack a text stack may no-op (boxes-first milestone).
     fn draw_text(&mut self, text: &str, bounds: Rect, style: &TextStyle);
+    /// Blit `frame` (already-decoded straight RGBA8 pixels — see
+    /// `nowui-image`) stretched to fill `bounds` exactly (the solver has
+    /// already done any aspect-ratio scaling `w-[auto]`/`h-[auto]` needed —
+    /// see `layout::measure`'s own `NodeKind::Image` arm; by the time this
+    /// is called, `bounds` is simply the size to paint at). Implementations
+    /// that don't support images may no-op, same convention `draw_text`'s
+    /// own doc comment sets.
+    fn draw_image(&mut self, _frame: &nowui_image::Frame, _bounds: Rect) {}
     /// Push a rectangular clip; subsequent draws are masked to the intersection.
     fn push_clip(&mut self, rect: Rect);
     fn pop_clip(&mut self);

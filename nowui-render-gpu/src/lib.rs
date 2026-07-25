@@ -199,6 +199,34 @@ impl<'a> Painter for GpuPainter<'a> {
         }
     }
 
+    /// **Known perf simplification**: builds a fresh `peniko::Image` (a new
+    /// `Arc<Vec<u8>>` copy of `frame.rgba`) on every single call — correct,
+    /// but redraws the same static image's pixel data every frame with no
+    /// cache, unlike `GpuFontCache`'s per-glyph-file caching. A `NodeId`-
+    /// keyed image cache (mirroring `GpuFontCache`) is the natural
+    /// follow-up once this needs to scale to many/large on-screen images.
+    fn draw_image(&mut self, frame: &nowui_image::Frame, bounds: Rect) {
+        if frame.width == 0 || frame.height == 0 || bounds.w <= 0.0 || bounds.h <= 0.0 {
+            return;
+        }
+        let image = vello::peniko::ImageData {
+            data: vello::peniko::Blob::new(Arc::new(frame.rgba.clone())),
+            format: vello::peniko::ImageFormat::Rgba8,
+            alpha_type: vello::peniko::ImageAlphaType::Alpha,
+            width: frame.width,
+            height: frame.height,
+        };
+        // `Scene::draw_image` paints the image at its own native pixel size
+        // (see its own doc comment) — scale from that native size to
+        // `bounds` (the solver has already done any aspect-ratio-preserving
+        // scaling for `w-[auto]`/`h-[auto]`, so this is always a uniform
+        // stretch, never a distortion) via the same origin-relative compose
+        // order every other transform here uses, then translate into place.
+        let scale = Affine::scale_non_uniform(bounds.w as f64 / frame.width as f64, bounds.h as f64 / frame.height as f64);
+        let transform = self.active_transform() * Affine::translate((bounds.x as f64, bounds.y as f64)) * scale;
+        self.scene.draw_image(&image, transform);
+    }
+
     fn push_clip(&mut self, rect: Rect) {
         let new_rect = Self::kurbo_rect(rect);
         let intersected = match self.clips.last() {

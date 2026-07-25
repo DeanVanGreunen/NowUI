@@ -1,0 +1,15 @@
+[package]
+name = "nowui-image"
+version = "0.1.0"
+edition = "2021"
+description = "Renderer-agnostic image decoding (png/gif/jpeg/bmp/webp) for the NowUI UI toolkit."
+license = "MIT"
+repository = "https://github.com/DeanVanGreunen/NowUI"
+
+# Deliberately has no `nowui-core` dependency (same "shared preprocessing,
+# no renderer/model coupling" shape as `nowui-text`) — decoding bytes into
+# plain RGBA pixel data is a pure, renderer-agnostic concern both Painter
+# backends need identically, so it exists exactly once, here, not
+# duplicated per backend.
+[dependencies]
+image = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg", "bmp", "webp"] }

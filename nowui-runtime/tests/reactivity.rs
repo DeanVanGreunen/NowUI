@@ -34,7 +34,7 @@ impl Counter {
 }
 
 fn click(node: &mut Node) -> Event<'_> {
-    Event { kind: EventKind::Click, cursor: Point::default(), key: None, node }
+    Event { kind: EventKind::Click, cursor: Point::default(), key: None, node, child_id: None, child_label: None }
 }
 
 /// `call`'s `root` parameter aliases `state` itself (see `NowUiState::call`'s

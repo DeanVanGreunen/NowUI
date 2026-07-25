@@ -1,0 +1,14 @@
+// `disabled:` style variant + `{disabled: state.path}` binding, and a
+// ternary `${cond ? "a" : "b"}` template interpolation — see
+// `button_disabled_ternary_demo.rs`'s own doc comment.
+layout: App w-[fill] h-[fill] bg-gray-100 col gap-6 p-6 {
+  Text `disabled: + ternary template demo` text-lg font-semibold
+
+  Text `Click "Save" to start a 2-second "saving" — the button disables itself, shows red text on yellow while disabled, and its own label switches via a backtick ternary.` text-gray-600 text-sm w-[520px]
+
+  Button `${state.is_saving == true ? "Saving..." : "Save"}` bg-blue-500 text-white rounded p-[10px]
+    disabled:text-[#FF0000] disabled:bg-[#FFFF00]
+    {onClick: state.save, disabled: state.is_saving}
+
+  Text `is_saving: ${state.is_saving}` text-gray-700
+}

@@ -135,6 +135,15 @@ pub struct App<S: NowUiState + 'static> {
     /// drift accumulating frame over frame), then reschedules
     /// `ControlFlow::WaitUntil` for the new deadline.
     next_frame: Instant,
+    /// In-flight background fetches for `NodeKind::Image` nodes with a
+    /// `http://`/`https://` source, keyed by the node's own `NodeId` — see
+    /// `network_image.rs`. Polled every redraw
+    /// (`sync_network_image_loads`); an entry is removed once its receiver
+    /// yields a result. A dynamic region re-expanding away the node this was
+    /// started for (see CLAUDE.md's "no node-removal/GC" limitation) just
+    /// leaves a harmless stale entry that's silently dropped whenever the
+    /// `App` itself is.
+    network_image_loads: std::collections::HashMap<NodeId, std::sync::mpsc::Receiver<Result<nowui_image::DecodedImage, String>>>,
 }
 
 impl<S: NowUiState + 'static> App<S> {
@@ -162,6 +171,47 @@ impl<S: NowUiState + 'static> App<S> {
             transitions: Transitions::new(),
             pending_on_load_timers: Vec::new(),
             next_frame: Instant::now(),
+            network_image_loads: std::collections::HashMap::new(),
+        }
+    }
+
+    /// Poll every in-flight network-image fetch (non-blocking), applying
+    /// any that finished into their node's `decoded`/`error` fields, then
+    /// scan the arena for `NodeKind::Image` nodes that are `http(s)://` and
+    /// still "loading" (`decoded: None, error: None`, per its own doc
+    /// comment) with no fetch already tracked for them, and kick one off.
+    /// Called once per redraw, same place `advance_image_animations` is.
+    fn sync_network_image_loads(&mut self) {
+        self.network_image_loads.retain(|&id, rx| {
+            match rx.try_recv() {
+                Ok(result) => {
+                    let node = self.ui.get_mut(id);
+                    if let NodeKind::Image { decoded, error, .. } = &mut node.kind {
+                        match result {
+                            Ok(img) => *decoded = Some(img),
+                            Err(e) => *error = Some(e),
+                        }
+                    }
+                    false
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => true,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => false,
+            }
+        });
+
+        for i in 0..self.ui.nodes.len() {
+            let id = NodeId(i as u32);
+            let NodeKind::Image { source, decoded, error, .. } = &self.ui.get(id).kind else { continue };
+            if decoded.is_some() || error.is_some() {
+                continue;
+            }
+            if !(source.starts_with("http://") || source.starts_with("https://")) {
+                continue;
+            }
+            if self.network_image_loads.contains_key(&id) {
+                continue;
+            }
+            self.network_image_loads.insert(id, crate::network_image::fetch(source.clone()));
         }
     }
 
@@ -178,9 +228,14 @@ impl<S: NowUiState + 'static> App<S> {
         crate::resolve::resolve_values(&mut self.ui, &self.state, self.dragging_slider);
     }
 
+    /// Thin wrapper around `crate::resolve::resolve_disabled`.
+    fn resolve_disabled(&mut self) {
+        crate::resolve::resolve_disabled(&mut self.ui, &self.state);
+    }
+
     /// Thin wrapper around `crate::resolve::resolve_templates`.
     fn resolve_templates(&mut self) {
-        crate::resolve::resolve_templates(&mut self.ui, &self.state);
+        crate::resolve::resolve_templates(&mut self.ui, &self.state, &self.semantic.template_exprs);
     }
 
     /// Thin wrapper around `crate::resolve::resolve_dynamic_styles`.
@@ -208,10 +263,38 @@ impl<S: NowUiState + 'static> App<S> {
     /// Marks the UI dirty when the handler ran, since a callback mutating
     /// state (or the node) almost always needs a redraw to show it.
     fn dispatch_event(&mut self, id: NodeId, event_name: &str, kind: EventKind, key: Option<String>) {
+        self.dispatch_event_with_child(id, event_name, kind, key, None, None);
+    }
+
+    /// Same as `dispatch_event`, plus `Event::child_id`/`child_label` — used
+    /// only by `Dropdown`'s `onSelect` so far (the just-selected
+    /// `DropdownItem`'s own `id`/`label`, since a dropdown option isn't a
+    /// real arena node `event.node` could otherwise point at — see
+    /// `Event::child_id`'s own doc comment). A separate method rather than
+    /// widening `dispatch_event`'s own signature, so its dozen-plus other
+    /// call sites (none of which have a meaningful "child") don't all need
+    /// two extra `None`s.
+    fn dispatch_event_with_child(
+        &mut self,
+        id: NodeId,
+        event_name: &str,
+        kind: EventKind,
+        key: Option<String>,
+        child_id: Option<String>,
+        child_label: Option<String>,
+    ) {
+        // A disabled node's own bound events don't fire — except `onLoad`,
+        // which isn't really user interaction (see `EVENT_BINDING_KEYS`'s
+        // own doc comment on why it's the odd one out) and shouldn't be
+        // silently skipped just because the node happens to start out
+        // disabled.
+        if kind != EventKind::Load && self.ui.get(id).disabled {
+            return;
+        }
         let Some(path) = self.ui.get(id).events.get(event_name).cloned() else { return };
         let cursor = self.cursor;
         let node = self.ui.get_mut(id);
-        let mut event = Event { kind, cursor, key, node };
+        let mut event = Event { kind, cursor, key, node, child_id, child_label };
         // SAFETY: `root` is a second, independently-constructed `&mut S`
         // aliasing `self.state` — the same object `call` is about to be
         // invoked on as its receiver — so a handler can reach sibling state
@@ -281,20 +364,22 @@ impl<S: NowUiState + 'static> App<S> {
     }
 
     /// Recompute each node's per-frame effective style (`base_style` +
-    /// responsive/hover/focus/active overlays), transition-smoothing the
-    /// animatable subset (colors/opacity/radius/transform). Non-animatable
+    /// responsive/hover/focus/active/disabled overlays), transition-smoothing
+    /// the animatable subset (colors/opacity/radius/transform). Non-animatable
     /// fields (sizing, typography, grid tracks, ...) snap instantly — see
     /// CLAUDE.md for why only that subset is animated.
     fn apply_dynamic_styles(&mut self, viewport_w: f32) {
         let now = Instant::now();
         for i in 0..self.ui.nodes.len() {
             let id = NodeId(i as u32);
-            let base = self.ui.get(id).base_style.clone();
+            let node = self.ui.get(id);
+            let base = node.base_style.clone();
+            let disabled = node.disabled;
             let hovered = self.hovered == Some(id);
             let focused = self.ui.focus == Some(id);
             let pressed = self.pressed == Some(id);
 
-            let target = compute_effective(&base, viewport_w, hovered, focused, pressed);
+            let target = compute_effective(&base, viewport_w, hovered, focused, pressed, disabled);
             let mut effective = target.clone();
             let animated = self.transitions.step(id, AnimatableStyle::from_style(&target), base.transition, now);
             animated.write_into(&mut effective);
@@ -326,13 +411,33 @@ impl<S: NowUiState + 'static> App<S> {
         // `value_path`/`templates`/`Style::dynamic` resolved this same
         // frame, not one frame late.
         self.semantic.refresh_dynamic_regions(&mut self.ui, &self.state);
+        // Frees whatever a region rebuild just orphaned (see `Ui::gc`'s own
+        // doc comment) — cheap enough to run unconditionally every redraw,
+        // and precisely timed: right after the one point in the frame that
+        // can actually create new garbage.
+        self.ui.gc();
         self.dispatch_pending_on_load();
 
+        // Rebuilds a `values`-bound `Dropdown`'s option list before
+        // `resolve_values` runs, so an explicit `{value: state.path}`
+        // binding (if also present) gets the final say on `selected`
+        // against the freshly-rebuilt `option_ids`, not a stale list.
+        crate::resolve::resolve_dropdown_values(&mut self.ui, &self.state);
         self.resolve_values();
         self.resolve_year_bounds();
         self.resolve_templates();
         self.resolve_dynamic_styles();
+        // Must run before `apply_dynamic_styles` — it reads `Node::disabled`
+        // to decide whether to apply the `disabled:` style variant.
+        self.resolve_disabled();
         self.apply_dynamic_styles(w as f32);
+        // Must run after `apply_dynamic_styles` — it reads each node's
+        // *effective* (hover/focus/active-resolved) `line_color`/
+        // `text_color` off `node.style`, not the unvaried `base_style`.
+        crate::resolve::resolve_icon_colors(&mut self.ui);
+        crate::resolve::resolve_tree_icons(&mut self.ui);
+        crate::resolve::advance_image_animations(&mut self.ui, FRAME_INTERVAL.as_secs_f32() * 1000.0);
+        self.sync_network_image_loads();
 
         // Kept in sync here (rather than on every input event) since these
         // only ever matter to `paint`'s hand-drawn popup-control hover/press
@@ -443,6 +548,15 @@ impl<S: NowUiState + 'static> App<S> {
     /// that lives outside the node's own `computed` rect (see paint.rs) and
     /// so isn't reachable through the normal rect-based `hit_test`.
     fn handle_click(&mut self, id: NodeId) {
+        // A disabled node doesn't respond to a click at all — no state
+        // toggle (Checkbox/Dropdown/Menu/Date/... open-on-click), no value
+        // write-back, no `onClick` dispatch — same as a real HTML
+        // `disabled` attribute. `Node::disabled` is resolved fresh every
+        // redraw by `resolve_disabled`, so this always reflects the
+        // current `{disabled: state.path}` binding, not a stale snapshot.
+        if self.ui.get(id).disabled {
+            return;
+        }
         let mut new_value = None;
         // Precomputed before the match below (which needs `self.ui.
         // get_mut(id)` — a `TreeViewItem`'s own `computed` rect always
@@ -452,8 +566,10 @@ impl<S: NowUiState + 'static> App<S> {
         // `TREE_TRIANGLE_W` and `TREE_TRIANGLE_W..+font_size` mark out,
         // matching exactly what `paint::paint_tree_view_item` draws there.
         let tree_item_local_x = self.ui.cursor.x - self.ui.get(id).computed.x;
+        let tree_item_row_w = self.ui.get(id).computed.w;
         let tree_item_has_children = !self.ui.get(id).children.is_empty();
         let mut tree_collapse_toggled_to: Option<bool> = None;
+        let mut tree_add_event: Option<&'static str> = None;
         match &mut self.ui.get_mut(id).kind {
             NodeKind::Checkbox { checked, .. } => {
                 *checked = !*checked;
@@ -510,8 +626,14 @@ impl<S: NowUiState + 'static> App<S> {
             // zone does neither on its own; `onClick` (dispatched below,
             // unconditionally) is how an app hooks up its own
             // select/navigate behavior for that.
-            NodeKind::TreeViewItem { collapsed, checkbox, selected, .. } => {
-                if tree_item_local_x < nowui_core::layout::TREE_TRIANGLE_W {
+            NodeKind::TreeViewItem { collapsed, checkbox, selected, show_folder_actions, .. } => {
+                let folder_zone_start = tree_item_row_w - nowui_core::layout::TREE_ACTION_ICON_W;
+                let file_zone_start = folder_zone_start - nowui_core::layout::TREE_ACTION_GAP - nowui_core::layout::TREE_ACTION_ICON_W;
+                if *show_folder_actions && tree_item_local_x >= folder_zone_start {
+                    tree_add_event = Some("onAddFolder");
+                } else if *show_folder_actions && tree_item_local_x >= file_zone_start {
+                    tree_add_event = Some("onAddFile");
+                } else if tree_item_local_x < nowui_core::layout::TREE_TRIANGLE_W {
                     if tree_item_has_children {
                         *collapsed = !*collapsed;
                         tree_collapse_toggled_to = Some(*collapsed);
@@ -528,6 +650,9 @@ impl<S: NowUiState + 'static> App<S> {
         if let Some(collapsed) = tree_collapse_toggled_to {
             self.dispatch_event(id, if collapsed { "onNodeCollapsed" } else { "onNodeUncollapsed" }, EventKind::Click, None);
         }
+        if let Some(event_key) = tree_add_event {
+            self.dispatch_event(id, event_key, EventKind::Click, None);
+        }
         // Clicking anywhere closes every *other* open dropdown/menu/picker —
         // there's no outside-click-detection system built in, so without
         // this an open popup would just sit there floating forever.
@@ -539,7 +664,10 @@ impl<S: NowUiState + 'static> App<S> {
 
     /// The screen-space rect an open dropdown's popup occupies — must match
     /// `paint::paint_dropdown_popup`'s placement exactly, or clicks and
-    /// pixels disagree about where the list is.
+    /// pixels disagree about where the list is. Clamped to `DROPDOWN_POPUP_
+    /// MAX_H` — beyond that the popup scrolls (see `dropdown_popup_content_h`
+    /// for the *full*, unclamped content height a scrollbar/wheel handler
+    /// needs instead).
     fn dropdown_popup_rect(&self, id: NodeId) -> Option<Rect> {
         let node = self.ui.get(id);
         let NodeKind::Dropdown { options, open, .. } = &node.kind else { return None };
@@ -548,7 +676,19 @@ impl<S: NowUiState + 'static> App<S> {
         }
         let (_, option_h) = dropdown_metrics(node.style.font_size);
         let rect = node.computed;
-        Some(Rect::new(rect.x, rect.y + rect.h, rect.w, option_h * options.len() as f32))
+        let h = (option_h * options.len() as f32).min(nowui_core::DROPDOWN_POPUP_MAX_H);
+        Some(Rect::new(rect.x, rect.y + rect.h, rect.w, h))
+    }
+
+    /// The *full*, unclamped height of an open dropdown's option list — how
+    /// far `Node::scroll_offset.y` can range, and what decides whether the
+    /// popup scrolls at all (`content_h > dropdown_popup_rect`'s own,
+    /// clamped height).
+    fn dropdown_popup_content_h(&self, id: NodeId) -> f32 {
+        let node = self.ui.get(id);
+        let NodeKind::Dropdown { options, .. } = &node.kind else { return 0.0 };
+        let (_, option_h) = dropdown_metrics(node.style.font_size);
+        option_h * options.len() as f32
     }
 
     /// Find the open dropdown (if any) whose floating popup contains `p`.
@@ -563,18 +703,43 @@ impl<S: NowUiState + 'static> App<S> {
         let rect = node.computed;
         let font_size = node.style.font_size;
         let (_, option_h) = dropdown_metrics(font_size);
-        let local_y = p.y - (rect.y + rect.h);
-        let mut selected_str = None;
-        if let NodeKind::Dropdown { options, selected, open, .. } = &mut node.kind {
+        // `scroll_offset.y` shifts the *visible* rows up (see `paint_
+        // dropdown_popup`), so a click's local position within the popup
+        // needs it added back before dividing into a row index — same
+        // convention any `scroll-y` container's own hit math would need,
+        // just not generalized here since a `Dropdown` popup isn't a real
+        // in-flow child tree.
+        let local_y = p.y - (rect.y + rect.h) + node.scroll_offset.y;
+        let mut selected_item = None;
+        if let NodeKind::Dropdown { options, option_ids, option_disabled, selected, open, .. } = &mut node.kind {
             let idx = (local_y / option_h).max(0.0) as usize;
             if idx < options.len() {
-                *selected = Some(idx);
-                selected_str = Some(options[idx].clone());
+                // A disabled option (blank id, or an explicit `disabled`
+                // flag) doesn't respond to a click at all — same as a real
+                // HTML `<select>`'s own disabled `<option>` — but the popup
+                // stays open, letting the user pick something else instead
+                // of having to reopen it.
+                if !option_disabled[idx] {
+                    *selected = Some(idx);
+                    selected_item = Some((option_ids[idx].clone(), options[idx].clone()));
+                    *open = false;
+                }
+            } else {
+                *open = false;
             }
-            *open = false;
         }
-        if let Some(s) = selected_str {
-            self.write_back_value(id, StateValue::Str(s));
+        if let Some((item_id, label)) = selected_item {
+            // `{value: state.path}` still gets the option's own id (its
+            // real identity — matches `resolve_values`'s own `option_ids`-
+            // first lookup), same two-way binding every other value-bound
+            // widget already has; `onSelect` fires *in addition to*, not
+            // instead of, that write-back — it's for imperative "run code
+            // when the selection changes" logic (same convention `Date`/
+            // `Time`/`DateTime`'s own `onSelect` already established), and
+            // gets the item's own id/label since a dropdown option isn't a
+            // real arena node `event.node` could otherwise point at.
+            self.write_back_value(id, StateValue::Str(item_id.clone()));
+            self.dispatch_event_with_child(id, "onSelect", EventKind::Click, None, Some(item_id), Some(label));
         }
         self.close_other_dropdowns(Some(id));
     }
@@ -1141,7 +1306,7 @@ impl<S: NowUiState + 'static> App<S> {
     /// the caller can skip a no-op state write for a pure cursor-move/no-op
     /// (e.g. Backspace on an already-empty field, or an arrow key).
     fn edit_text_input(&mut self, id: NodeId, logical_key: &Key, text: Option<&str>, shift: bool, ctrl: bool) -> Option<String> {
-        use nowui_core::text_input::{char_len, delete_range, insert_str, move_left, move_right};
+        use nowui_core::text_input::{char_index_at, char_len, delete_range, insert_str, line_and_col, move_left, move_right};
 
         let multiline = self.ui.get(id).style.multiline;
         let NodeKind::TextInput { label, cursor, selection_anchor, .. } = &mut self.ui.get_mut(id).kind else {
@@ -1177,6 +1342,38 @@ impl<S: NowUiState + 'static> App<S> {
             }
             Key::Named(NamedKey::ArrowLeft) => move_left(cursor, selection_anchor, shift),
             Key::Named(NamedKey::ArrowRight) => move_right(cursor, selection_anchor, shift, char_len(label)),
+            // Move to the same column on the line above/below, clamped to
+            // that line's own length if it's shorter (`char_index_at`'s own
+            // "out of range col clamps to that line's length" contract) —
+            // same hard-line model `line_and_col`/`char_index_at` already
+            // give every other multiline caret operation here. A no-op at
+            // the first/last line, same as `move_left`/`move_right` at the
+            // very start/end of the text. Meaningless (but harmless) on a
+            // single-line `TextInput` — `line_and_col` always reports line 0
+            // there, so `ArrowUp` no-ops and `ArrowDown`'s own `char_index_at`
+            // clamp keeps the cursor on that same only line.
+            Key::Named(NamedKey::ArrowUp) => {
+                let (line, col) = line_and_col(label, *cursor);
+                if line > 0 {
+                    if shift {
+                        selection_anchor.get_or_insert(*cursor);
+                    } else {
+                        *selection_anchor = None;
+                    }
+                    *cursor = char_index_at(label, line - 1, col);
+                } else if !shift {
+                    *selection_anchor = None;
+                }
+            }
+            Key::Named(NamedKey::ArrowDown) => {
+                let (line, col) = line_and_col(label, *cursor);
+                if shift {
+                    selection_anchor.get_or_insert(*cursor);
+                } else {
+                    *selection_anchor = None;
+                }
+                *cursor = char_index_at(label, line + 1, col);
+            }
             Key::Named(NamedKey::Home) => {
                 if shift {
                     selection_anchor.get_or_insert(*cursor);
@@ -1687,6 +1884,27 @@ impl<S: NowUiState + 'static> ApplicationHandler for App<S> {
                     break;
                 }
 
+                // No in-flow `scroll-h`/`scroll-v` container claimed it: an
+                // open `Dropdown` popup isn't part of that hit-test chain at
+                // all (it's a floating popup, not a normal child — see
+                // `find_open_dropdown_popup_at`), so it gets its own check
+                // here, scrolling only when its *full* content actually
+                // overflows the clamped `DROPDOWN_POPUP_MAX_H` box.
+                if !claimed {
+                    if let Some(id) = self.find_open_dropdown_popup_at(self.cursor) {
+                        let content_h = self.dropdown_popup_content_h(id);
+                        let visible_h = self.dropdown_popup_rect(id).map(|r| r.h).unwrap_or(0.0);
+                        let max_y = (content_h - visible_h).max(0.0);
+                        if max_y > 0.0 {
+                            let node = self.ui.get_mut(id);
+                            node.scroll_offset.y = (node.scroll_offset.y - dy).clamp(0.0, max_y);
+                            claimed = true;
+                            self.ui.dirty = true;
+                            self.request_redraw();
+                        }
+                    }
+                }
+
                 // No `scroll-h`/`scroll-v` container claimed it: if a picker
                 // popup currently has the page panned to reveal it (see
                 // `update_auto_scroll`), let the wheel pan further within
@@ -1760,6 +1978,32 @@ mod tests {
     }
 
     #[test]
+    fn resolve_dynamic_styles_applies_a_dynamic_value_inside_a_hover_variant() {
+        // `hover:fill-color-[${state.hoverColorValue}]` — recorded on the
+        // *hover variant's own* `Style::dynamic`, not the base style's (see
+        // `semantic::resolve_styles`), so this needs its own resolution
+        // pass distinct from the base-style case above.
+        #[derive(Default, Clone, NowUiState)]
+        struct ColorState {
+            hover_color: String,
+        }
+        let mut style = Style::default();
+        let mut hover = Style::default();
+        hover.dynamic.insert("fill-color".to_string(), vec!["state".to_string(), "hover_color".to_string()]);
+        style.variants.hover = Some(Box::new(hover));
+        let mut ui = Ui::new();
+        let id = ui.push(Node::new(NodeKind::Container, style));
+        ui.add_layer(id, "main");
+
+        let mut app =
+            App::new("test".to_string(), ui, ColorState { hover_color: "#ffff00".to_string() }, crate::semantic::Semantic::new(&[]), Backend::Cpu);
+        app.resolve_dynamic_styles();
+
+        let hover = app.ui.get(id).base_style.variants.hover.as_ref().expect("hover variant still present");
+        assert_eq!(hover.line_color, nowui_core::Color::from_hex("#ffff00"));
+    }
+
+    #[test]
     fn on_load_delay_defers_dispatch_until_its_deadline_passes() {
         #[derive(Default, Clone, nowui_core::NowUiState)]
         #[nowui(methods(loaded))]
@@ -1786,6 +2030,145 @@ mod tests {
         app.fire_due_on_load_timers();
         assert_eq!(app.state.load_count, 1, "deadline passed — fires on the next check");
         assert!(app.pending_on_load_timers.is_empty());
+    }
+
+    #[test]
+    fn select_dropdown_option_writes_back_the_id_and_dispatches_onselect_with_the_child() {
+        #[derive(Default, Clone, nowui_core::NowUiState)]
+        #[nowui(methods(on_select))]
+        struct S {
+            selected_id: String,
+            last_child_id: String,
+            last_child_label: String,
+        }
+        impl S {
+            fn on_select(&mut self, app: &mut S, event: &mut nowui_core::Event) {
+                app.last_child_id = event.child_id.clone().unwrap_or_default();
+                app.last_child_label = event.child_label.clone().unwrap_or_default();
+            }
+        }
+
+        let src = "layout: T { Dropdown `Choose` {value: state.selected_id, onSelect: state.on_select} { \
+            DropdownItem `id_here` `Label Here` \
+            DropdownItem `id_two` `Label Two` \
+            } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = crate::semantic::Semantic::new(&ast);
+        let ui = sem.build("T", &S::default()).unwrap();
+
+        let mut app = App::new("test".to_string(), ui, S::default(), sem, Backend::Cpu);
+        let root = app.ui.layers[0].root;
+        let dropdown_id = app.ui.get(root).children[0];
+        app.ui.get_mut(dropdown_id).computed = Rect::new(0.0, 0.0, 200.0, 30.0);
+
+        // Click inside the popup's second row ("id_two") — see
+        // `select_dropdown_option`'s own math for how a click point maps to
+        // an option index.
+        let (_, option_h) = dropdown_metrics(16.0);
+        let click_point = Point { x: 10.0, y: 30.0 + option_h * 1.5 };
+        app.select_dropdown_option(dropdown_id, click_point);
+
+        assert_eq!(app.state.selected_id, "id_two", "value binding should write back the option's own id");
+        assert_eq!(app.state.last_child_id, "id_two");
+        assert_eq!(app.state.last_child_label, "Label Two");
+        let NodeKind::Dropdown { selected, .. } = &app.ui.get(dropdown_id).kind else { panic!() };
+        assert_eq!(*selected, Some(1));
+    }
+
+    #[test]
+    fn clicking_a_disabled_dropdown_option_is_a_no_op() {
+        #[derive(Default, Clone, nowui_core::NowUiState)]
+        #[nowui(methods(on_select))]
+        struct S {
+            selected_id: String,
+            select_count: i64,
+        }
+        impl S {
+            fn on_select(&mut self, app: &mut S, _event: &mut nowui_core::Event) {
+                app.select_count += 1;
+            }
+        }
+
+        // A blank id (the first item) is implicitly disabled, and the
+        // second item opts in explicitly — both should be unclickable.
+        let src = "layout: T { Dropdown `Choose` {value: state.selected_id, onSelect: state.on_select} { \
+            DropdownItem `` `-- choose one --` default-selected \
+            DropdownItem `id_disabled` `Disabled Option` disabled \
+            DropdownItem `id_two` `Enabled Option` \
+            } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = crate::semantic::Semantic::new(&ast);
+        let ui = sem.build("T", &S::default()).unwrap();
+
+        let mut app = App::new("test".to_string(), ui, S::default(), sem, Backend::Cpu);
+        let root = app.ui.layers[0].root;
+        let dropdown_id = app.ui.get(root).children[0];
+        app.ui.get_mut(dropdown_id).computed = Rect::new(0.0, 0.0, 200.0, 30.0);
+
+        let (_, option_h) = dropdown_metrics(16.0);
+
+        // Row 0 — the blank-id placeholder, already the default selection.
+        app.select_dropdown_option(dropdown_id, Point { x: 10.0, y: 30.0 + option_h * 0.5 });
+        assert_eq!(app.state.select_count, 0, "clicking a disabled row must not fire onSelect");
+        assert!(app.state.selected_id.is_empty(), "must not write back a disabled row's id");
+
+        // Row 1 — explicitly `disabled`.
+        app.select_dropdown_option(dropdown_id, Point { x: 10.0, y: 30.0 + option_h * 1.5 });
+        assert_eq!(app.state.select_count, 0);
+        assert!(app.state.selected_id.is_empty());
+
+        // Row 2 — enabled, should work normally.
+        app.select_dropdown_option(dropdown_id, Point { x: 10.0, y: 30.0 + option_h * 2.5 });
+        assert_eq!(app.state.select_count, 1);
+        assert_eq!(app.state.selected_id, "id_two");
+    }
+
+    #[test]
+    fn a_disabled_button_does_not_dispatch_onclick_and_shows_its_disabled_styling() {
+        #[derive(Default, Clone, nowui_core::NowUiState)]
+        #[nowui(methods(save))]
+        struct S {
+            saving: bool,
+            save_count: i64,
+        }
+        impl S {
+            fn save(&mut self, app: &mut S, _event: &Event) {
+                app.save_count += 1;
+            }
+        }
+
+        let src = "layout: T { Button `Save` text-color-[#000000] bg-[#ffffff] disabled:text-color-[#ff0000] \
+            disabled:bg-[#ffff00] {onClick: state.save, disabled: state.saving} }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = crate::semantic::Semantic::new(&ast);
+        let ui = sem.build("T", &S::default()).unwrap();
+
+        let mut app = App::new("test".to_string(), ui, S { saving: true, save_count: 0 }, sem, Backend::Cpu);
+        let root = app.ui.layers[0].root;
+        let button_id = app.ui.get(root).children[0];
+
+        // Resolve `disabled` + effective style the same way a real redraw
+        // would, before the click — `disabled:`'s own styling should be
+        // showing, and the click itself should be a complete no-op.
+        app.resolve_disabled();
+        app.apply_dynamic_styles(800.0);
+        assert!(app.ui.get(button_id).disabled);
+        assert_eq!(app.ui.get(button_id).style.text_color, nowui_core::Color::from_hex("#ff0000").unwrap());
+        assert_eq!(app.ui.get(button_id).style.bg, nowui_core::Color::from_hex("#ffff00"));
+
+        app.handle_click(button_id);
+        assert_eq!(app.state.save_count, 0, "a disabled button must not dispatch onClick");
+
+        // Re-enable and confirm it now works normally — proves the gate is
+        // driven live by `disabled_path`, not baked in once.
+        app.state.saving = false;
+        app.resolve_disabled();
+        app.apply_dynamic_styles(800.0);
+        assert!(!app.ui.get(button_id).disabled);
+        assert_eq!(app.ui.get(button_id).style.text_color, nowui_core::Color::from_hex("#000000").unwrap());
+
+        app.handle_click(button_id);
+        assert_eq!(app.state.save_count, 1);
     }
 
     #[test]
@@ -1909,11 +2292,11 @@ mod tests {
     fn clicking_the_disclosure_triangle_toggles_collapsed_and_dispatches_the_matching_event() {
         let mut ui = Ui::new();
         let leaf = ui.push(Node::new(
-            NodeKind::TreeViewItem { id: "leaf".to_string(), label: "Leaf".to_string(), collapsed: false, selected: false, checkbox: false },
+            NodeKind::TreeViewItem { id: "leaf".to_string(), label: "Leaf".to_string(), collapsed: false, selected: false, checkbox: false, show_folder_actions: false, icon: None },
             Style::default(),
         ));
         let item = ui.push(Node::new(
-            NodeKind::TreeViewItem { id: "item".to_string(), label: "Parent".to_string(), collapsed: false, selected: false, checkbox: false },
+            NodeKind::TreeViewItem { id: "item".to_string(), label: "Parent".to_string(), collapsed: false, selected: false, checkbox: false, show_folder_actions: false, icon: None },
             Style::default(),
         ));
         ui.get_mut(item).children = vec![leaf];
@@ -1954,10 +2337,54 @@ mod tests {
     }
 
     #[test]
+    fn clicking_a_folders_action_icons_dispatches_onaddfile_or_onaddfolder_without_toggling_collapsed() {
+        let mut ui = Ui::new();
+        let item = ui.push(Node::new(
+            NodeKind::TreeViewItem { id: "item".to_string(), label: "widgets".to_string(), collapsed: false, selected: false, checkbox: false, show_folder_actions: true, icon: None },
+            Style::default(),
+        ));
+        ui.get_mut(item).computed = Rect::new(0.0, 0.0, 200.0, 20.0);
+        ui.get_mut(item).events.insert("onAddFile".to_string(), vec!["state".to_string(), "on_add_file".to_string()]);
+        ui.get_mut(item).events.insert("onAddFolder".to_string(), vec!["state".to_string(), "on_add_folder".to_string()]);
+        ui.add_layer(item, "main");
+
+        #[derive(Default, Clone, nowui_core::NowUiState)]
+        #[nowui(methods(on_add_file, on_add_folder))]
+        struct S {
+            add_file_count: u32,
+            add_folder_count: u32,
+        }
+        impl S {
+            fn on_add_file(&mut self, _app: &mut S, _e: &nowui_core::Event) {
+                self.add_file_count += 1;
+            }
+            fn on_add_folder(&mut self, _app: &mut S, _e: &nowui_core::Event) {
+                self.add_folder_count += 1;
+            }
+        }
+
+        let mut app = App::new("test".to_string(), ui, S::default(), crate::semantic::Semantic::new(&[]), Backend::Cpu);
+
+        // Inside the add-folder zone, at the row's own right edge.
+        app.ui.cursor = Point::new(198.0, 5.0);
+        app.handle_click(item);
+        assert_eq!(app.state.add_folder_count, 1);
+        assert_eq!(app.state.add_file_count, 0);
+        let NodeKind::TreeViewItem { collapsed, .. } = &app.ui.get(item).kind else { panic!() };
+        assert!(!collapsed, "the action-icon zones must not also toggle collapsed");
+
+        // Inside the add-file zone, just to the left of the add-folder icon.
+        app.ui.cursor = Point::new(180.0, 5.0);
+        app.handle_click(item);
+        assert_eq!(app.state.add_file_count, 1);
+        assert_eq!(app.state.add_folder_count, 1);
+    }
+
+    #[test]
     fn clicking_the_checkbox_zone_toggles_selected_only_in_checkbox_mode() {
         let mut ui = Ui::new();
         let item = ui.push(Node::new(
-            NodeKind::TreeViewItem { id: "item".to_string(), label: "Item".to_string(), collapsed: false, selected: false, checkbox: true },
+            NodeKind::TreeViewItem { id: "item".to_string(), label: "Item".to_string(), collapsed: false, selected: false, checkbox: true, show_folder_actions: false, icon: None },
             Style::default(),
         ));
         ui.get_mut(item).computed = Rect::new(0.0, 0.0, 200.0, 20.0);
@@ -2563,6 +2990,28 @@ mod tests {
             app.edit_text_input(id, &Key::Named(NamedKey::Enter), Some("\r"), false, false),
             Some("h\no".to_string())
         );
+    }
+
+    #[test]
+    fn arrow_up_down_move_to_the_same_column_clamped_to_a_shorter_lines_own_length() {
+        let (mut app, id) = multiline_text_input_app("abcd\nwx\nyzab");
+        if let NodeKind::TextInput { cursor, .. } = &mut app.ui.get_mut(id).kind {
+            *cursor = 10; // "yzab" col 2 ('a')
+        }
+        app.edit_text_input(id, &Key::Named(NamedKey::ArrowUp), None, false, false);
+        // "wx" is only 2 chars long — clamps to its own end, not column 2.
+        assert_eq!(text_input_state(&app, id).1, 7);
+
+        app.edit_text_input(id, &Key::Named(NamedKey::ArrowUp), None, false, false);
+        // Back on "abcd", column 2 fits fine.
+        assert_eq!(text_input_state(&app, id).1, 2);
+
+        app.edit_text_input(id, &Key::Named(NamedKey::ArrowUp), None, false, false);
+        // Already on the first line — a no-op.
+        assert_eq!(text_input_state(&app, id).1, 2);
+
+        app.edit_text_input(id, &Key::Named(NamedKey::ArrowDown), None, false, false);
+        assert_eq!(text_input_state(&app, id).1, 7, "column 2 -> clamped to 'wx' end");
     }
 
     #[test]

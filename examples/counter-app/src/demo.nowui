@@ -52,7 +52,11 @@ layout: App w-[fill] h-[fill] bg-gray-100 {
         Text `Settings` text-gray-800 font-semibold text-lg pb-2
 
         Text `Theme` text-gray-700 text-sm font-medium
-        Dropdown `Choose a theme` `Light` `Dark` `System` w-full border border-gray-300 rounded {value: state.theme}
+        Dropdown `Choose a theme` w-full border border-gray-300 rounded {value: state.theme} {
+          DropdownItem `light` `Light`
+          DropdownItem `dark` `Dark`
+          DropdownItem `system` `System`
+        }
 
         Checkbox `Enable notifications` text-gray-700 text-sm border border-gray-400 bg-gray-50 rounded pt-2
 

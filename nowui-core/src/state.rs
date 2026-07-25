@@ -153,6 +153,16 @@ pub struct Event<'a> {
     pub cursor: Point,
     pub key: Option<String>,
     pub node: &'a mut Node,
+    /// The specific child/item that caused this event, when one exists —
+    /// currently populated only for `Dropdown`'s `onSelect` (the just-
+    /// selected `DropdownItem`'s own `id`/`label`, i.e. `option_ids[i]`/
+    /// `options[i]` at the moment of selection), `None` for every other
+    /// event. Plain owned strings, not a live node handle — `Event` already
+    /// can't be `Clone` because `node` borrows the arena, and a dropdown
+    /// option isn't a real arena node at all (see `NodeKind::Dropdown`'s
+    /// own doc comment), so there's nothing to hand back a reference to.
+    pub child_id: Option<String>,
+    pub child_label: Option<String>,
 }
 
 /// Implemented by a live application state object — usually via

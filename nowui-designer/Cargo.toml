@@ -19,6 +19,7 @@ nowui-syntax = { path = "../nowui-syntax", version = "0.1.0" }
 nowui-runtime = { path = "../nowui-runtime", version = "0.1.0" }
 nowui-render-gpu = { path = "../nowui-render-gpu", version = "0.1.0" }
 nowui-text = { path = "../nowui-text", version = "0.1.0" }
+nowui-icons = { path = "../nowui-icons", version = "0.1.0" }
 vello = { workspace = true }
 # In-process tokenizer reuse for syntax highlighting (see nowui-lsp's own
 # Cargo.toml comment) — no tower-lsp/tokio pulled in just for this.

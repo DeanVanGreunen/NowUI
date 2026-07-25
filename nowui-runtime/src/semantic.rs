@@ -55,6 +55,23 @@ pub struct Semantic {
     /// `Semantic`/offset bookkeeping to disambiguate which file a span is
     /// relative to; a single-file caller can use it directly.
     pub node_spans: HashMap<NodeId, nowui_syntax::ast::Span>,
+    /// `NodeId -> its original (scope-resolved), un-lowered
+    /// `nowui_syntax::ast::Template`s — populated in `expand()` alongside
+    /// `templates`/`node_spans`, but only for a node with at least one
+    /// `${...}` backtick containing something richer than a bare dotted
+    /// path (currently only a ternary — see `TplPart::Expr`). `nowui-core`
+    /// can't hold a raw `Expr` (its own "no chumsky/no nowui-syntax
+    /// dependency" hard rule), so this side table — evaluated fresh every
+    /// redraw by `resolve::resolve_templates` via `dynamic::eval_expr`,
+    /// exactly the same machinery `if`/`for` conditions already use — is
+    /// the only place that Expr tree survives *at all* past the semantic
+    /// pass; `Node::templates` (nowui-core) is left with harmless empty
+    /// placeholders at whichever indices this table's own entries cover
+    /// (see `to_core_template`'s own comment on its `TplPart::Expr` arm).
+    /// Every backtick of a node present here — even a plain-path one mixed
+    /// in alongside a ternary — renders through this table uniformly, to
+    /// avoid a per-argument-index mixed-strategy.
+    pub template_exprs: HashMap<NodeId, Vec<nowui_syntax::ast::Template>>,
 }
 
 /// A live top-level dynamic region: the still-unexpanded AST it came from,
@@ -100,7 +117,14 @@ impl Semantic {
                 );
             }
         }
-        Semantic { defs, warnings: Vec::new(), regions: Vec::new(), pending_on_load: Vec::new(), node_spans: HashMap::new() }
+        Semantic {
+            defs,
+            warnings: Vec::new(),
+            regions: Vec::new(),
+            pending_on_load: Vec::new(),
+            node_spans: HashMap::new(),
+            template_exprs: HashMap::new(),
+        }
     }
 
     /// Drain every node id created (by `expand`) since the last call to
@@ -153,12 +177,36 @@ impl Semantic {
         track: bool,
     ) -> Vec<NodeId> {
         let mut kids = Vec::new();
+        // Owned, not the borrowed parameter, so a `Variable name=value`
+        // partway through this list can extend it for every *remaining*
+        // sibling (and their descendants) without touching anything that
+        // came before it — a `let`-shaped declaration, not a widget; see
+        // the loop body's own `"Variable"` arm below for why it never
+        // reaches `expand()`/`primitive()` at all.
+        let mut scope = scope.clone();
         for child in children {
+            if let AstNode::Widget { kind, args, .. } = child {
+                if kind == "Variable" {
+                    // Resolved eagerly against the scope *so far* (same
+                    // moment `bind_scope` resolves a custom layout's own
+                    // params) — so `Variable b=a` (aliasing an earlier
+                    // `Variable`/param, not `state` directly) chains
+                    // correctly instead of capturing the unresolved name.
+                    for arg in args {
+                        let resolved = match &arg.value {
+                            BindValue::Path(path) => BindValue::Path(resolve_scoped_path(path, &scope)),
+                            other => other.clone(),
+                        };
+                        scope.insert(arg.name.clone(), resolved);
+                    }
+                    continue;
+                }
+            }
             match child {
                 AstNode::If { branches, else_branch } => {
                     let start = kids.len();
                     let ast = RegionAst::If { branches: branches.clone(), else_branch: else_branch.clone() };
-                    let (ids, signature) = self.expand_region(ui, parent, &ast, scope, state, depth);
+                    let (ids, signature) = self.expand_region(ui, parent, &ast, &scope, state, depth);
                     let len = ids.len();
                     kids.extend(ids);
                     if track {
@@ -168,7 +216,7 @@ impl Semantic {
                 AstNode::For { var, iter, body } => {
                     let start = kids.len();
                     let ast = RegionAst::For { var: var.clone(), iter: iter.clone(), body: body.clone() };
-                    let (ids, signature) = self.expand_region(ui, parent, &ast, scope, state, depth);
+                    let (ids, signature) = self.expand_region(ui, parent, &ast, &scope, state, depth);
                     let len = ids.len();
                     kids.extend(ids);
                     if track {
@@ -176,7 +224,7 @@ impl Semantic {
                     }
                 }
                 _ => {
-                    if let Some(id) = self.expand(ui, child, scope, state, depth) {
+                    if let Some(id) = self.expand(ui, child, &scope, state, depth) {
                         kids.push(id);
                     }
                 }
@@ -321,7 +369,7 @@ impl Semantic {
 
         // Otherwise a primitive.
         let style = self.resolve_styles(styles, &Style::default(), scope);
-        let arena_kind = self.primitive(kind, string_args, bindings, scope)?;
+        let arena_kind = self.primitive(kind, string_args, bindings, scope, &style, children)?;
         let id = ui.push(ArenaNode::new(arena_kind, style));
         apply_generic_bindings(ui, id, bindings, scope);
         self.pending_on_load.push(id);
@@ -330,12 +378,28 @@ impl Semantic {
         // Only worth storing (and re-rendering each frame) if at least one
         // backtick actually has a `${...}` in it — the common all-literal
         // case leaves `templates` empty, same cost as before this existed.
-        if string_args.iter().any(|t| t.parts.iter().any(|p| matches!(p, TplPart::Var(_)))) {
+        let has_var = string_args.iter().any(|t| t.parts.iter().any(|p| matches!(p, TplPart::Var(_))));
+        let has_expr = string_args.iter().any(|t| t.parts.iter().any(|p| matches!(p, TplPart::Expr(_))));
+        if has_var || has_expr {
             ui.get_mut(id).templates = string_args.iter().map(|t| to_core_template(t, scope)).collect();
         }
+        if has_expr {
+            self.template_exprs.insert(id, string_args.iter().map(|t| resolve_scoped_template(t, scope)).collect());
+        }
 
-        let kids = self.expand_children(ui, id, children, scope, state, depth + 1, true);
-        ui.get_mut(id).children = kids;
+        // A `Dropdown`'s own children are literal `DropdownItem`s, already
+        // consumed directly out of `children` by `primitive`'s `"Dropdown"`
+        // arm (into `NodeKind::Dropdown::static_items`) — same "data only,
+        // never becomes an independent arena node" precedent `Variable`
+        // already sets, not a real-child-tree widget like `Menu`/`MenuItem`.
+        // Running the generic `expand_children` on them too would both
+        // double-handle them and warn "unknown widget `DropdownItem`" for
+        // every one (no `NodeKind::DropdownItem` exists — see `primitive`'s
+        // own comment on the `"Dropdown"` arm for why).
+        if kind != "Dropdown" {
+            let kids = self.expand_children(ui, id, children, scope, state, depth + 1, true);
+            ui.get_mut(id).children = kids;
+        }
 
         if let NodeKind::TreeView { has_checkbox_selection, .. } = &ui.get(id).kind {
             if *has_checkbox_selection {
@@ -347,12 +411,17 @@ impl Semantic {
     }
 
     /// Map a primitive widget kind + its string args/bindings into a NodeKind.
+    /// `children` is only read by the `"Dropdown"` arm (its literal
+    /// `DropdownItem`s — see that arm's own comment); every other kind
+    /// ignores it, same as `style`'s existing "only `Icon` reads it" shape.
     fn primitive(
         &mut self,
         kind: &str,
         string_args: &[Template],
         bindings: &[nowui_syntax::ast::Binding],
-        _scope: &Scope,
+        scope: &Scope,
+        style: &Style,
+        children: &[AstNode],
     ) -> Option<NodeKind> {
         let arg = |i: usize| string_args.get(i).map(|t| t.render_flat()).unwrap_or_default();
         match kind {
@@ -375,12 +444,53 @@ impl Semantic {
                     highlight_spans: Vec::new(),
                 })
             }
-            "Dropdown" => Some(NodeKind::Dropdown {
-                placeholder: arg(0),
-                options: string_args.iter().skip(1).map(|t| t.render_flat()).collect(),
-                selected: None,
-                open: false,
-            }),
+            // Options are always real `DropdownItem` children (`` `id`
+            // `Label` `` plus the bare `default-selected`/`disabled` flags)
+            // — read directly out of `children` here rather than through
+            // the generic `expand_children`/`primitive` path, so
+            // `DropdownItem` never becomes its own arena node (see
+            // `expand`'s own comment on why it skips `expand_children` for
+            // `"Dropdown"`). Static items always render *above* whatever a
+            // `{values: state.path}` binding later contributes — see
+            // `resolve_dropdown_values`. A blank id (`` `` ``, e.g. a
+            // "-- choose one --" placeholder) is always disabled, in
+            // addition to whatever the explicit `disabled` flag says — see
+            // `NodeKind::Dropdown`'s own doc comment.
+            "Dropdown" => {
+                let mut static_items = Vec::new();
+                let mut default_selected_id = None;
+                for child in children {
+                    let AstNode::Widget { kind: child_kind, string_args: item_args, styles: item_styles, .. } = child else { continue };
+                    if child_kind != "DropdownItem" {
+                        continue;
+                    }
+                    let item_id = item_args.first().map(|t| t.render_flat()).unwrap_or_default();
+                    let item_label = item_args.get(1).map(|t| t.render_flat()).unwrap_or_default();
+                    let item_style = self.resolve_styles(item_styles, &Style::default(), scope);
+                    if item_style.default_selected {
+                        default_selected_id = Some(item_id.clone());
+                    }
+                    let disabled = item_style.disabled || item_id.is_empty();
+                    static_items.push((item_id, item_label, disabled));
+                }
+
+                let options: Vec<String> = static_items.iter().map(|(_, label, _)| label.clone()).collect();
+                let option_ids: Vec<String> = static_items.iter().map(|(id, _, _)| id.clone()).collect();
+                let option_disabled: Vec<bool> = static_items.iter().map(|(_, _, disabled)| *disabled).collect();
+
+                let selected = default_selected_id.as_ref().and_then(|id| option_ids.iter().position(|i| i == id));
+
+                Some(NodeKind::Dropdown {
+                    placeholder: arg(0),
+                    options,
+                    option_ids,
+                    option_disabled,
+                    static_items,
+                    default_selected_id,
+                    selected,
+                    open: false,
+                })
+            }
             // `value` (0..=100) is a `value:` binding like everywhere else (see
             // `apply_generic_bindings`) when it's a live state path; a literal
             // starting position is also accepted as a plain number so the
@@ -441,7 +551,58 @@ impl Semantic {
                 collapsed: false,
                 selected: bindings.iter().any(|b| b.key == "selected" && matches!(b.value, BindValue::Bool(true))),
                 checkbox: false,
+                show_folder_actions: style.show_folder_actions,
+                icon: None,
             }),
+            // A local path (relative-to-its-own-file already resolved to
+            // absolute by `loader::resolve_image_paths`, since only the
+            // loader still knows which file this `Image` was written in —
+            // see its own doc comment) decodes synchronously, once, right
+            // here. A network URL (`http://`/`https://`) decodes in the
+            // background instead (see `network_image.rs`) — starts out
+            // "still loading" (`decoded: None, error: None`) below.
+            "Image" => {
+                let source = arg(0);
+                // A `http://`/`https://` source is deliberately left
+                // `decoded: None, error: None` here — "still loading", per
+                // `NodeKind::Image`'s own doc comment — rather than fetched
+                // synchronously on the semantic pass (which would block a
+                // 60fps redraw loop on network I/O). `App::
+                // sync_network_image_loads` (nowui-runtime/src/network_image.rs)
+                // notices any such node every redraw and kicks off the real
+                // background fetch.
+                let (decoded, error) = if source.starts_with("http://") || source.starts_with("https://") {
+                    (None, None)
+                } else {
+                    // Tries the `bundled.nowdat` sidecar (by basename) before
+                    // falling back to a disk read — see `bundled_assets.rs`.
+                    match crate::bundled_assets::decode_local(&source) {
+                        Ok(img) => (Some(img), None),
+                        Err(e) => (None, Some(e)),
+                    }
+                };
+                if let Some(e) = &error {
+                    self.warnings.push(format!("Image `{source}`: {e}"));
+                }
+                Some(NodeKind::Image { source, decoded, current_frame: 0, frame_elapsed_ms: 0.0, error })
+            }
+            // Recolored to `line-color` (falling back to `text-color`,
+            // whose own default is black — see `NodeKind::Icon`'s own doc
+            // comment) and rasterized once, right here, from the embedded
+            // `nowui-icons` react-icons library — an unknown name (not in
+            // the bundled sets) is a disclosed warning, not a silent blank.
+            "Icon" => {
+                let name = arg(0);
+                let color = style.line_color.unwrap_or(style.text_color);
+                let (decoded, error) = match nowui_icons::icon_frame(&name, [color.r, color.g, color.b, color.a]) {
+                    Ok(frame) => (Some(frame), None),
+                    Err(e) => (None, Some(e)),
+                };
+                if let Some(e) = &error {
+                    self.warnings.push(format!("Icon `{name}`: {e}"));
+                }
+                Some(NodeKind::Icon { name, decoded, error })
+            }
             // `picker`/`date_picker`/`time_picker` start seeded from an empty
             // `value` (i.e. the system clock's current date/time) — they're
             // re-seeded from whatever `value` actually is every time the
@@ -491,6 +652,7 @@ impl Semantic {
         let mut hover_pairs = Vec::new();
         let mut focus_pairs = Vec::new();
         let mut active_pairs = Vec::new();
+        let mut disabled_pairs = Vec::new();
         // (min_width, pairs), one bucket per breakpoint name encountered.
         let mut responsive: Vec<(u32, Vec<StylePair>)> = Vec::new();
 
@@ -502,6 +664,7 @@ impl Semantic {
                         "hover" => hover_pairs.push(stripped),
                         "focus" => focus_pairs.push(stripped),
                         "active" => active_pairs.push(stripped),
+                        "disabled" => disabled_pairs.push(stripped),
                         bp if tailwind::breakpoint(bp).is_some() => {
                             let min_w = tailwind::breakpoint(bp).unwrap();
                             match responsive.iter_mut().find(|(w, _)| *w == min_w) {
@@ -546,6 +709,13 @@ impl Semantic {
                 self.apply_style(&mut s, p, scope);
             }
             resolved.variants.active = Some(Box::new(s));
+        }
+        if !disabled_pairs.is_empty() {
+            let mut s = resolved.clone();
+            for p in &disabled_pairs {
+                self.apply_style(&mut s, p, scope);
+            }
+            resolved.variants.disabled = Some(Box::new(s));
         }
 
         responsive.sort_by_key(|(w, _)| *w);
@@ -597,8 +767,56 @@ fn to_core_template(t: &Template, scope: &Scope) -> nowui_core::Template {
                 let path: Vec<String> = v.split('.').map(str::to_string).collect();
                 nowui_core::TemplatePart::Var(resolve_scoped_path(&path, scope))
             }
+            // Never actually read at render time — a node with an
+            // `Expr`-bearing backtick renders through `Semantic::
+            // template_exprs` instead, for every one of its own backticks
+            // (see that field's own doc comment for why).
+            TplPart::Expr(_) => nowui_core::TemplatePart::Lit(String::new()),
         })
         .collect()
+}
+
+/// Rewrite every `Expr::Path` inside `e` through `scope` — the same
+/// substitution `resolve_scoped_path` already does for a plain `Var`
+/// template part or a `{key: state.path}` binding, just walked recursively
+/// over an `Expr` tree instead of applied to one bare path. Called once, at
+/// build time, so `Semantic::template_exprs`' entries never need `scope`
+/// again at render time (by then they're always already-rooted `state.*`
+/// paths, or unresolved to begin with).
+fn resolve_scoped_expr(e: &Expr, scope: &Scope) -> Expr {
+    match e {
+        Expr::Path(p) => Expr::Path(resolve_scoped_path(p, scope)),
+        Expr::Bool(_) | Expr::Number(_) | Expr::Str(_) => e.clone(),
+        Expr::Not(inner) => Expr::Not(Box::new(resolve_scoped_expr(inner, scope))),
+        Expr::Cmp(l, op, r) => Expr::Cmp(Box::new(resolve_scoped_expr(l, scope)), *op, Box::new(resolve_scoped_expr(r, scope))),
+        Expr::And(l, r) => Expr::And(Box::new(resolve_scoped_expr(l, scope)), Box::new(resolve_scoped_expr(r, scope))),
+        Expr::Or(l, r) => Expr::Or(Box::new(resolve_scoped_expr(l, scope)), Box::new(resolve_scoped_expr(r, scope))),
+        Expr::Ternary(c, t, f) => Expr::Ternary(
+            Box::new(resolve_scoped_expr(c, scope)),
+            Box::new(resolve_scoped_expr(t, scope)),
+            Box::new(resolve_scoped_expr(f, scope)),
+        ),
+    }
+}
+
+/// Same idea as `resolve_scoped_expr`, applied to every part of a whole
+/// `Template` — a plain `Var` gets the ordinary dotted-path substitution,
+/// an `Expr` gets the recursive one above, a literal passes through
+/// untouched.
+fn resolve_scoped_template(t: &Template, scope: &Scope) -> Template {
+    let parts = t
+        .parts
+        .iter()
+        .map(|p| match p {
+            TplPart::Lit(s) => TplPart::Lit(s.clone()),
+            TplPart::Var(v) => {
+                let path: Vec<String> = v.split('.').map(str::to_string).collect();
+                TplPart::Var(resolve_scoped_path(&path, scope).join("."))
+            }
+            TplPart::Expr(e) => TplPart::Expr(resolve_scoped_expr(e, scope)),
+        })
+        .collect();
+    Template { parts }
 }
 
 /// `${a.b.c}` -> `Some(["a", "b", "c"])`, only when the *entire* trimmed
@@ -645,6 +863,26 @@ pub(crate) fn apply_exact(s: &mut Style, key: &str, v: &str) -> bool {
         // displayed/parsed value and the spinner popup's third column.
         // Harmlessly unused on anything else.
         "with-seconds" => s.with_seconds = true,
+        // `Image ... loop { ... }` on an animated GIF — restart from frame 0
+        // instead of holding on the last frame. Harmlessly unused on a
+        // static image or anything else.
+        "loop" => s.loop_playback = true,
+        // `DropdownItem `id` `Label` default-selected { ... }` — marks this
+        // item as the `Dropdown`'s initial selection. Harmlessly unused on
+        // anything else (see `Style::default_selected`'s own doc comment).
+        "default-selected" => s.default_selected = true,
+        // `DropdownItem `id` `Label` disabled { ... }` — greys out the text
+        // and makes it unselectable by click. Harmlessly unused on
+        // anything else.
+        "disabled" => s.disabled = true,
+        // `TreeViewItem \`...\` folder-actions { ... }` — draws the add-file/
+        // add-folder action icons next to the label. Harmlessly unused on
+        // anything else.
+        "folder-actions" => s.show_folder_actions = true,
+        // `TreeViewItem \`...\` tree-icon-[FaFolder] { ... }` — a named
+        // react-icons glyph drawn at the row's own left edge (see `Style::
+        // tree_icon`'s own doc comment). Harmlessly unused on anything else.
+        "tree-icon" => s.tree_icon = v.to_string(),
 
         "w" => s.width = parse_sizing(v),
         "h" => s.height = parse_sizing(v),
@@ -683,6 +921,11 @@ pub(crate) fn apply_exact(s: &mut Style, key: &str, v: &str) -> bool {
         "border" if v.is_empty() => s.border_width = Edges::all(1.0),
         "border" => s.border_width = Edges::all(parse_px(v)),
         "border-color" => s.border_color = Color::from_hex(v),
+        // `fill-color` is an alias for `line-color` — both name the same
+        // `Icon` tint field (see its own doc comment); `fill-color` reads
+        // more naturally for `hover:fill-color-[...]` since an SVG icon's
+        // recolorable surface is its fill, not a stroke/border.
+        "line-color" | "fill-color" => s.line_color = Color::from_hex(v),
         "transition" => {
             s.transition.get_or_insert(Transition { duration_ms: 150.0, delay_ms: 0.0, easing: Easing::InOut });
         }
@@ -721,7 +964,7 @@ pub(crate) fn apply_exact(s: &mut Style, key: &str, v: &str) -> bool {
 
         // Colors (legacy bracket-only aliases).
         "bg-color" | "bg" => s.bg = Color::from_hex(v),
-        "text-color" | "color" => {
+        "text-color" | "color" | "text" => {
             if let Some(c) = Color::from_hex(v) {
                 s.text_color = c;
             }
@@ -1123,6 +1366,10 @@ fn apply_generic_bindings(ui: &mut Ui, id: NodeId, bindings: &[nowui_syntax::ast
             ui.get_mut(id).min_year_path = path;
         } else if b.key == "maxYear" {
             ui.get_mut(id).max_year_path = path;
+        } else if b.key == "values" {
+            ui.get_mut(id).values_path = path;
+        } else if b.key == "disabled" {
+            ui.get_mut(id).disabled_path = path;
         } else if EVENT_BINDING_KEYS.contains(&b.key.as_str()) {
             ui.get_mut(id).events.insert(b.key.clone(), path);
         }
@@ -1210,7 +1457,16 @@ fn parse_sizing(v: &str) -> Sizing {
         Sizing::Fill(1.0)
     } else if let Some(rest) = v.strip_prefix("fill-") {
         Sizing::Fill(rest.parse().unwrap_or(1.0))
-    } else if v == "hug" {
+    } else if v == "hug" || v == "auto" {
+        // `w-[auto]`/`h-[auto]` reuse `Hug` (`Style` has no separate `Auto`
+        // variant): for most widgets "size to content" and "auto" already
+        // mean the same thing. `Image` specifically distinguishes the two
+        // *within* its own intrinsic-size computation (see `layout.rs`'s
+        // `measure`) — auto-on-one-axis-with-a-fixed-other-axis scales by
+        // the image's own natural aspect ratio, which is exactly what
+        // "auto" means for an `<img>` in CSS; ordinary `Hug` content has no
+        // such natural ratio to scale against, so the two only ever
+        // diverge for `Image`.
         Sizing::Hug
     } else if v == "full" {
         Sizing::Percent(1.0)
@@ -1322,6 +1578,37 @@ mod tests {
     }
 
     #[test]
+    fn disabled_variant_and_binding_parse_onto_the_button_node() {
+        let ast = nowui_syntax::parse(
+            "layout: T { Button `Save` disabled:text-[#ff0000] disabled:bg-[#ffff00] {disabled: state.saving} }",
+        )
+        .unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let node = ui.get(root.children[0]);
+        let disabled = node.base_style.variants.disabled.as_ref().expect("disabled variant resolved");
+        assert_eq!(disabled.text_color, Color::from_hex("#ff0000").unwrap());
+        assert_eq!(disabled.bg, Color::from_hex("#ffff00"));
+        assert_eq!(node.disabled_path, vec!["state".to_string(), "saving".to_string()]);
+    }
+
+    #[test]
+    fn fill_color_is_an_alias_for_line_color_and_supports_a_hover_variant() {
+        let s = first_child_style("layout: T { Icon `FaUser` fill-color-[#111827] hover:fill-color-[#ffff00] }");
+        assert_eq!(s.line_color, Color::from_hex("#111827"));
+        let hover = s.variants.hover.as_ref().expect("hover variant resolved");
+        assert_eq!(hover.line_color, Color::from_hex("#ffff00"));
+    }
+
+    #[test]
+    fn hover_fill_color_accepts_a_dynamic_state_bound_value() {
+        let s = first_child_style("layout: T { Icon `FaUser` hover:fill-color-[${state.hoverColorValue}] }");
+        let hover = s.variants.hover.as_ref().expect("hover variant resolved");
+        assert_eq!(hover.dynamic.get("fill-color"), Some(&vec!["state".to_string(), "hoverColorValue".to_string()]));
+    }
+
+    #[test]
     fn responsive_breakpoints_cascade_cumulatively() {
         let s = first_child_style("layout: T { Card w-4 sm:w-8 md:grid-cols-2 { Text `hi` } }");
         assert_eq!(s.width, Sizing::Fixed(16.0));
@@ -1379,6 +1666,128 @@ mod tests {
     }
 
     #[test]
+    fn resolves_tree_icon_bracket_onto_style_and_leaves_the_node_kinds_own_icon_unresolved_at_build_time() {
+        let ast = nowui_syntax::parse("layout: T { TreeView { TreeViewItem `widgets` tree-icon-[FaFolder] } }").unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let tree_view = ui.get(root.children[0]);
+        let item = ui.get(tree_view.children[0]);
+        assert_eq!(item.style.tree_icon, "FaFolder");
+        let NodeKind::TreeViewItem { icon, .. } = &item.kind else { panic!("expected a TreeViewItem") };
+        assert!(icon.is_none(), "resolved later by resolve_tree_icons, not at build time");
+    }
+
+    #[test]
+    fn image_decodes_a_real_local_png_file_and_reports_its_natural_size() {
+        let dir = std::env::temp_dir().join("nowui_semantic_test_image_decode");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("photo.png");
+        let mut img = image::RgbaImage::new(8, 4);
+        for p in img.pixels_mut() {
+            *p = image::Rgba([10, 20, 30, 255]);
+        }
+        image::DynamicImage::ImageRgba8(img).save(&path).unwrap();
+
+        // The loader already rewrote a relative source to an absolute one
+        // by the time semantic sees it (see `loader::resolve_image_paths`)
+        // — construct the AST with the already-absolute path directly,
+        // same as semantic.rs's other tests bypass the loader entirely.
+        let src = format!("layout: T {{ Image `{}` w-[100px] h-[100px] }}", path.display().to_string().replace('\\', "/"));
+        let ast = nowui_syntax::parse(&src).unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+
+        let NodeKind::Image { decoded, error, .. } = &ui.get(root.children[0]).kind else { panic!("expected an Image node") };
+        assert!(error.is_none(), "unexpected decode error: {error:?}");
+        let decoded = decoded.as_ref().expect("should have decoded");
+        assert_eq!((decoded.width, decoded.height), (8, 4));
+        assert!(sem.warnings.is_empty(), "a successful decode shouldn't warn: {:?}", sem.warnings);
+    }
+
+    #[test]
+    fn icon_rasterizes_a_known_react_icons_name() {
+        let src = "layout: T { Icon `FaUser` w-[32px] h-[32px] }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let NodeKind::Icon { name, decoded, error } = &ui.get(root.children[0]).kind else { panic!("expected an Icon node") };
+        assert_eq!(name, "FaUser");
+        assert!(error.is_none(), "unexpected error: {error:?}");
+        let frame = decoded.as_ref().expect("should have rasterized");
+        assert_eq!((frame.width, frame.height), (nowui_icons::DEFAULT_RASTER_SIZE, nowui_icons::DEFAULT_RASTER_SIZE));
+        assert!(sem.warnings.is_empty());
+    }
+
+    #[test]
+    fn icon_with_an_unknown_name_warns_and_leaves_decoded_as_none() {
+        let src = "layout: T { Icon `NotARealIconName12345` w-[32px] h-[32px] }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let NodeKind::Icon { decoded, error, .. } = &ui.get(root.children[0]).kind else { panic!("expected an Icon node") };
+        assert!(decoded.is_none());
+        assert!(error.is_some());
+        assert!(sem.warnings.iter().any(|w| w.contains("Icon")), "expected a disclosed warning: {:?}", sem.warnings);
+    }
+
+    #[test]
+    fn icon_line_color_overrides_text_color_and_recolors_the_rasterized_pixels() {
+        // Two icons, same name, different `line-color` — their rasterized
+        // pixel buffers must differ if recoloring actually ran (rather than
+        // both silently defaulting to black).
+        let src_red = "layout: T { Icon `FaUser` w-[32px] h-[32px] line-color-[#ff0000] text-color-[#0000ff] }";
+        let ast_red = nowui_syntax::parse(src_red).unwrap();
+        let mut sem_red = Semantic::new(&ast_red);
+        let ui_red = sem_red.build("T", &nowui_core::NoState).unwrap();
+        let root_red = ui_red.get(ui_red.layers[0].root);
+        let NodeKind::Icon { decoded: red, .. } = &ui_red.get(root_red.children[0]).kind else { panic!() };
+
+        let src_blue = "layout: T { Icon `FaUser` w-[32px] h-[32px] text-color-[#0000ff] }";
+        let ast_blue = nowui_syntax::parse(src_blue).unwrap();
+        let mut sem_blue = Semantic::new(&ast_blue);
+        let ui_blue = sem_blue.build("T", &nowui_core::NoState).unwrap();
+        let root_blue = ui_blue.get(ui_blue.layers[0].root);
+        let NodeKind::Icon { decoded: blue, .. } = &ui_blue.get(root_blue.children[0]).kind else { panic!() };
+
+        assert_ne!(red.as_ref().unwrap().rgba, blue.as_ref().unwrap().rgba, "line-color should win over text-color and actually change the pixels");
+    }
+
+    #[test]
+    fn image_with_a_missing_local_file_warns_and_leaves_decoded_as_none() {
+        let src = "layout: T { Image `/definitely/does/not/exist.png` w-[10px] h-[10px] }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let NodeKind::Image { decoded, error, .. } = &ui.get(root.children[0]).kind else { panic!("expected an Image node") };
+        assert!(decoded.is_none());
+        assert!(error.is_some());
+        assert!(!sem.warnings.is_empty(), "a failed decode should surface as a warning, not a silent gap");
+    }
+
+    #[test]
+    fn image_with_a_network_url_starts_out_still_loading_not_an_error() {
+        // The semantic pass never does network I/O itself (would block the
+        // redraw loop) — a `http(s)://` source starts as `decoded: None,
+        // error: None` ("still loading"), left for `nowui-runtime`'s
+        // `App::sync_network_image_loads` to actually fetch in the
+        // background. See `network_image.rs` for the fetch itself.
+        let src = "layout: T { Image `https://example.com/a.png` w-[10px] h-[10px] }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let NodeKind::Image { decoded, error, .. } = &ui.get(root.children[0]).kind else { panic!("expected an Image node") };
+        assert!(decoded.is_none());
+        assert!(error.is_none());
+        assert!(sem.warnings.is_empty());
+    }
+
+    #[test]
     fn resolves_z_index_bracket_and_compact_forms() {
         let bracket = first_child_style("layout: T { Card z-index-[5] { Text `hi` } }");
         assert_eq!(bracket.z_index, 5);
@@ -1389,21 +1798,81 @@ mod tests {
     #[test]
     fn resolves_dropdown_placeholder_and_options() {
         let ast = nowui_syntax::parse(
-            "layout: T { Dropdown `Choose a role` `Admin` `Editor` `Viewer` {value: state.role} }",
+            "layout: T { Dropdown `Choose a role` {value: state.role} { \
+             DropdownItem `admin` `Admin` \
+             DropdownItem `editor` `Editor` \
+             DropdownItem `viewer` `Viewer` \
+             } }",
         )
         .unwrap();
         let mut sem = Semantic::new(&ast);
         let ui = sem.build("T", &nowui_core::NoState).unwrap();
         let root = ui.get(ui.layers[0].root);
         let node = ui.get(root.children[0]);
-        let nowui_core::NodeKind::Dropdown { placeholder, options, selected, open } = &node.kind else {
+        let nowui_core::NodeKind::Dropdown { placeholder, options, option_ids, selected, open, .. } = &node.kind else {
             panic!("expected a Dropdown node");
         };
         assert_eq!(placeholder, "Choose a role");
         assert_eq!(options, &vec!["Admin".to_string(), "Editor".to_string(), "Viewer".to_string()]);
+        assert_eq!(option_ids, &vec!["admin".to_string(), "editor".to_string(), "viewer".to_string()]);
         assert_eq!(node.value_path, vec!["state".to_string(), "role".to_string()]);
         assert_eq!(*selected, None);
         assert!(!*open);
+    }
+
+    #[test]
+    fn dropdown_reads_literal_dropdown_item_children_as_static_options() {
+        let ast = nowui_syntax::parse(
+            "layout: T { Dropdown `Choose` {onSelect: state.onSelectDropDown, values: state.someDropdownVector} { \
+             DropdownItem `id_here` `Label Here` default-selected \
+             DropdownItem `id_two` `Label Two` \
+             DropdownItem `id_three` `Label Three` disabled \
+             } }",
+        )
+        .unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let node = ui.get(root.children[0]);
+        let nowui_core::NodeKind::Dropdown { options, option_ids, option_disabled, static_items, default_selected_id, selected, .. } =
+            &node.kind
+        else {
+            panic!("expected a Dropdown node");
+        };
+        assert_eq!(options, &vec!["Label Here".to_string(), "Label Two".to_string(), "Label Three".to_string()]);
+        assert_eq!(option_ids, &vec!["id_here".to_string(), "id_two".to_string(), "id_three".to_string()]);
+        assert_eq!(option_disabled, &vec![false, false, true], "the explicit `disabled` flag on the third item");
+        assert_eq!(
+            static_items,
+            &vec![
+                ("id_here".to_string(), "Label Here".to_string(), false),
+                ("id_two".to_string(), "Label Two".to_string(), false),
+                ("id_three".to_string(), "Label Three".to_string(), true),
+            ]
+        );
+        assert_eq!(default_selected_id.as_deref(), Some("id_here"));
+        assert_eq!(*selected, Some(0));
+        assert_eq!(node.values_path, vec!["state".to_string(), "someDropdownVector".to_string()]);
+        assert_eq!(node.events.get("onSelect"), Some(&vec!["state".to_string(), "onSelectDropDown".to_string()]));
+        // `DropdownItem` is consumed directly into `static_items`, never
+        // becoming its own arena node — no "unknown widget" warning, and no
+        // real children on the Dropdown itself.
+        assert!(sem.warnings.is_empty(), "unexpected warnings: {:?}", sem.warnings);
+        assert!(node.children.is_empty());
+    }
+
+    #[test]
+    fn dropdown_item_with_a_blank_id_is_implicitly_disabled() {
+        let ast = nowui_syntax::parse("layout: T { Dropdown `Choose` { DropdownItem `` `-- choose one --` default-selected } }").unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let node = ui.get(root.children[0]);
+        let nowui_core::NodeKind::Dropdown { option_disabled, selected, .. } = &node.kind else {
+            panic!("expected a Dropdown node");
+        };
+        assert_eq!(option_disabled, &vec![true], "a blank id is disabled even without an explicit `disabled` flag");
+        assert_eq!(*selected, Some(0), "default-selected still applies to a disabled (blank-id) item");
     }
 
     #[test]
@@ -1642,6 +2111,37 @@ mod tests {
     }
 
     #[test]
+    fn ternary_backtick_interpolation_is_recorded_in_template_exprs_not_core_templates() {
+        let ast = nowui_syntax::parse(r#"layout: T { Button `${state.isSaving == true ? "Saving..." : "Save"}` } "#).unwrap();
+        let mut sem = Semantic::new(&ast);
+        let ui = sem.build("T", &nowui_core::NoState).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        let id = root.children[0];
+        let node = ui.get(id);
+
+        // `nowui-core`'s own `templates` can't hold a raw `Expr` — left as
+        // an empty-literal placeholder (see `to_core_template`'s own arm).
+        assert_eq!(node.templates, vec![vec![nowui_core::TemplatePart::Lit(String::new())]]);
+
+        let raw = sem.template_exprs.get(&id).expect("expected a template_exprs entry");
+        assert_eq!(raw.len(), 1);
+        let nowui_syntax::ast::TplPart::Expr(nowui_syntax::ast::Expr::Ternary(cond, then_branch, else_branch)) = &raw[0].parts[0]
+        else {
+            panic!("expected a ternary Expr part, got {:?}", raw[0].parts[0]);
+        };
+        assert_eq!(
+            **cond,
+            nowui_syntax::ast::Expr::Cmp(
+                Box::new(nowui_syntax::ast::Expr::Path(vec!["state".to_string(), "isSaving".to_string()])),
+                nowui_syntax::ast::CmpOp::Eq,
+                Box::new(nowui_syntax::ast::Expr::Bool(true))
+            )
+        );
+        assert_eq!(**then_branch, nowui_syntax::ast::Expr::Str("Saving...".to_string()));
+        assert_eq!(**else_branch, nowui_syntax::ast::Expr::Str("Save".to_string()));
+    }
+
+    #[test]
     fn purely_literal_backtick_leaves_templates_empty() {
         let ast = nowui_syntax::parse("layout: T { Text `Static label` }").unwrap();
         let mut sem = Semantic::new(&ast);
@@ -1680,6 +2180,70 @@ mod tests {
                 other => panic!("expected a Text node, got {other:?}"),
             })
             .collect()
+    }
+
+    #[test]
+    fn variable_aliases_a_state_path_and_produces_no_arena_node_of_its_own() {
+        // The exact shape requested: `Variable name=state.path` followed by
+        // `if name { ... }`, where the condition's truthiness comes from
+        // `StateValue::List`'s own `!is_empty()` rule (see `state.rs`) —
+        // `counters` aliases a non-empty list, so the branch renders.
+        let src = r#"layout: T {
+            Variable counters=state.rows
+            if counters {
+                Text `has rows`
+            }
+        }"#;
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+        let state = DynamicTestState { show: false, rows: vec![1, 2, 3] };
+        let ui = sem.build("T", &state).unwrap();
+        let root = ui.get(ui.layers[0].root);
+
+        assert_eq!(root.children.len(), 1, "Variable itself produced no arena node — only the Text from the taken if-branch");
+        assert_eq!(text_contents(&ui, &root.children), vec!["has rows".to_string()]);
+        assert!(sem.warnings.is_empty(), "Variable must not be treated as an unknown widget: {:?}", sem.warnings);
+    }
+
+    #[test]
+    fn variable_aliasing_an_empty_list_is_falsy() {
+        let src = "layout: T { Variable counters=state.rows if counters { Text `has rows` } else { Text `empty` } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+        let state = DynamicTestState { show: false, rows: vec![] };
+        let ui = sem.build("T", &state).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        assert_eq!(text_contents(&ui, &root.children), vec!["empty".to_string()]);
+    }
+
+    #[test]
+    fn variable_resolves_dynamically_in_an_if_condition_using_length() {
+        // `.length` (a real field path first, else a pseudo-property — see
+        // CLAUDE.md) is resolved by `dynamic::eval_expr`'s own path
+        // resolution, used by `if`/`for` conditions; plain `${...}`
+        // templates go through a separate, simpler resolver
+        // (`resolve::render_template`) that doesn't special-case `.length`
+        // at all — a pre-existing gap unrelated to `Variable` itself, so
+        // this exercises the alias through the path `.length` actually
+        // works on today.
+        let src = "layout: T { Variable n=state.rows if n.length > 2 { Text `big` } else { Text `small` } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+        let state = DynamicTestState { show: false, rows: vec![10, 20, 30] };
+        let ui = sem.build("T", &state).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        assert_eq!(text_contents(&ui, &root.children), vec!["big".to_string()], "n.length resolves via the aliased state.rows");
+    }
+
+    #[test]
+    fn a_second_variable_can_alias_an_earlier_one() {
+        let src = "layout: T { Variable a=state.rows Variable b=a if b.length > 1 { Text `many` } else { Text `few` } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+        let state = DynamicTestState { show: false, rows: vec![1, 2] };
+        let ui = sem.build("T", &state).unwrap();
+        let root = ui.get(ui.layers[0].root);
+        assert_eq!(text_contents(&ui, &root.children), vec!["many".to_string()], "b chains through a to the real state.rows");
     }
 
     #[test]
@@ -1950,7 +2514,7 @@ mod tests {
         // until `resolve::resolve_templates` runs against live state, same
         // as every real redraw (nowui-runtime's own `App::redraw`, and
         // nowui-designer's `Chrome::refresh`) does each frame.
-        crate::resolve::resolve_templates(&mut ui, &state);
+        crate::resolve::resolve_templates(&mut ui, &state, &sem.template_exprs);
         let root = ui.get(ui.layers[0].root);
 
         // Depth 0: one RenderNode (a Container) whose first child is its own `Text`.
@@ -2010,6 +2574,30 @@ mod tests {
             text_contents(&ui, &ui.get(root_id).children),
             vec!["1".to_string(), "2".to_string(), "3".to_string(), "4".to_string()]
         );
+    }
+
+    #[test]
+    fn gc_frees_a_fors_own_orphaned_nodes_after_a_rebuild() {
+        let src = "layout: T { for x in state.rows { Text `${x}` } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+
+        let mut state = DynamicTestState { show: false, rows: vec![1, 2] };
+        let mut ui = sem.build("T", &state).unwrap();
+        let root_id = ui.layers[0].root;
+        let old_children = ui.get(root_id).children.clone();
+
+        state.rows = vec![9, 9, 9];
+        sem.refresh_dynamic_regions(&mut ui, &state);
+        assert_ne!(ui.get(root_id).children, old_children, "the rebuild spliced in brand new node ids");
+
+        ui.gc();
+
+        for old_id in old_children {
+            assert_eq!(ui.get(old_id).kind, nowui_core::NodeKind::Container, "the old, now-orphaned Text node was swept to an empty tombstone");
+        }
+        // The live replacement content survived untouched.
+        assert_eq!(text_contents(&ui, &ui.get(root_id).children), vec!["9".to_string(), "9".to_string(), "9".to_string()]);
     }
 
     #[derive(Default, Clone, nowui_core::NowUiState)]

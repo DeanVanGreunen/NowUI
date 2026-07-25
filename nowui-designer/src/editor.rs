@@ -12,7 +12,7 @@
 //! own `char_index_for_click` uses, which needs a `Painter` at click time —
 //! a real, disclosed gap, not a silent one.
 
-use nowui_core::text_input::{char_len, delete_range, insert_str, move_left, move_right};
+use nowui_core::text_input::{char_index_at, char_len, delete_range, insert_str, line_and_col, move_left, move_right};
 use nowui_core::{Color, NodeId, NodeKind, Ui};
 use winit::keyboard::{Key, NamedKey};
 
@@ -81,6 +81,34 @@ pub fn edit_text_input(ui: &mut Ui, id: NodeId, logical_key: &Key, text: Option<
         }
         Key::Named(NamedKey::ArrowLeft) => move_left(cursor, selection_anchor, shift),
         Key::Named(NamedKey::ArrowRight) => move_right(cursor, selection_anchor, shift, char_len(label)),
+        // Move to the same column on the line above/below, clamped to that
+        // line's own length if it's shorter (`char_index_at`'s own "out of
+        // range col clamps to that line's length" contract) — same hard-line
+        // model `line_and_col`/`char_index_at` already give every other
+        // multiline caret operation here. A no-op at the first/last line,
+        // same as `move_left`/`move_right` at the very start/end of the text.
+        Key::Named(NamedKey::ArrowUp) => {
+            let (line, col) = line_and_col(label, *cursor);
+            if line > 0 {
+                if shift {
+                    selection_anchor.get_or_insert(*cursor);
+                } else {
+                    *selection_anchor = None;
+                }
+                *cursor = char_index_at(label, line - 1, col);
+            } else if !shift {
+                *selection_anchor = None;
+            }
+        }
+        Key::Named(NamedKey::ArrowDown) => {
+            let (line, col) = line_and_col(label, *cursor);
+            if shift {
+                selection_anchor.get_or_insert(*cursor);
+            } else {
+                *selection_anchor = None;
+            }
+            *cursor = char_index_at(label, line + 1, col);
+        }
         Key::Named(NamedKey::Home) => {
             if shift {
                 selection_anchor.get_or_insert(*cursor);
@@ -189,5 +217,56 @@ mod tests {
         assert!(!edit_text_input(&mut ui, id, &Key::Named(NamedKey::ArrowLeft), None, false));
         let NodeKind::TextInput { cursor, .. } = &ui.get(id).kind else { panic!() };
         assert_eq!(*cursor, 2);
+    }
+
+    #[test]
+    fn arrow_up_moves_to_the_same_column_on_the_line_above() {
+        let (mut ui, id) = editor_ui("abcd\nwxyz");
+        let NodeKind::TextInput { cursor, .. } = &mut ui.get_mut(id).kind else { panic!() };
+        *cursor = 7; // "wxyz" col 2 ('y')
+        assert!(!edit_text_input(&mut ui, id, &Key::Named(NamedKey::ArrowUp), None, false));
+        let NodeKind::TextInput { cursor, .. } = &ui.get(id).kind else { panic!() };
+        assert_eq!(*cursor, 2, "same column 2 on the first line ('c')");
+    }
+
+    #[test]
+    fn arrow_up_clamps_to_the_end_of_a_shorter_line_above() {
+        let (mut ui, id) = editor_ui("ab\nwxyz");
+        let NodeKind::TextInput { cursor, .. } = &mut ui.get_mut(id).kind else { panic!() };
+        *cursor = 6; // "wxyz" col 3 ('z')
+        edit_text_input(&mut ui, id, &Key::Named(NamedKey::ArrowUp), None, false);
+        let NodeKind::TextInput { cursor, .. } = &ui.get(id).kind else { panic!() };
+        assert_eq!(*cursor, 2, "clamped to the end of the shorter first line 'ab'");
+    }
+
+    #[test]
+    fn arrow_up_on_the_first_line_is_a_no_op() {
+        let (mut ui, id) = editor_ui("abc");
+        let NodeKind::TextInput { cursor, .. } = &mut ui.get_mut(id).kind else { panic!() };
+        *cursor = 1;
+        assert!(!edit_text_input(&mut ui, id, &Key::Named(NamedKey::ArrowUp), None, false));
+        let NodeKind::TextInput { cursor, .. } = &ui.get(id).kind else { panic!() };
+        assert_eq!(*cursor, 1);
+    }
+
+    #[test]
+    fn arrow_down_moves_to_the_same_column_on_the_line_below() {
+        let (mut ui, id) = editor_ui("abcd\nwxyz");
+        let NodeKind::TextInput { cursor, .. } = &mut ui.get_mut(id).kind else { panic!() };
+        *cursor = 2; // "abcd" col 2 ('c')
+        edit_text_input(&mut ui, id, &Key::Named(NamedKey::ArrowDown), None, false);
+        let NodeKind::TextInput { cursor, .. } = &ui.get(id).kind else { panic!() };
+        assert_eq!(*cursor, 7, "same column 2 on the second line ('y')");
+    }
+
+    #[test]
+    fn shift_arrow_down_extends_the_selection() {
+        let (mut ui, id) = editor_ui("abcd\nwxyz");
+        let NodeKind::TextInput { cursor, .. } = &mut ui.get_mut(id).kind else { panic!() };
+        *cursor = 0;
+        edit_text_input(&mut ui, id, &Key::Named(NamedKey::ArrowDown), None, true);
+        let NodeKind::TextInput { cursor, selection_anchor, .. } = &ui.get(id).kind else { panic!() };
+        assert_eq!(*cursor, 5);
+        assert_eq!(*selection_anchor, Some(0));
     }
 }

@@ -9,6 +9,7 @@ repository = "https://github.com/DeanVanGreunen/NowUI"
 [dependencies]
 nowui-core = { path = "../nowui-core", version = "0.1.0" }
 nowui-text = { path = "../nowui-text", version = "0.1.0" }
+nowui-image = { path = "../nowui-image", version = "0.1.0" }
 cosmic-text = { workspace = true }
 vello = { workspace = true }
 pollster = { workspace = true }
