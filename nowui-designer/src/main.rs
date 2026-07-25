@@ -16,6 +16,7 @@ mod chrome;
 mod preview;
 mod state;
 mod virtual_fs;
+mod watcher;
 
 use std::process::ExitCode;
 

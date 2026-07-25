@@ -20,6 +20,7 @@ use winit::window::{Window, WindowId};
 use crate::chrome::Chrome;
 use crate::preview::PreviewDoc;
 use crate::state::DesignerState;
+use crate::watcher::FileWatcher;
 
 /// Same fixed-60fps-loop convention `nowui-runtime`'s own `App` uses (see
 /// its module doc / CLAUDE.md's "Runtime gotchas") — not on-demand redraw.
@@ -30,6 +31,10 @@ pub struct DesignerApp {
     pub chrome: Chrome,
     pub doc: PreviewDoc,
     pub state: DesignerState,
+    /// `None` in an environment that can't create a real filesystem watcher
+    /// (see `watcher::try_new_watcher`'s own doc comment) — the designer
+    /// still runs, just without reload-on-external-edit.
+    watcher: Option<FileWatcher>,
     window: Option<Arc<Window>>,
     gpu: Option<GpuSurfaceState>,
     text: nowui_text::TextContext,
@@ -39,15 +44,36 @@ pub struct DesignerApp {
 
 impl DesignerApp {
     pub fn new(chrome: Chrome, doc: PreviewDoc, state: DesignerState) -> Self {
+        let mut watcher = crate::watcher::try_new_watcher();
+        if let (Some(w), Ok(files)) = (&mut watcher, doc.imported_files()) {
+            w.set_watched(&files);
+        }
         DesignerApp {
             chrome,
             doc,
             state,
+            watcher,
             window: None,
             gpu: None,
             text: nowui_text::TextContext::new(),
             font_cache: GpuFontCache::new(),
             next_frame: Instant::now(),
+        }
+    }
+
+    /// Re-resolves the live document straight from disk (no unsaved-buffer
+    /// overrides yet — those arrive with the editor) and re-arms the
+    /// watcher with whatever it imports *now*, since a reload can change
+    /// the import graph itself (an added/removed `#` import). A failed
+    /// reload (a syntax error mid-edit in an external editor) is logged and
+    /// otherwise ignored — `PreviewDoc::reload_with_overrides` already
+    /// leaves the last good `Ui` in place rather than blanking the preview.
+    fn reload_from_disk(&mut self) {
+        if let Err(e) = self.doc.reload_with_overrides(&std::collections::HashMap::new()) {
+            eprintln!("nowui-designer: reload of `{}` failed: {e}", self.doc.entry_path.display());
+        }
+        if let (Some(w), Ok(files)) = (&mut self.watcher, self.doc.imported_files()) {
+            w.set_watched(&files);
         }
     }
 
@@ -105,6 +131,9 @@ impl ApplicationHandler for DesignerApp {
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = Instant::now();
         if now >= self.next_frame {
+            if self.watcher.as_ref().is_some_and(FileWatcher::poll_changed) {
+                self.reload_from_disk();
+            }
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
