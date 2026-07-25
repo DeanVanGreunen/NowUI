@@ -127,10 +127,29 @@ pub fn derive_nowui_state(input: TokenStream) -> TokenStream {
             object_fields.push(quote! {
                 (#name_str.to_string(), ::nowui_core::StateValue::List(self.#ident.iter().map(|v| #elem_expr).collect()))
             });
-            // Indexed `call` into one element, only when that element is
-            // itself a `NowUiState` (a scalar `Vec<String>`/`Vec<bool>`/...
-            // element has no method to call).
+            // Indexed `get`/`call` into one element, only when that element
+            // is itself a `NowUiState` (a scalar `Vec<String>`/`Vec<bool>`/
+            // ... element has no field/method to reach into further). The
+            // indexed `get` arm is what makes `${item.field}` inside a
+            // *recursive* custom `layout:` actually resolve live each
+            // redraw (see `nowui-runtime`'s `dynamic::substitute_named_arg`
+            // doc comment for the other half of this: rewriting the
+            // recursive call's own arg to a concrete indexed path in the
+            // first place) — without it, `state.get(["tree","0","label"])`
+            // had no way to step through the numeric index at all, only the
+            // *whole* list (`rest.is_empty()`, above) or a write via `call`.
             if scalar_kind(inner_ty).is_none() {
+                get_arms.push(quote! {
+                    Some((&#name_str, rest)) if !rest.is_empty() => {
+                        match rest.split_first() {
+                            Some((idx, rest)) => match idx.parse::<usize>() {
+                                Ok(idx) => self.#ident.get(idx).and_then(|item| ::nowui_core::NowUiState::get(item, rest)),
+                                Err(_) => None,
+                            },
+                            None => None,
+                        }
+                    }
+                });
                 call_arms.push(quote! {
                     Some((&#name_str, rest)) => {
                         match rest.split_first() {

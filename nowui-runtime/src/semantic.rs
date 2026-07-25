@@ -219,10 +219,17 @@ impl Semantic {
                     .and_then(|v| v.as_list().map(<[_]>::to_vec))
                     .unwrap_or_default();
                 // Only a simple dotted path (`state.rows`) gives a real slot
-                // to rewrite an `{onClick: x.handleMe}` binding onto — see
-                // `dynamic::substitute_loop_var`.
+                // to rewrite an `{onClick: x.handleMe}`/`Widget arg=x.field`
+                // onto — see `dynamic::substitute_loop_var`/
+                // `substitute_named_arg`. Scope-resolved the same way the
+                // items themselves were (`resolve_scoped_path`) — inside a
+                // recursive custom `layout:`, `iter` is often a *param*
+                // reference (`item.children`), not a literal `state.*` path;
+                // without this resolution the substituted paths below would
+                // be rooted at the meaningless literal param name instead of
+                // the real state location it stands for.
                 let iter_path: Vec<String> = match iter {
-                    Expr::Path(p) => p.clone(),
+                    Expr::Path(p) => resolve_scoped_path(p, scope),
                     _ => Vec::new(),
                 };
 
@@ -1895,6 +1902,71 @@ mod tests {
     #[derive(Default, Clone, nowui_core::NowUiState)]
     struct RowListState {
         rows: Vec<RowItem>,
+    }
+
+    #[derive(Default, Clone, nowui_core::NowUiState)]
+    struct TreeItem {
+        label: String,
+        children: Vec<TreeItem>,
+    }
+
+    #[derive(Default, Clone, nowui_core::NowUiState)]
+    struct TreeState {
+        tree: Vec<TreeItem>,
+    }
+
+    #[test]
+    fn a_recursive_layout_over_a_for_loop_walks_real_tree_shaped_state_at_every_depth() {
+        // The technique nowui-designer's own file explorer (and any
+        // dynamic, state-driven `TreeView`) needs: `for`'s loop variable
+        // passed as a *named arg* into a self-referential `layout:`, one
+        // level per recursive call — depends on `dynamic::
+        // substitute_loop_var` rewriting `NamedArg`s the same way it
+        // already rewrites bindings/templates (see its own doc comment).
+        let src = r#"
+            layout: RenderNode(item) {
+                Text `${item.label}`
+                for child in item.children { RenderNode item=child }
+            }
+            layout: T {
+                for x in state.tree { RenderNode item=x }
+            }
+        "#;
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+
+        let state = TreeState {
+            tree: vec![TreeItem {
+                label: "Paper".to_string(),
+                children: vec![
+                    TreeItem { label: "Header".to_string(), children: vec![TreeItem { label: "Logo".to_string(), children: vec![] }] },
+                    TreeItem { label: "Footer".to_string(), children: vec![] },
+                ],
+            }],
+        };
+        let mut ui = sem.build("T", &state).unwrap();
+        // `sem.build` only does the static expansion — a dynamic `${...}`
+        // template's raw placeholder text isn't resolved into real content
+        // until `resolve::resolve_templates` runs against live state, same
+        // as every real redraw (nowui-runtime's own `App::redraw`, and
+        // nowui-designer's `Chrome::refresh`) does each frame.
+        crate::resolve::resolve_templates(&mut ui, &state);
+        let root = ui.get(ui.layers[0].root);
+
+        // Depth 0: one RenderNode (a Container) whose first child is its own `Text`.
+        let paper = ui.get(root.children[0]);
+        assert_eq!(text_contents(&ui, &[paper.children[0]]), vec!["Paper".to_string()]);
+
+        // Depth 1: Header and Footer, both real state — not "item.label"
+        // literally, and not blank.
+        let header = ui.get(paper.children[1]);
+        let footer = ui.get(paper.children[2]);
+        assert_eq!(text_contents(&ui, &[header.children[0]]), vec!["Header".to_string()]);
+        assert_eq!(text_contents(&ui, &[footer.children[0]]), vec!["Footer".to_string()]);
+
+        // Depth 2: Logo, nested under Header.
+        let logo = ui.get(header.children[1]);
+        assert_eq!(text_contents(&ui, &[logo.children[0]]), vec!["Logo".to_string()]);
     }
 
     #[test]

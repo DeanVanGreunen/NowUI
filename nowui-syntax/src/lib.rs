@@ -206,6 +206,27 @@ mod tests {
     }
 
     #[test]
+    fn a_widget_with_no_trailing_block_does_not_swallow_a_sibling_for_or_if_as_bare_styles() {
+        // `style().repeated()` is otherwise greedy: with no explicit `{}`
+        // block to stop it, a bare lowercase word right after a widget with
+        // no children looks exactly like one more bare-flag style — `for`/
+        // `if` are the one case that isn't (see the "sibling kind" gotcha
+        // this mirrors, just for a keyword instead of a Capitalized kind).
+        let src = "layout: T { Text `a` for x in state.rows { Text `b` } }";
+        let ast = parse(src).expect("should parse, not merge Text with the for's own header");
+        let Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
+        assert_eq!(children.len(), 2, "the Text and the For are two separate siblings");
+        assert!(matches!(&children[0], Node::Widget { kind, styles, .. } if kind == "Text" && styles.is_empty()));
+        assert!(matches!(&children[1], Node::For { var, .. } if var == "x"));
+
+        let src_if = "layout: T { Text `a` if state.show { Text `b` } }";
+        let ast_if = parse(src_if).expect("same for `if`");
+        let Node::LayoutDef { children, .. } = &ast_if[0] else { panic!() };
+        assert_eq!(children.len(), 2);
+        assert!(matches!(&children[1], Node::If { .. }));
+    }
+
+    #[test]
     fn sibling_nodes_dont_swallow_next_kind_as_bare_style() {
         // A node with no bracketed trailing style must not let `style()` greedily
         // consume the next sibling's Capitalized `kind` ident as a bare flag.

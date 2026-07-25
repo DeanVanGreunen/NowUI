@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 use nowui_core::{
     compute_effective, display_string, dropdown_metrics, AnimatableStyle, Color, CursorIcon, Event,
-    EventKind, NodeId, NodeKind, NowUiState, Point, Rect, Size, StateValue, TemplatePart, Ui,
+    EventKind, NodeId, NodeKind, NowUiState, Point, Rect, Size, StateValue, Ui,
 };
 use nowui_render::{present_to_softbuffer, SkiaPainter, TextContext};
 use nowui_render_gpu::{GpuFontCache, GpuPainter, GpuSurfaceState};
@@ -35,6 +35,7 @@ use winit::event_loop::{ActiveEventLoop, ControlFlow};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
 
+use crate::resolve::state_subpath;
 use crate::transitions::Transitions;
 use crate::Backend;
 
@@ -170,123 +171,21 @@ impl<S: NowUiState + 'static> App<S> {
     /// resolve (wrong type, unknown field, `NoState`), are left exactly as
     /// the `.nowui` file authored them; this never *clears* a value, only
     /// overrides it when the state genuinely has one.
+    /// Thin wrapper around `crate::resolve::resolve_values` — see its own
+    /// doc comment for the actual logic, extracted out so nowui-designer's
+    /// own harness can reuse it without duplicating it.
     fn resolve_values(&mut self) {
-        for i in 0..self.ui.nodes.len() {
-            let id = NodeId(i as u32);
-            let path = self.ui.get(id).value_path.clone();
-            if path.is_empty() {
-                continue;
-            }
-            let sub = state_subpath(&path);
-            let Some(value) = self.state.get(&sub) else { continue };
-
-            // A slider mid-drag is the source of truth for its own value
-            // this frame — don't let a stale read fight the live gesture.
-            let dragging = self.dragging_slider == Some(id);
-
-            let node = self.ui.get_mut(id);
-            match &mut node.kind {
-                NodeKind::Text { content } => *content = display_string(&value),
-                NodeKind::Checkbox { checked, .. } => {
-                    if let Some(b) = value.as_bool() {
-                        *checked = b;
-                    }
-                }
-                NodeKind::Dropdown { options, selected, .. } => {
-                    if let Some(s) = value.as_str() {
-                        *selected = options.iter().position(|o| o == s);
-                    }
-                }
-                NodeKind::TextInput { label, .. } => {
-                    if let Some(s) = value.as_str() {
-                        *label = s.to_string();
-                    }
-                }
-                NodeKind::Date { value: v, .. } | NodeKind::Time { value: v, .. } | NodeKind::DateTime { value: v, .. } => {
-                    if let Some(s) = value.as_str() {
-                        *v = s.to_string();
-                    }
-                }
-                NodeKind::Slider { value: v } if !dragging => {
-                    if let Some(n) = value.as_f64() {
-                        *v = (n as f32 / 100.0).clamp(0.0, 1.0);
-                    }
-                }
-                NodeKind::ProgressBar { value: v } => {
-                    if let Some(n) = value.as_f64() {
-                        *v = (n as f32 / 100.0).clamp(0.0, 1.0);
-                    }
-                }
-                _ => {}
-            }
-        }
+        crate::resolve::resolve_values(&mut self.ui, &self.state, self.dragging_slider);
     }
 
-    /// Re-render every node's `templates` (backticks containing `${state.path}`
-    /// interpolation, e.g. `` `Count: ${state.counter.count}` ``) against the
-    /// live state and write the result into the widget field(s) that backtick
-    /// originally built — the same read-half-of-reactivity idea as
-    /// `resolve_values`, just for inline text instead of a `{value: ...}`
-    /// binding. A node with no dynamic backticks has empty `templates` and is
-    /// skipped entirely.
+    /// Thin wrapper around `crate::resolve::resolve_templates`.
     fn resolve_templates(&mut self) {
-        for i in 0..self.ui.nodes.len() {
-            let id = NodeId(i as u32);
-            let templates = self.ui.get(id).templates.clone();
-            if templates.is_empty() {
-                continue;
-            }
-            let rendered: Vec<String> = templates.iter().map(|t| self.render_template(t)).collect();
-            apply_resolved_templates(&mut self.ui.get_mut(id).kind, &rendered);
-        }
+        crate::resolve::resolve_templates(&mut self.ui, &self.state);
     }
 
-    /// Concatenate one backtick's literal/`${state.path}` parts into the
-    /// string it should currently display.
-    fn render_template(&self, parts: &[TemplatePart]) -> String {
-        let mut out = String::new();
-        for part in parts {
-            match part {
-                TemplatePart::Lit(s) => out.push_str(s),
-                TemplatePart::Var(path) => {
-                    if let Some(v) = self.state.get(&state_subpath(path)) {
-                        out.push_str(&display_string(&v));
-                    }
-                }
-            }
-        }
-        out
-    }
-
-    /// Resolve every node's `Style::dynamic` entries (a `key-[${state.path}]`
-    /// bracket value, e.g. `w-[${state.myWidth}]`) against the live state and
-    /// re-apply them onto `base_style` — the same read-half-of-reactivity
-    /// idea as `resolve_values`/`resolve_templates`, but for style values
-    /// instead of widget content. Runs before `apply_dynamic_styles` each
-    /// redraw so hover/focus/responsive variants and transitions are computed
-    /// from the resolved value, not the stale default `apply_style` left in
-    /// place at parse time. Written into `base_style` (not the transient,
-    /// recomputed-every-frame `style`) since that's the field
-    /// `apply_dynamic_styles` treats as ground truth.
-    ///
-    /// Reuses `semantic::apply_exact`/`apply_prefixed` — the exact same
-    /// key-dispatch `resolve_styles` uses for the static (parse-time) case —
-    /// so a dynamic value is interpreted identically to a literal one; keep
-    /// this in sync if that dispatch ever changes.
+    /// Thin wrapper around `crate::resolve::resolve_dynamic_styles`.
     fn resolve_dynamic_styles(&mut self) {
-        for i in 0..self.ui.nodes.len() {
-            let id = NodeId(i as u32);
-            let dynamic = self.ui.get(id).base_style.dynamic.clone();
-            if dynamic.is_empty() {
-                continue;
-            }
-            for (key, path) in &dynamic {
-                let Some(value) = self.state.get(&state_subpath(path)) else { continue };
-                let v = display_string(&value);
-                let style = &mut self.ui.get_mut(id).base_style;
-                let _ = crate::semantic::apply_exact(style, key, &v) || crate::semantic::apply_prefixed(style, key, &v);
-            }
-        }
+        crate::resolve::resolve_dynamic_styles(&mut self.ui, &self.state);
     }
 
     /// Write `value` back to whatever state path `id`'s `value_path` names,
@@ -1357,15 +1256,6 @@ impl<S: NowUiState + 'static> App<S> {
 }
 
 /// `["state", "counter", "count"]` -> `["counter", "count"]` — every
-/// `.nowui` binding path is rooted at the literal `state` segment (see
-/// `nowui-syntax`'s dotted-path grammar), but `NowUiState` impls are rooted
-/// at their own struct's fields, so that leading segment is stripped before
-/// crossing the reflection boundary.
-fn state_subpath(path: &[String]) -> Vec<&str> {
-    let skip = usize::from(path.first().is_some_and(|s| s == "state"));
-    path.iter().skip(skip).map(String::as_str).collect()
-}
-
 /// Map a resolved `cursor-*` style value to what actually has to be told to
 /// the OS window: `(visible, icon)` — `icon` is meaningless whenever
 /// `visible` is `false` (`cursor-none`), since the cursor isn't drawn at all.
@@ -1515,67 +1405,6 @@ fn apply_dial_point(picker: &mut nowui_core::datetime::TimePickerState, layout: 
         }
         ClockMode::Minute => picker.staged_minute = nowui_core::datetime::angle_to_60(angle),
         ClockMode::Second => picker.staged_second = nowui_core::datetime::angle_to_60(angle),
-    }
-}
-
-/// Write `values` (one per original backtick, same order/count as
-/// `nowui-runtime/src/semantic.rs`'s `primitive()` built the node's string
-/// fields from) into whichever `NodeKind` fields came from those backticks.
-/// Keep this index mapping in sync with `primitive()` if either changes.
-fn apply_resolved_templates(kind: &mut NodeKind, values: &[String]) {
-    match kind {
-        NodeKind::Text { content } => {
-            if let Some(v) = values.first() {
-                *content = v.clone();
-            }
-        }
-        NodeKind::Button { label } => {
-            if let Some(v) = values.first() {
-                *label = v.clone();
-            }
-        }
-        NodeKind::Checkbox { label, .. } => {
-            if let Some(v) = values.first() {
-                *label = v.clone();
-            }
-        }
-        NodeKind::TextInput { label, placeholder, .. } => {
-            if let Some(v) = values.first() {
-                *label = v.clone();
-            }
-            if let Some(v) = values.get(1) {
-                *placeholder = v.clone();
-            }
-        }
-        NodeKind::Dropdown { placeholder, options, .. } => {
-            if let Some(v) = values.first() {
-                *placeholder = v.clone();
-            }
-            for (opt, v) in options.iter_mut().zip(values.iter().skip(1)) {
-                *opt = v.clone();
-            }
-        }
-        NodeKind::Menu { label, .. } => {
-            if let Some(v) = values.first() {
-                *label = v.clone();
-            }
-        }
-        NodeKind::MenuItem { label } => {
-            if let Some(v) = values.first() {
-                *label = v.clone();
-            }
-        }
-        NodeKind::Date { placeholder, .. } | NodeKind::Time { placeholder, .. } | NodeKind::DateTime { placeholder, .. } => {
-            if let Some(v) = values.first() {
-                *placeholder = v.clone();
-            }
-        }
-        NodeKind::TreeViewItem { label, .. } => {
-            if let Some(v) = values.first() {
-                *label = v.clone();
-            }
-        }
-        NodeKind::Slider { .. } | NodeKind::ProgressBar { .. } | NodeKind::Container | NodeKind::DataGrid | NodeKind::TreeView { .. } => {}
     }
 }
 

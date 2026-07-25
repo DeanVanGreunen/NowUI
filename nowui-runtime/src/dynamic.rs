@@ -26,7 +26,7 @@
 //!     needs an arena-wide GC, out of scope here.
 
 use nowui_core::{NowUiState, StateValue};
-use nowui_syntax::ast::{BindValue, Binding, CmpOp, Expr, Node as AstNode, Template, TplPart};
+use nowui_syntax::ast::{BindValue, Binding, CmpOp, Expr, NamedArg, Node as AstNode, Template, TplPart};
 
 /// What a registered dynamic region actually is — the still-unexpanded AST,
 /// captured once and re-evaluated against live state on every refresh.
@@ -200,7 +200,7 @@ pub fn substitute_loop_var(node: &AstNode, var: &str, value: &StateValue, iter_p
     match node {
         AstNode::Widget { kind, args, string_args, styles, bindings, children, span } => AstNode::Widget {
             kind: kind.clone(),
-            args: args.clone(),
+            args: args.iter().map(|a| substitute_named_arg(a, var, iter_path, index)).collect(),
             string_args: string_args.iter().map(|t| substitute_template(t, var, value)).collect(),
             styles: styles.clone(),
             bindings: bindings.iter().map(|b| substitute_binding(b, var, iter_path, index)).collect(),
@@ -226,6 +226,32 @@ pub fn substitute_loop_var(node: &AstNode, var: &str, value: &StateValue, iter_p
             },
         },
         AstNode::LayoutDef { .. } | AstNode::Import { .. } => node.clone(),
+    }
+}
+
+/// Rewrite a single named-arg's path if it's rooted at the loop variable —
+/// the mechanism a **recursive** custom `layout:` needs to walk real tree-
+/// shaped state one level at a time (`for child in x.children { TreeNode
+/// entry=child } }` inside a `layout: TreeNode(entry) { ... }`): without
+/// this, `entry=child` would pass the bare loop-variable name `child`
+/// through unresolved (not a real `state`-rooted path), breaking the
+/// recursion at its very first level. Same rewrite `substitute_binding`
+/// already does for `{key: x.field}` — kept as a separate function only
+/// because `NamedArg`/`Binding` are different AST types with no shared
+/// trait, not because the logic differs.
+fn substitute_named_arg(a: &NamedArg, var: &str, iter_path: &[String], index: usize) -> NamedArg {
+    let BindValue::Path(path) = &a.value else { return a.clone() };
+    if iter_path.is_empty() {
+        return a.clone();
+    }
+    match path.split_first() {
+        Some((head, rest)) if head == var => {
+            let mut new_path = iter_path.to_vec();
+            new_path.push(index.to_string());
+            new_path.extend(rest.iter().cloned());
+            NamedArg { name: a.name.clone(), value: BindValue::Path(new_path) }
+        }
+        _ => a.clone(),
     }
 }
 
@@ -416,6 +442,26 @@ mod tests {
         assert_eq!(
             bindings[0].value,
             BindValue::Path(vec!["state".to_string(), "rows".to_string(), "2".to_string(), "handleMe".to_string()])
+        );
+    }
+
+    #[test]
+    fn substitute_loop_var_rewrites_a_named_arg_rooted_at_the_loop_variable() {
+        // The mechanism a recursive custom `layout:` needs to walk real
+        // tree-shaped state one level at a time — `TreeNode entry=child`
+        // where `child` is this `for`'s own loop variable.
+        let src = "layout: T { for x in state.rows { TreeNode entry=x } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let nowui_syntax::ast::Node::LayoutDef { children, .. } = &ast[0] else { panic!() };
+        let AstNode::For { body, .. } = &children[0] else { panic!() };
+        let item = StateValue::Object(vec![("label".to_string(), StateValue::Str("First row".to_string()))]);
+        let iter_path = vec!["state".to_string(), "rows".to_string()];
+        let substituted = substitute_loop_var(&body[0], "x", &item, &iter_path, 2);
+        let AstNode::Widget { args, .. } = &substituted else { panic!() };
+        assert_eq!(args[0].name, "entry");
+        assert_eq!(
+            args[0].value,
+            BindValue::Path(vec!["state".to_string(), "rows".to_string(), "2".to_string()])
         );
     }
 

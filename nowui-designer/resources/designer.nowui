@@ -1,0 +1,28 @@
+// Chrome, dogfooded — a title strip, a `TreeView`-based project explorer
+// (real, live `DesignerState.tree` data, walked via the recursive
+// `RenderVfsNode` layout below — see nowui-runtime's `dynamic::
+// substitute_named_arg` for the engine fix that makes a loop variable
+// passed as a *named arg* into a self-referential layout resolve live
+// state, not just the literal loop-variable name), and one preview slot.
+// No tabs/editor/inspector yet (see nowui-designer/src/app.rs's own module
+// doc for the build-order this is following). The preview slot is
+// recognized *structurally* right now (the root's own last child) rather
+// than via a dedicated marker — a documented simplification for this early
+// stage, not a permanent design; see `app.rs`'s `preview_slot_rect`.
+
+layout: RenderVfsNode(entry) {
+  TreeViewItem `${entry.name}` {
+    for child in entry.children { RenderVfsNode entry=child }
+  }
+}
+
+layout: App w-[fill] h-[fill] row {
+  Container w-[240px] h-[fill] bg-gray-900 p-3 gap-2 scroll-v {
+    Text `NowUI Designer` text-white font-semibold
+    TreeView text-white {
+      for entry in state.tree { RenderVfsNode entry=entry }
+    }
+  }
+  Container w-[fill] h-[fill] bg-gray-200 {
+  }
+}

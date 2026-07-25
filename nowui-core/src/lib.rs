@@ -73,6 +73,21 @@ mod tests {
     }
 
     #[test]
+    fn solve_into_forces_the_root_to_the_given_rect_instead_of_the_full_viewport() {
+        let mut ui = Ui::new();
+        let child = ui.push(Node::new(NodeKind::Container, Style { width: Sizing::Fill(1.0), height: Sizing::Fill(1.0), ..Default::default() }));
+        let root = ui.push(Node::new(NodeKind::Container, Style::default()));
+        ui.get_mut(root).children = vec![child];
+        ui.add_layer(root, "main");
+
+        layout::solve_into(&mut ui, Rect::new(50.0, 30.0, 200.0, 100.0), &mut NullPainter);
+
+        assert_eq!(ui.get(root).computed, Rect::new(50.0, 30.0, 200.0, 100.0), "root pinned to the given rect, not (0,0)+viewport");
+        assert_eq!(ui.get(child).computed, Rect::new(50.0, 30.0, 200.0, 100.0), "a Fill child fills that same rect");
+        assert_eq!(ui.viewport, Size::default(), "solve_into leaves Ui::viewport untouched — this Ui doesn't own a window");
+    }
+
+    #[test]
     fn fill_child_expands_to_viewport() {
         let mut ui = Ui::new();
         let child = ui.push(Node::new(

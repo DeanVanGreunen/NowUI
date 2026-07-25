@@ -21,16 +21,34 @@ use crate::style::{Align, Direction, Display, GridTrack, Position, Sizing, Style
 /// Solve every layer against the given viewport size.
 pub fn solve(ui: &mut Ui, viewport: Size, painter: &mut dyn Painter) {
     ui.viewport = viewport;
+    // Root fills the viewport unless it has an explicit fixed size. The
+    // whole tree is shifted by `-auto_scroll` (same sign convention as a
+    // `scroll-x`/`scroll-y` container's own pan) — see `Ui::auto_scroll`'s
+    // doc comment for why: bringing an open picker popup that still doesn't
+    // fully fit on screen into view by panning the whole page.
+    let root_rect = Rect::new(-ui.auto_scroll.x, -ui.auto_scroll.y, viewport.w, viewport.h);
+    solve_roots_into(ui, root_rect, painter);
+}
+
+/// Like `solve`, but every layer's root is forced to `root_rect` instead of
+/// being derived from `Ui::viewport`/`auto_scroll` — for a caller compositing
+/// this `Ui` into a sub-region of someone else's own layout rather than a
+/// whole window (nowui-designer's live preview: the region a *different*,
+/// independently-solved chrome document's own layout resolved for a
+/// "preview slot" container that frame — see its `preview.rs`). Does *not*
+/// touch `Ui::viewport`/`auto_scroll` itself, since those describe this
+/// `Ui`'s relationship to its own window, which a preview-in-a-panel doesn't
+/// have — a picker popup that doesn't fit is the chrome's problem to solve
+/// for the whole window, not this embedded document's.
+pub fn solve_into(ui: &mut Ui, root_rect: Rect, painter: &mut dyn Painter) {
+    solve_roots_into(ui, root_rect, painter);
+}
+
+fn solve_roots_into(ui: &mut Ui, root_rect: Rect, painter: &mut dyn Painter) {
     let roots: Vec<NodeId> = ui.layers.iter().map(|l| l.root).collect();
     for root in roots {
         let mut sizes = HashMap::new();
         measure(ui, root, painter, &mut sizes);
-        // Root fills the viewport unless it has an explicit fixed size. The
-        // whole tree is shifted by `-auto_scroll` (same sign convention as a
-        // `scroll-x`/`scroll-y` container's own pan) — see `Ui::auto_scroll`'s
-        // doc comment for why: bringing an open picker popup that still
-        // doesn't fully fit on screen into view by panning the whole page.
-        let root_rect = Rect::new(-ui.auto_scroll.x, -ui.auto_scroll.y, viewport.w, viewport.h);
         arrange(ui, root, root_rect, &sizes, root_rect);
         // After the normal pass, so every `Menu`'s own `computed` rect
         // (which anchors its popup) is final.

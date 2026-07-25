@@ -19,6 +19,7 @@
 pub mod app;
 pub mod dynamic;
 pub mod loader;
+pub mod resolve;
 pub mod semantic;
 pub mod transitions;
 

@@ -304,6 +304,26 @@ fn style() -> impl Parser<char, StylePair, Error = Simple<char>> + Clone {
             value: value.map(|v| v.trim().to_string()).unwrap_or_default(),
             span: Span { start: span.start, end: span.end },
         })
+        // `if`/`for` are reserved control-flow keywords, never real style
+        // names — without this, a widget with no explicit trailing `{}`
+        // block (so nothing else stops `style().repeated()`) directly
+        // followed by a sibling `if`/`for` node would have `style()`
+        // greedily swallow that keyword (and everything after it up to the
+        // next `{`) as one more bare-flag style, silently merging the two
+        // siblings into one and mis-parsing the `if`/`for`'s own header as
+        // more bare flags. Rejecting here forces `style().repeated()` to
+        // stop one token early and backtrack, so `node()`'s outer
+        // `choice((if_node, for_node, widget))` gets a clean second attempt
+        // at the very same input as a fresh sibling — same "content
+        // disambiguates, not position" principle as the `{ }` binding-vs-
+        // children-block gotcha.
+        .try_map(|pair, span| {
+            if pair.key == "if" || pair.key == "for" {
+                Err(Simple::custom(span, "`if`/`for` are reserved keywords, not style names"))
+            } else {
+                Ok(pair)
+            }
+        })
         .padded()
 }
 

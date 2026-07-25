@@ -1,0 +1,127 @@
+//! The designer's own `winit::application::ApplicationHandler` — built
+//! directly on `nowui_core`/`nowui_render_gpu`'s lower-level pieces (not
+//! `nowui_runtime::App`/`run_path`, which each own a whole `EventLoop` and
+//! exactly one window — see `preview.rs`'s module doc for why). Currently a
+//! single undetachable read-only preview window (this crate's first
+//! build-order stage); the multi-window chrome+preview split, live reload,
+//! and detach all land in later stages without changing this shape much —
+//! just what gets rendered into which window.
+
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use nowui_core::Size;
+use nowui_render_gpu::{GpuFontCache, GpuPainter, GpuSurfaceState};
+use winit::application::ApplicationHandler;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, ControlFlow};
+use winit::window::{Window, WindowId};
+
+use crate::chrome::Chrome;
+use crate::preview::PreviewDoc;
+use crate::state::DesignerState;
+
+/// Same fixed-60fps-loop convention `nowui-runtime`'s own `App` uses (see
+/// its module doc / CLAUDE.md's "Runtime gotchas") — not on-demand redraw.
+const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
+const CLEAR: nowui_core::Color = nowui_core::Color { r: 0x1e, g: 0x1e, b: 0x1e, a: 255 };
+
+pub struct DesignerApp {
+    pub chrome: Chrome,
+    pub doc: PreviewDoc,
+    pub state: DesignerState,
+    window: Option<Arc<Window>>,
+    gpu: Option<GpuSurfaceState>,
+    text: nowui_text::TextContext,
+    font_cache: GpuFontCache,
+    next_frame: Instant,
+}
+
+impl DesignerApp {
+    pub fn new(chrome: Chrome, doc: PreviewDoc, state: DesignerState) -> Self {
+        DesignerApp {
+            chrome,
+            doc,
+            state,
+            window: None,
+            gpu: None,
+            text: nowui_text::TextContext::new(),
+            font_cache: GpuFontCache::new(),
+            next_frame: Instant::now(),
+        }
+    }
+
+    /// Solves and paints the chrome first (full window), then reads wherever
+    /// its own layout placed the preview slot this frame and solves/paints
+    /// the live document into exactly that rect (`layout::solve_into`) —
+    /// the Gap-1 "second, independent `Ui`/`Layer` composited into a
+    /// chrome-defined region" technique, reusing the *existing* multi-layer
+    /// compositing model instead of true node-tree embedding. Both draws go
+    /// into the same `Scene`/present call, so they composite as one frame;
+    /// `push_clip`/`pop_clip` around the preview keeps overflowing content
+    /// from spilling outside its slot, same as any other clipped container.
+    fn redraw(&mut self) {
+        let Some(window) = self.window.clone() else { return };
+        let Some(gpu) = self.gpu.as_mut() else { return };
+
+        let size = window.inner_size();
+        let (w, h) = (size.width.max(1), size.height.max(1));
+        let mut scene = vello::Scene::new();
+
+        self.chrome.refresh(&self.state);
+        {
+            let mut painter = GpuPainter::new(&mut scene, &mut self.text, &mut self.font_cache);
+            nowui_core::layout::solve(&mut self.chrome.ui, Size::new(w as f32, h as f32), &mut painter);
+            nowui_core::paint::paint(&self.chrome.ui, &mut painter);
+        }
+
+        let slot_rect = self.chrome.preview_slot_rect();
+        {
+            let mut painter = GpuPainter::new(&mut scene, &mut self.text, &mut self.font_cache);
+            self.doc.render_into(slot_rect, &mut painter);
+        }
+
+        gpu.resize(w, h);
+        gpu.render_and_present(&scene, CLEAR);
+    }
+}
+
+impl ApplicationHandler for DesignerApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        let attrs = Window::default_attributes()
+            .with_title(format!("NowUI Designer — {}", self.doc.entry_path.display()))
+            .with_inner_size(winit::dpi::LogicalSize::new(1200.0, 800.0));
+        let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        let size = window.inner_size();
+        self.gpu = Some(GpuSurfaceState::new(window.clone(), size.width.max(1), size.height.max(1)));
+        self.window = Some(window);
+        self.next_frame = Instant::now();
+        if let Some(w) = &self.window {
+            w.request_redraw();
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = Instant::now();
+        if now >= self.next_frame {
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+            self.next_frame = if now.saturating_duration_since(self.next_frame) > FRAME_INTERVAL {
+                now + FRAME_INTERVAL
+            } else {
+                self.next_frame + FRAME_INTERVAL
+            };
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(self.next_frame));
+    }
+
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::RedrawRequested => self.redraw(),
+            _ => {}
+        }
+    }
+}
