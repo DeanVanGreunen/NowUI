@@ -463,13 +463,13 @@ impl DesignerApp {
             })
             .collect();
 
-        // Only worth showing at all once the active file actually defines
-        // more than one `layout:` — see `LayoutOption`'s own doc comment.
-        self.state.layout_options = if self.doc.layout_names.len() > 1 {
-            self.doc.layout_hierarchy.iter().map(|(path, name)| LayoutOption { label: path.clone(), id: name.clone() }).collect()
-        } else {
-            Vec::new()
-        };
+        // Populated whenever the active file has at least one reachable
+        // `layout:` — including just one, so the picker still shows (and
+        // lets you re-select) the file's own single layout instead of
+        // sitting empty with nothing to open. See `LayoutOption`'s own doc
+        // comment.
+        self.state.layout_options =
+            self.doc.layout_hierarchy.iter().map(|(path, name)| LayoutOption { label: path.clone(), id: name.clone() }).collect();
 
         let dir_label = match self.selected_dir.strip_prefix(&self.vfs.root) {
             Ok(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
@@ -706,16 +706,35 @@ impl DesignerApp {
         }
     }
 
-    /// `Ctrl+W` — close the active tab. If another tab becomes active,
-    /// loads it into the editor/preview; if that was the last tab, leaves
-    /// the editor/preview showing whatever they last did (nothing left to
-    /// switch to) but still refreshes `state.tabs`/`state.layouts` so the
-    /// (now empty) tab strip actually reflects it.
+    /// `Ctrl+W` — close the active tab. Thin wrapper around `close_tab_at`.
     fn close_active_tab(&mut self) {
-        let Some(index) = self.tabs.active_index() else { return };
+        if let Some(index) = self.tabs.active_index() {
+            self.close_tab_at(index);
+        }
+    }
+
+    /// Closes the tab at `index` — its own tab-strip "×" close button, or
+    /// `close_active_tab`'s own `Ctrl+W`. If `index` *was* the active tab,
+    /// loads whichever tab is now active into the editor/preview, or — if
+    /// none remain — clears the editor's own buffer so it falls back to its
+    /// `` `Open a .nowui file to start editing` `` placeholder (see
+    /// `TextInput`'s own "second backtick shows only while empty"
+    /// convention) instead of leaving the just-closed file's now-stale
+    /// content on screen. Closing a *different*, background tab doesn't
+    /// touch the editor/preview at all — `Tabs::close` already preserves
+    /// which tab stays active, just still needs `state.tabs` refreshed so
+    /// the closed tab's own row disappears from the strip.
+    fn close_tab_at(&mut self, index: usize) {
+        let was_active = self.tabs.active_index() == Some(index);
         self.tabs.close(index);
-        if self.tabs.active_index().is_some() {
-            self.load_active_tab_into_editor_and_preview();
+        if was_active {
+            if self.tabs.active_index().is_some() {
+                self.load_active_tab_into_editor_and_preview();
+            } else {
+                self.chrome.set_editor_text("");
+                self.selected_node = None;
+                self.sync_reactive_state();
+            }
         } else {
             self.sync_reactive_state();
         }
@@ -746,11 +765,15 @@ impl DesignerApp {
     /// walk). A click within the row's own disclosure-triangle zone (same
     /// `nowui_core::layout::TREE_TRIANGLE_W` zone `nowui_runtime::App::
     /// handle_click` uses for a real app's `TreeView`) toggles `collapsed`
-    /// instead of opening/selecting anything — only meaningful when the
-    /// item actually has children. Otherwise: a file opens it as a tab; a
-    /// folder selects it as the right-click context menu's own default
-    /// creation target. A `truncated` placeholder row maps to `None` —
-    /// neither, so the click is a no-op.
+    /// only, without selecting/opening anything — matches a real file
+    /// explorer's own convention that the arrow is a pure expand/collapse
+    /// control. A click *anywhere else* on a folder row does both: toggles
+    /// `collapsed` (the same "click a parent to open it" convention VS
+    /// Code's own explorer uses — a folder can be toggled from anywhere on
+    /// its own row, not only its narrow arrow) *and* selects it as the
+    /// right-click context menu's own default creation target, same as
+    /// before. A file row instead opens it as a tab. A `truncated`
+    /// placeholder row maps to `None` — neither, so the click is a no-op.
     fn handle_tree_click(&mut self, id: NodeId) {
         let node = self.chrome.ui.get(id);
         let has_children = !node.children.is_empty();
@@ -761,6 +784,12 @@ impl DesignerApp {
                 *collapsed = !*collapsed;
             }
             return;
+        }
+
+        if has_children {
+            if let NodeKind::TreeViewItem { collapsed, .. } = &mut self.chrome.ui.get_mut(id).kind {
+                *collapsed = !*collapsed;
+            }
         }
 
         let Some((path, is_dir)) = self.tree_click_path(id) else { return };
@@ -825,7 +854,15 @@ impl DesignerApp {
             return;
         }
         if let Some(index) = self.chrome.tab_strip_buttons().iter().position(|&b| b == id) {
-            self.switch_tab(index);
+            // Two buttons per tab, in source order (label, then its own "×"
+            // close button — see `resources/designer.nowui`'s own tab-strip
+            // comment), so tab N's pair sits at indices `2*N`/`2*N + 1`.
+            let tab_index = index / 2;
+            if index % 2 == 0 {
+                self.switch_tab(tab_index);
+            } else {
+                self.close_tab_at(tab_index);
+            }
             return;
         }
         if let Some(index) = self.chrome.inspector_field_buttons().iter().position(|&b| b == id) {
@@ -2235,12 +2272,18 @@ mod tests {
     }
 
     #[test]
-    fn a_single_layout_file_leaves_the_picker_empty() {
+    fn a_single_layout_file_still_populates_the_picker_with_its_own_one_layout() {
+        // Previously the picker stayed empty unless a file defined *more*
+        // than one reachable `layout:` — but an empty dropdown with
+        // nothing to open looks broken, not intentionally hidden. It
+        // should always show at least the file's own one layout.
         let dir = scratch_dir("single_layout");
         let a = dir.join("a.nowui");
         fs::write(&a, "layout: App { Text `main` }").unwrap();
         let app = build_app(&a, Vec::new());
-        assert!(app.state.layout_options.is_empty());
+        assert_eq!(app.state.layout_options.len(), 1);
+        assert_eq!(app.state.layout_options[0].label, "App");
+        assert_eq!(app.state.layout_options[0].id, "App");
     }
 
     #[test]
@@ -2335,10 +2378,50 @@ mod tests {
         app.chrome.refresh(&app.state.clone());
 
         let tab_buttons = app.chrome.tab_strip_buttons();
-        assert_eq!(tab_buttons.len(), 2);
+        // Two buttons per tab (label, then its own "×" close button — see
+        // `resources/designer.nowui`'s own tab-strip comment): index 2 is
+        // the second tab's own label button.
+        assert_eq!(tab_buttons.len(), 4);
+        app.handle_button_click(tab_buttons[2]);
+
+        assert_eq!(app.tabs.active().unwrap().path, b, "clicking the second tab's own label button still switches to the second tab");
+    }
+
+    #[test]
+    fn clicking_a_tabs_own_close_button_closes_just_that_tab() {
+        let dir = scratch_dir("tab_close_button");
+        let a = dir.join("a.nowui");
+        let b = dir.join("b.nowui");
+        fs::write(&a, "layout: App { Text `a` }").unwrap();
+        fs::write(&b, "layout: App { Text `b` }").unwrap();
+        let mut app = build_app(&a, Vec::new());
+        app.open_file(b.clone()); // "b" now active
+        app.chrome.refresh(&app.state.clone());
+
+        let tab_buttons = app.chrome.tab_strip_buttons();
+        assert_eq!(tab_buttons.len(), 4, "label + close, per tab");
+
+        // Index 1 is the *first* tab's ("a", a background tab — "b" is
+        // active) own close button.
         app.handle_button_click(tab_buttons[1]);
 
-        assert_eq!(app.tabs.active().unwrap().path, b, "clicking the second tab button still switches to the second tab");
+        assert_eq!(app.tabs.len(), 1);
+        assert_eq!(app.tabs.active().unwrap().path, b, "closing a background tab must not change which tab is active");
+        assert!(app.tabs.iter().all(|t| t.path != a), "the closed tab is gone");
+    }
+
+    #[test]
+    fn closing_the_last_tab_clears_the_editor_instead_of_leaving_stale_content() {
+        let dir = scratch_dir("close_last_tab");
+        let a = dir.join("a.nowui");
+        fs::write(&a, "layout: App { Text `a` }").unwrap();
+        let mut app = build_app(&a, Vec::new());
+        assert_eq!(app.chrome.editor_text(), "layout: App { Text `a` }");
+
+        app.close_active_tab();
+
+        assert!(app.tabs.is_empty());
+        assert_eq!(app.chrome.editor_text(), "", "no tabs left — the just-closed file's content must not linger");
     }
 
     #[test]
@@ -2610,11 +2693,12 @@ mod tests {
         let buttons = live_buttons(&app.chrome.ui);
         // The new-item popup's own Cancel/Create, the context menu's own
         // four (Add Folder/Add File/Rename/Delete — always present, see
-        // `DesignerState::context_menu_add_h`'s own doc comment), plus one
-        // tab-strip button for `a.nowui` (`build_app`/`DesignerApp::new`
-        // always seed one open tab from the initially-opened file) — no
-        // `layout:` picker buttons since `a.nowui` only defines one layout.
-        assert_eq!(buttons.len(), 7);
+        // `DesignerState::context_menu_add_h`'s own doc comment), plus two
+        // tab-strip buttons (label + "×" close) for `a.nowui`
+        // (`build_app`/`DesignerApp::new` always seed one open tab from the
+        // initially-opened file) — no `layout:` picker buttons since
+        // `a.nowui` only defines one layout.
+        assert_eq!(buttons.len(), 8);
 
         // Cancel (index 0) discards without creating anything.
         app.handle_button_click(buttons[0]);

@@ -93,17 +93,26 @@ impl Tabs {
         }
     }
 
-    /// Closes the tab at `index`. The new active tab (if any remain) is
-    /// whichever one now sits at the same index — the next tab to the
-    /// right, or the new last tab if the closed one was rightmost — the
-    /// same convention most tabbed editors use. No-op if `index` is out of
-    /// range.
+    /// Closes the tab at `index`. If `index` *was* the active tab, the new
+    /// active tab (if any remain) is whichever one now sits at the same
+    /// index — the next tab to the right, or the new last tab if the closed
+    /// one was rightmost — the same convention most tabbed editors use.
+    /// Closing a *different* tab (e.g. a background tab's own close button)
+    /// leaves whichever tab was already active still active — its own
+    /// index just shifts left by one if it sat to the right of the closed
+    /// tab. No-op if `index` is out of range.
     pub fn close(&mut self, index: usize) {
         if index >= self.open.len() {
             return;
         }
         self.open.remove(index);
-        self.active = if self.open.is_empty() { None } else { Some(index.min(self.open.len() - 1)) };
+        self.active = match self.active {
+            None => None,
+            Some(_) if self.open.is_empty() => None,
+            Some(active) if active == index => Some(index.min(self.open.len() - 1)),
+            Some(active) if active > index => Some(active - 1),
+            Some(active) => Some(active),
+        };
     }
 
     /// Rewrites every open tab's own path that equals `old_prefix` or sits
@@ -176,6 +185,27 @@ mod tests {
         tabs.close(1); // closes "b" — "c" (now at index 1) becomes active
         assert_eq!(tabs.len(), 2);
         assert_eq!(tabs.active().unwrap().path, PathBuf::from("/c.nowui"));
+    }
+
+    #[test]
+    fn closing_a_background_tab_leaves_the_active_one_active() {
+        // Regression: closing a tab via its own close button (not
+        // necessarily the active one) must not steal activeness — the
+        // previous implementation always recomputed `active` from the
+        // *closed* index, so closing an unrelated background tab could
+        // silently switch which tab was active.
+        let mut tabs = Tabs::default();
+        tabs.open_or_focus(Path::new("/a.nowui"), || "a".to_string());
+        tabs.open_or_focus(Path::new("/b.nowui"), || "b".to_string());
+        tabs.open_or_focus(Path::new("/c.nowui"), || "c".to_string());
+        tabs.switch_to(0); // "a" active
+
+        tabs.close(2); // closes "c", a background tab to the right of "a"
+        assert_eq!(tabs.active().unwrap().path, PathBuf::from("/a.nowui"), "the active tab must not change");
+
+        tabs.switch_to(1); // "b" active (now at index 1: [a, b])
+        tabs.close(0); // closes "a", a background tab to the *left* of "b"
+        assert_eq!(tabs.active().unwrap().path, PathBuf::from("/b.nowui"), "still active, just shifted to index 0");
     }
 
     #[test]

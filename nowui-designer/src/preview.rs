@@ -168,7 +168,8 @@ impl PreviewDoc {
 
     /// Switch which of the current file's own `layout:` definitions
     /// renders, without touching `entry_path` — e.g. the designer's own
-    /// layout picker, shown when `layout_names.len() > 1`. Reloads
+    /// layout picker, shown whenever `layout_names` has at least one entry.
+    /// Reloads
     /// immediately against `overrides` (the caller's unsaved-buffer
     /// override map, same as any other reload) so the new selection takes
     /// effect right away.

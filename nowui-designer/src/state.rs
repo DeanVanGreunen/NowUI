@@ -86,10 +86,10 @@ pub struct TabInfo {
 /// PageLogin > ResultPopUp"`, see `preview::layout_hierarchy`), `id` the
 /// bare layout name to switch to (`Dropdown`'s own two-field-struct
 /// convention for a `values` binding — see CLAUDE.md's `Dropdown` section).
-/// Shown only while the active tab's file defines more than one `layout:`
-/// (see `app::DesignerApp::sync_reactive_state`) — empty otherwise, so the
-/// dropdown naturally has nothing to pick from rather than needing a
-/// separate visibility guard.
+/// Populated whenever the active tab's file has at least one reachable
+/// `layout:` (see `app::DesignerApp::sync_reactive_state`) — including a
+/// file with just one, so the picker still shows and lets you re-select it,
+/// rather than sitting empty with nothing to open.
 #[derive(Default, Clone, nowui_core::NowUiState)]
 pub struct LayoutOption {
     pub label: String,

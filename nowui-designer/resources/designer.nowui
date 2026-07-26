@@ -129,12 +129,29 @@ layout: App w-[fill] h-[fill] row bg-[#1e1e1e] {
     }
   }
   Container w-[fill] h-[fill] bg-[#1e1e1e] col {
+    // Each tab is a `Container` with three children, in this fixed order —
+    // a file icon, the label `Button` (click switches to it), and a "×"
+    // close `Button` — never just one `Button` per tab any more. `app.rs`'s
+    // `handle_button_click` relies on that exact order: `Chrome::
+    // tab_strip_buttons()` only counts `Button`s (the icon is a plain
+    // `Icon`, not a `Button`, so it doesn't shift the count), giving
+    // exactly two per tab — label at `2*N`, close at `2*N + 1` — which is
+    // how it tells a "switch to this tab" click apart from a "close this
+    // tab" click without needing a dedicated marker.
     Container row scroll-h gap-1 p-2 bg-[#252526] h-[hug] {
       for tab in state.tabs {
         if tab.active {
-          Button `${tab.label}` bg-[#1e1e1e] text-white p-2 rounded
+          Container row items-center bg-[#1e1e1e] text-white rounded-t-[6px] px-3 py-2 gap-2 {
+            Icon `FaFile` w-[13px] h-[13px] line-color-[#cccccc]
+            Button `${tab.label}` bg-[#1e1e1e] text-white text-sm p-0
+            Button `×` bg-[#1e1e1e] text-[#969696] hover:text-white hover:bg-[#5a5a5a] rounded p-1 w-[18px] h-[18px] text-sm
+          }
         } else {
-          Button `${tab.label}` bg-[#2d2d2d] text-[#969696] p-2 rounded
+          Container row items-center bg-[#2d2d2d] text-[#969696] rounded-t-[6px] px-3 py-2 gap-2 hover:bg-[#333333] {
+            Icon `FaFile` w-[13px] h-[13px] line-color-[#969696]
+            Button `${tab.label}` bg-[#2d2d2d] text-[#969696] text-sm p-0
+            Button `×` bg-[#2d2d2d] text-[#969696] hover:text-white hover:bg-[#5a5a5a] rounded p-1 w-[18px] h-[18px] text-sm
+          }
         }
       }
     }
