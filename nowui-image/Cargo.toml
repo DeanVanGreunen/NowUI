@@ -1,7 +1,7 @@
 [package]
 name = "nowui-image"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 description = "Renderer-agnostic image decoding (png/gif/jpeg/bmp/webp) for the NowUI UI toolkit."
 license = "MIT"
 repository = "https://github.com/DeanVanGreunen/NowUI"

@@ -307,7 +307,7 @@ fn measure(ui: &mut Ui, id: NodeId, painter: &mut dyn Painter, sizes: &mut HashM
         let in_flow_sizes: Vec<Size> = children
             .iter()
             .zip(child_sizes.iter())
-            .filter(|(&c, _)| ui.get(c).style.position != Position::Absolute)
+            .filter(|&(&c, _)| ui.get(c).style.position != Position::Absolute)
             .map(|(_, &s)| s)
             .collect();
         let gap_total = style.gap * in_flow_sizes.len().saturating_sub(1) as f32;
