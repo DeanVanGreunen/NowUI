@@ -31,10 +31,14 @@ pub(crate) fn state_subpath(path: &[String]) -> Vec<&str> {
 pub fn resolve_disabled(ui: &mut Ui, state: &dyn NowUiState) {
     for i in 0..ui.nodes.len() {
         let id = NodeId(i as u32);
-        let path = ui.get(id).disabled_path.clone();
-        if path.is_empty() {
+        // Checked by reference first — a `Vec<String>` clone (even of an
+        // empty one) on every node in the arena, every frame, just to find
+        // out it's unbound is real, wasted cost for the overwhelmingly
+        // common case of a node with no `{disabled: ...}` binding at all.
+        if ui.get(id).disabled_path.is_empty() {
             continue;
         }
+        let path = ui.get(id).disabled_path.clone();
         let disabled = state.get(&state_subpath(&path)).and_then(|v| v.as_bool()).unwrap_or(false);
         ui.get_mut(id).disabled = disabled;
     }
@@ -49,10 +53,12 @@ pub fn resolve_disabled(ui: &mut Ui, state: &dyn NowUiState) {
 pub fn resolve_values(ui: &mut Ui, state: &dyn NowUiState, dragging_slider: Option<NodeId>) {
     for i in 0..ui.nodes.len() {
         let id = NodeId(i as u32);
-        let path = ui.get(id).value_path.clone();
-        if path.is_empty() {
+        // See `resolve_disabled`'s own comment on checking by reference
+        // before cloning — same reasoning here.
+        if ui.get(id).value_path.is_empty() {
             continue;
         }
+        let path = ui.get(id).value_path.clone();
         let sub = state_subpath(&path);
         let Some(value) = state.get(&sub) else { continue };
         let dragging = dragging_slider == Some(id);
@@ -117,10 +123,12 @@ pub fn resolve_values(ui: &mut Ui, state: &dyn NowUiState, dragging_slider: Opti
 pub fn resolve_dropdown_values(ui: &mut Ui, state: &dyn NowUiState) {
     for i in 0..ui.nodes.len() {
         let id = NodeId(i as u32);
-        let values_path = ui.get(id).values_path.clone();
-        if values_path.is_empty() {
+        // See `resolve_disabled`'s own comment on checking by reference
+        // before cloning — same reasoning here.
+        if ui.get(id).values_path.is_empty() {
             continue;
         }
+        let values_path = ui.get(id).values_path.clone();
         let Some(value) = state.get(&state_subpath(&values_path)) else { continue };
         let Some(items) = value.as_list() else { continue };
 
@@ -191,10 +199,12 @@ pub fn resolve_templates(ui: &mut Ui, state: &dyn NowUiState, template_exprs: &H
             apply_resolved_templates(&mut ui.get_mut(id).kind, &rendered);
             continue;
         }
-        let templates = ui.get(id).templates.clone();
-        if templates.is_empty() {
+        // See `resolve_disabled`'s own comment on checking by reference
+        // before cloning — same reasoning here.
+        if ui.get(id).templates.is_empty() {
             continue;
         }
+        let templates = ui.get(id).templates.clone();
         let rendered: Vec<String> = templates.iter().map(|t| render_template(state, t)).collect();
         apply_resolved_templates(&mut ui.get_mut(id).kind, &rendered);
     }
@@ -373,6 +383,22 @@ fn resolve_dynamic_map(style: &mut Style, dynamic: &std::collections::HashMap<St
 pub fn resolve_dynamic_styles(ui: &mut Ui, state: &dyn NowUiState) {
     for i in 0..ui.nodes.len() {
         let id = NodeId(i as u32);
+        // Checked by reference first — `base_style` is a whole `Style`
+        // (colors, transform, every variant), not a small field, so cloning
+        // it unconditionally for every node in the arena just to check
+        // whether it happens to have any `${state.path}` bracket at all was
+        // the single most expensive per-node tax among these resolvers. The
+        // overwhelming majority of nodes have no dynamic style at all.
+        let has_dynamic = {
+            let s = &ui.get(id).base_style;
+            !s.dynamic.is_empty()
+                || s.variants.hover.as_ref().is_some_and(|v| !v.dynamic.is_empty())
+                || s.variants.focus.as_ref().is_some_and(|v| !v.dynamic.is_empty())
+                || s.variants.active.as_ref().is_some_and(|v| !v.dynamic.is_empty())
+        };
+        if !has_dynamic {
+            continue;
+        }
         let base = ui.get(id).base_style.clone();
 
         if !base.dynamic.is_empty() {

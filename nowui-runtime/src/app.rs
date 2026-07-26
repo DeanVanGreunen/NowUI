@@ -425,12 +425,19 @@ impl<S: NowUiState + 'static> App<S> {
         // *before* everything else — a newly-appeared node needs its own
         // `value_path`/`templates`/`Style::dynamic` resolved this same
         // frame, not one frame late.
+        let nodes_before = self.ui.nodes.len();
         self.semantic.refresh_dynamic_regions(&mut self.ui, &self.state);
         // Frees whatever a region rebuild just orphaned (see `Ui::gc`'s own
-        // doc comment) — cheap enough to run unconditionally every redraw,
-        // and precisely timed: right after the one point in the frame that
-        // can actually create new garbage.
-        self.ui.gc();
+        // doc comment). `Ui::gc`'s own doc comment: a rebuild never reuses a
+        // `NodeId`, it always `push`es fresh ones, so `ui.nodes.len()`
+        // strictly grows whenever (and *only* whenever) a region actually
+        // rebuilt this call — a free, exact proxy for "is there anything new
+        // to sweep." Gated rather than unconditional: `gc()`'s own full-
+        // arena reachability walk isn't free, and on the (typical) frame
+        // where no region rebuilt, there's nothing for it to find.
+        if self.ui.nodes.len() != nodes_before {
+            self.ui.gc();
+        }
         self.dispatch_pending_on_load();
 
         // Rebuilds a `values`-bound `Dropdown`'s option list before

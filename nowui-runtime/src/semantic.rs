@@ -237,6 +237,14 @@ impl Semantic {
     /// chosen branch (`If`) or every iteration (`For`) into fresh arena
     /// nodes under `parent`. Nested `if`/`for` inside the chosen body are
     /// expanded via `expand_children` with `track: false` — see its doc.
+    ///
+    /// Always called from `refresh_dynamic_regions` after `compute_region_
+    /// signature` (just below) has already determined the signature
+    /// changed — this function still recomputes it as part of building the
+    /// real result (a small, one-time redundancy only paid on an actual
+    /// rebuild), rather than threading the already-known signature through,
+    /// to keep this the single source of truth for "what a real expansion
+    /// produces" with nothing to keep in sync by hand.
     fn expand_region(
         &mut self,
         ui: &mut Ui,
@@ -297,6 +305,44 @@ impl Semantic {
         }
     }
 
+    /// Computes what `expand_region`'s own signature *would be* for `ast`
+    /// against `state`/`scope` right now — reading state and evaluating the
+    /// condition/iterable, same as `expand_region` itself does, but without
+    /// ever expanding a chosen `If` branch's body or a `For`'s per-item
+    /// bodies into real arena nodes (no `ui.push`, no style/binding
+    /// resolution). `refresh_dynamic_regions` calls this first, every
+    /// redraw, and only falls through to the real, arena-mutating
+    /// `expand_region` when the result actually differs from what's already
+    /// recorded.
+    ///
+    /// This split exists because `expand_region` used to be the *only* way
+    /// to get a signature — meaning every redraw, including every no-op one
+    /// (a hover, a transition tick, or simply this region's own data not
+    /// having changed), paid to fully re-expand a `For`'s *entire* body for
+    /// *every* item (or an `If`'s chosen branch), only to throw the result
+    /// away the moment the signature turned out to match. For a large bound
+    /// list — a file explorer's own hundreds-to-thousands of rows, say —
+    /// that was a severe, unconditional per-frame cost that scaled with the
+    /// list's own size regardless of whether anything was actually dirty.
+    /// A `For`'s own signature is `RegionSignature::Items(Vec<String>)`,
+    /// one `signature_string` per item — the same per-item work `expand_
+    /// region`'s own loop already did, just no longer interleaved with the
+    /// far more expensive expansion step.
+    fn compute_region_signature(ast: &RegionAst, scope: &Scope, state: &dyn NowUiState) -> RegionSignature {
+        match ast {
+            RegionAst::If { branches, .. } => {
+                let mut resolve = scoped_resolver(state, scope);
+                let chosen = branches.iter().position(|(cond, _)| dynamic::eval_bool(cond, &mut resolve));
+                RegionSignature::Branch(chosen.unwrap_or(branches.len()))
+            }
+            RegionAst::For { iter, .. } => {
+                let mut resolve = scoped_resolver(state, scope);
+                let items = dynamic::eval_expr(iter, &mut resolve).and_then(|v| v.as_list().map(<[_]>::to_vec)).unwrap_or_default();
+                RegionSignature::Items(items.iter().map(dynamic::signature_string).collect())
+            }
+        }
+    }
+
     /// Re-evaluate every top-level dynamic region against `state`'s current
     /// values, rebuilding only the ones whose `RegionSignature` actually
     /// changed since last time (an unrelated redraw — a hover, a transition
@@ -308,16 +354,29 @@ impl Semantic {
         for i in 0..self.regions.len() {
             let region = &self.regions[i];
             let (parent, ast, scope, depth) = (region.parent, region.ast.clone(), region.scope.clone(), region.depth);
-            // `expand_region` runs speculatively here on *every* redraw, just
-            // to get a `RegionSignature` to compare — even a no-op redraw
-            // (a hover, a transition tick) calls it, and its `ui.push`ed
-            // nodes get thrown away below when nothing actually changed (see
-            // this fn's own doc comment, and `dynamic.rs`'s module doc on
-            // orphaned nodes). `expand`/`primitive`-adjacent code pushes
-            // every node it creates onto `pending_on_load` unconditionally,
-            // so a discarded speculative expansion must roll those back too
-            // — otherwise `onLoad` would refire every single redraw instead
-            // of only on a genuine rebuild.
+
+            // Cheap first: compute what the signature *would* be — reading
+            // state and hashing it (`dynamic::signature_string`) is real
+            // work for a large bound list, but it's nothing next to actually
+            // expanding every item into real arena nodes (style/binding
+            // resolution, `ui.push` per widget). On the overwhelmingly
+            // common no-op redraw (a hover, a transition tick, or simply
+            // this region's own data not having changed this frame), this
+            // is now the *only* work this region costs — see
+            // `compute_region_signature`'s own doc comment for why an
+            // earlier version of this function always paid for the full
+            // speculative expansion instead, on every region, every frame.
+            if Self::compute_region_signature(&ast, &scope, state) == self.regions[i].signature {
+                continue;
+            }
+
+            // Something really did change — now pay for the real
+            // expansion. `expand`/`primitive`-adjacent code pushes every
+            // node it creates onto `pending_on_load` unconditionally; a
+            // defensive re-check against the *real* signature (belt and
+            // braces against `compute_region_signature`/`expand_region`
+            // ever drifting out of sync with each other) still rolls that
+            // back on a false alarm, same as before this split existed.
             let on_load_mark = self.pending_on_load.len();
             let (new_ids, new_signature) = self.expand_region(ui, parent, &ast, &scope, state, depth);
             let region = &mut self.regions[i];
@@ -2287,6 +2346,32 @@ mod tests {
         sem.refresh_dynamic_regions(&mut ui, &state);
 
         assert_eq!(ui.get(root_id).children, before, "same NodeIds — nothing was rebuilt");
+    }
+
+    #[test]
+    fn refresh_on_a_for_region_allocates_no_new_nodes_at_all_when_nothing_changed() {
+        // `compute_region_signature` exists specifically so an unchanged
+        // `for` region is never even speculatively re-expanded — before
+        // that split, `refresh_dynamic_regions` fully expanded every item's
+        // body (real `ui.push`es, style/binding resolution) on *every*
+        // call just to get a signature to compare, discarding the result
+        // when it matched but leaving `ui.nodes.len()` — and so the arena's
+        // own memory footprint — growing forever regardless. A real, not
+        // just theoretical, cost for a large bound list refreshed 60 times
+        // a second.
+        let src = "layout: T { for row in state.rows { Text `${row}` } }";
+        let ast = nowui_syntax::parse(src).unwrap();
+        let mut sem = Semantic::new(&ast);
+
+        let state = DynamicTestState { show: true, rows: vec![1, 2, 3] };
+        let mut ui = sem.build("T", &state).unwrap();
+        let len_before = ui.nodes.len();
+
+        for _ in 0..5 {
+            sem.refresh_dynamic_regions(&mut ui, &state);
+        }
+
+        assert_eq!(ui.nodes.len(), len_before, "an unchanged for-bound list must not allocate any new nodes, speculatively or otherwise");
     }
 
     #[test]
