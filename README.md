@@ -3,7 +3,7 @@
 **A native UI toolkit for Rust, styled the way the web already thinks in.**
 
 NowUI lets you describe an application's interface in a small, declarative
-markup — a Tailwind-flavored styling vocabulary over a simple widget tree —
+markup - a Tailwind-flavored styling vocabulary over a simple widget tree -
 and back it with plain Rust state. No browser, no JavaScript runtime, no
 webview. Just a compact file format, a fast layout engine, and a GPU-accelerated
 renderer underneath, producing a real native window at a steady 60 frames per
