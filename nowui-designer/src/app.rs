@@ -2189,6 +2189,55 @@ mod tests {
     }
 
     #[test]
+    fn clicking_anywhere_else_on_a_folder_row_also_opens_it() {
+        // Not just its own narrow disclosure triangle — clicking the rest
+        // of a folder's row (its icon/label) should open it too, same as a
+        // real file explorer's own convention. `widgets` is nested under a
+        // top-level `src` here (rather than sitting at `state.tree`'s own
+        // top level) specifically so it starts *collapsed* — `RenderVfsNode`
+        // always starts a non-root folder collapsed, unlike `RenderRootVfsNode`
+        // (see designer.nowui's own comment) — so this test actually
+        // exercises "click opens a collapsed folder," not a no-op toggle.
+        let dir = scratch_dir("tree_row_click_expands");
+        let a = dir.join("a.nowui");
+        fs::create_dir_all(dir.join("src/widgets")).unwrap();
+        let nested = dir.join("src/widgets/Card.nowui");
+        fs::write(&a, "layout: App { Text `a` }").unwrap();
+        fs::write(&nested, "layout: Card { Text `c` }").unwrap();
+
+        let tree = vec![VfsNode {
+            name: "src".to_string(),
+            path: dir.join("src").display().to_string(),
+            is_dir: true,
+            children: vec![VfsNode {
+                name: "widgets".to_string(),
+                path: dir.join("src/widgets").display().to_string(),
+                is_dir: true,
+                children: vec![VfsNode { name: "Card.nowui".to_string(), path: nested.display().to_string(), is_dir: false, ..Default::default() }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let mut app = build_app(&a, tree);
+        app.chrome.refresh(&app.state.clone());
+        nowui_core::layout::solve(&mut app.chrome.ui, Size::new(1200.0, 800.0), &mut NullPainter);
+
+        let widgets_item = find_live_tree_item(&app.chrome.ui, "widgets");
+        let NodeKind::TreeViewItem { collapsed, .. } = &app.chrome.ui.get(widgets_item).kind else { panic!() };
+        assert!(collapsed, "sanity check: a nested folder starts collapsed");
+
+        let row_x = app.chrome.ui.get(widgets_item).computed.x;
+        // Well past the disclosure-triangle zone — over the label instead.
+        app.cursor.x = row_x + nowui_core::layout::TREE_TRIANGLE_W + 20.0;
+
+        app.handle_tree_click(widgets_item);
+
+        let NodeKind::TreeViewItem { collapsed, .. } = &app.chrome.ui.get(widgets_item).kind else { panic!() };
+        assert!(!collapsed, "clicking the row (not just the arrow) opens the folder");
+        assert_eq!(app.selected_dir, dir.join("src/widgets"), "and still selects it as the creation target, same as before");
+    }
+
+    #[test]
     fn opening_a_multi_layout_file_populates_the_layout_picker_with_its_own_hierarchy_paths() {
         let dir = scratch_dir("multi_layout");
         let a = dir.join("a.nowui");
