@@ -1099,6 +1099,67 @@ impl DesignerApp {
         self.reload_from_editor_buffer();
     }
 
+    /// Measure `text`'s pixel width at `size`, outside of an actual paint —
+    /// mirrors `nowui_runtime::App::measure_text_width` exactly (pure
+    /// cosmic-text shaping via `nowui-text`, no `Painter`/pixmap/GPU
+    /// surface needed at all).
+    fn measure_text_width(&mut self, text: &str, size: f32) -> f32 {
+        nowui_text::measure(&mut self.text.font_system, text, size).x
+    }
+
+    /// Which char index in `text` sits nearest to `target_x` (0 = before the
+    /// first char, `text.chars().count()` = after the last) — snaps to
+    /// whichever side of each char's midpoint `target_x` is closer to.
+    /// Mirrors `nowui_runtime::App::nearest_char_boundary` exactly.
+    fn nearest_char_boundary(&mut self, text: &str, target_x: f32, font_size: f32) -> usize {
+        let chars: Vec<char> = text.chars().collect();
+        let mut prev_w = 0.0;
+        for i in 0..chars.len() {
+            let prefix: String = chars[..=i].iter().collect();
+            let w = self.measure_text_width(&prefix, font_size);
+            if target_x < (prev_w + w) / 2.0 {
+                return i;
+            }
+            prev_w = w;
+        }
+        chars.len()
+    }
+
+    /// Which char index in `id`'s own `TextInput` a click at `cursor` should
+    /// place the caret at — mirrors `nowui_runtime::App::char_index_for_
+    /// click` exactly (single-line: accounts for horizontal scroll offset,
+    /// same origin `paint_text_input` draws from; multiline: picks the
+    /// clicked hard line from vertical position first, same as
+    /// `nowui_runtime`'s own). This is the fix for the documented "click-to-
+    /// position isn't wired up yet" gap `editor.rs`'s own module doc used to
+    /// describe — both the editor and the new-item/rename/field-edit prompt
+    /// are real `TextInput` nodes, so the same logic serves both.
+    fn char_index_for_click(&mut self, id: NodeId, cursor: Point) -> usize {
+        let (shown, style, content_rect, scroll) = {
+            let node = self.chrome.ui.get(id);
+            let style = node.style.clone();
+            let content_rect = node.computed.inset(style.border_width).inset(style.padding);
+            let NodeKind::TextInput { label, masked, cursor: caret, ime_preview, .. } = &node.kind else {
+                return 0;
+            };
+            let shown = nowui_core::text_input::display_string(label, *caret, ime_preview, *masked);
+            (shown, style, content_rect, node.scroll_offset)
+        };
+
+        if style.multiline {
+            let line_h = nowui_core::text_input::line_height(style.font_size);
+            let lines = nowui_core::text_input::hard_lines(&shown);
+            let target_y = (cursor.y - content_rect.y) + scroll.y;
+            let line = ((target_y / line_h).floor().max(0.0) as usize).min(lines.len().saturating_sub(1));
+            let target_x = cursor.x - content_rect.x;
+            let col = self.nearest_char_boundary(lines[line], target_x, style.font_size);
+            return nowui_core::text_input::char_index_at(&shown, line, col);
+        }
+
+        let target_x = (cursor.x - content_rect.x) + scroll.x;
+        self.nearest_char_boundary(&shown, target_x, style.font_size)
+    }
+
     /// Looks up `id`'s own source span (`PreviewDoc::node_span`) and, if
     /// found, selects that byte range in the editor's buffer — converted to
     /// **char** indices first (`TextInput::cursor`/`selection_anchor`'s own
@@ -1527,8 +1588,9 @@ impl ApplicationHandler for DesignerApp {
                 if hit == Some(self.chrome.editor_node) {
                     self.selected_node = None;
                     self.chrome.ui.focus = Some(self.chrome.editor_node);
-                    if let NodeKind::TextInput { label, cursor, selection_anchor, .. } = &mut self.chrome.ui.get_mut(self.chrome.editor_node).kind {
-                        *cursor = nowui_core::text_input::char_len(label);
+                    let idx = self.char_index_for_click(self.chrome.editor_node, self.cursor);
+                    if let NodeKind::TextInput { cursor, selection_anchor, .. } = &mut self.chrome.ui.get_mut(self.chrome.editor_node).kind {
+                        *cursor = idx;
                         *selection_anchor = None;
                     }
                 } else if hit == Some(self.chrome.new_item_node) {
@@ -1540,9 +1602,9 @@ impl ApplicationHandler for DesignerApp {
                     // inert field.
                     self.selected_node = None;
                     self.chrome.ui.focus = Some(self.chrome.new_item_node);
-                    let text = self.chrome.new_item_text().to_string();
+                    let idx = self.char_index_for_click(self.chrome.new_item_node, self.cursor);
                     if let NodeKind::TextInput { cursor, selection_anchor, .. } = &mut self.chrome.ui.get_mut(self.chrome.new_item_node).kind {
-                        *cursor = nowui_core::text_input::char_len(&text);
+                        *cursor = idx;
                         *selection_anchor = None;
                     }
                 } else if let Some(id) = hit.filter(|&id| matches!(self.chrome.ui.get(id).kind, NodeKind::TreeViewItem { .. })) {
@@ -1881,6 +1943,28 @@ mod tests {
 
         assert_eq!(app.tabs.active().unwrap().path, b);
         assert_eq!(app.chrome.editor_text(), "layout: App { Text `b` }");
+    }
+
+    #[test]
+    fn char_index_for_click_finds_the_nearest_char_boundary_not_always_the_end() {
+        // Regression for the documented "click-to-position isn't wired up
+        // yet" gap — a click used to always place the caret at
+        // `char_len(label)` regardless of where in the box it landed.
+        let dir = scratch_dir("editor_click_position");
+        let a = dir.join("a.nowui");
+        fs::write(&a, "layout: App { Text `a` }").unwrap();
+        let mut app = build_app(&a, Vec::new());
+        app.chrome.set_editor_text("hello world");
+        app.chrome.ui.get_mut(app.chrome.editor_node).computed = nowui_core::Rect::new(0.0, 0.0, 400.0, 30.0);
+
+        let idx_start = app.char_index_for_click(app.chrome.editor_node, Point::new(0.0, 5.0));
+        assert_eq!(idx_start, 0, "clicking near the left edge should land before the first character");
+
+        let idx_end = app.char_index_for_click(app.chrome.editor_node, Point::new(9999.0, 5.0));
+        assert_eq!(idx_end, "hello world".chars().count(), "clicking far past the text should land after the last character");
+
+        let idx_mid = app.char_index_for_click(app.chrome.editor_node, Point::new(1.0, 5.0));
+        assert!(idx_mid < idx_end, "clicking near the start should not land at the end");
     }
 
     #[test]

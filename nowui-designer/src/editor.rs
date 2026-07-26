@@ -5,12 +5,13 @@
 //! logic doesn't touch application state at all — a free function, not
 //! worth threading through `nowui_runtime::resolve`'s state-reading concern).
 //!
-//! **Known simplification**: click-to-position-the-caret isn't wired up yet
-//! — clicking the editor always focuses it and places the caret at the end
-//! of the text (see `app.rs`'s mouse handling). Real click positioning
-//! needs the same `measure_text`-driven char-index math `nowui-runtime`'s
-//! own `char_index_for_click` uses, which needs a `Painter` at click time —
-//! a real, disclosed gap, not a silent one.
+//! Click-to-position the caret is handled separately, in `app.rs`'s own
+//! `char_index_for_click`/`nearest_char_boundary` (a direct port of
+//! `nowui-runtime`'s own `App::char_index_for_click` — the same
+//! `measure_text`-driven char-index math, just needing `&mut DesignerApp`'s
+//! own `self.text: TextContext` at click time instead of a `Painter`)
+//! rather than living here, since this module only ever handles *keyboard*
+//! editing on an already-focused, already-positioned caret.
 
 use nowui_core::text_input::{char_index_at, char_len, delete_range, insert_str, line_and_col, move_left, move_right};
 use nowui_core::{Color, NodeId, NodeKind, Ui};
