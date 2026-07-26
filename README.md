@@ -92,7 +92,7 @@ fn main() -> ExitCode {
 ### The view (NowUI)
 
 ```nowui
-layout: App w-[fill] h-[fill] items-center justify-center gap-4 bg-gray-100 {
+layout: App w-[fill] h-[fill] scroll-v items-center justify-center gap-4 bg-gray-100 {
   Text `Count: ${state.counter.count}` text-2xl font-semibold text-gray-800
   Container row gap-3 {
     Button `-` w-[48px] text-center text-white bg-gray-600 rounded py-2 {onClick: state.counter.decrement}
@@ -162,8 +162,8 @@ struct AppState {
 // Callable methods aren't discovered from the `impl Counter` block below —
 // derive macros never see it — so they're listed explicitly here.
 #[derive(Default, Clone, NowUiState)]
-#[nowui(methods(increment, decrement))]
 #[nowui(root(AppState))]
+#[nowui(methods(increment, decrement))]
 struct Counter {
     count: i64,
 }
