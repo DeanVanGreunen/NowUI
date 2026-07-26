@@ -105,6 +105,26 @@ impl Tabs {
         self.open.remove(index);
         self.active = if self.open.is_empty() { None } else { Some(index.min(self.open.len() - 1)) };
     }
+
+    /// Rewrites every open tab's own path that equals `old_prefix` or sits
+    /// nested under it (a folder rename affecting the files inside it) to
+    /// the same path rooted at `new_prefix` instead — called after
+    /// `VirtualFs::rename` succeeds, so an open tab keeps editing the same
+    /// file/folder under its new name/location instead of pointing at a
+    /// now-stale path. Returns whether the *active* tab's own path changed
+    /// (the caller needs to know whether to reload the editor/preview).
+    pub fn retarget_paths(&mut self, old_prefix: &Path, new_prefix: &Path) -> bool {
+        let mut active_changed = false;
+        for (i, tab) in self.open.iter_mut().enumerate() {
+            if let Ok(rel) = tab.path.strip_prefix(old_prefix) {
+                tab.path = new_prefix.join(rel);
+                if Some(i) == self.active {
+                    active_changed = true;
+                }
+            }
+        }
+        active_changed
+    }
 }
 
 #[cfg(test)]
@@ -174,5 +194,32 @@ mod tests {
         tabs.open_or_focus(Path::new("/b.nowui"), || "b".to_string());
         tabs.close(1); // closes "b", the rightmost — "a" should become active
         assert_eq!(tabs.active().unwrap().path, PathBuf::from("/a.nowui"));
+    }
+
+    #[test]
+    fn retarget_paths_rewrites_a_renamed_folders_own_nested_tabs() {
+        let mut tabs = Tabs::default();
+        tabs.open_or_focus(Path::new("/proj/widgets/Card.nowui"), || "card".to_string());
+        tabs.open_or_focus(Path::new("/proj/other.nowui"), || "other".to_string());
+        tabs.switch_to(0);
+
+        let active_changed = tabs.retarget_paths(Path::new("/proj/widgets"), Path::new("/proj/controls"));
+
+        assert!(active_changed, "the active tab (index 0) was nested under the renamed folder");
+        assert_eq!(tabs.active().unwrap().path, PathBuf::from("/proj/controls/Card.nowui"));
+        // The sibling tab, not nested under the renamed folder, is untouched.
+        assert_eq!(tabs.iter().nth(1).unwrap().path, PathBuf::from("/proj/other.nowui"));
+    }
+
+    #[test]
+    fn retarget_paths_handles_a_plain_file_rename_not_just_a_folder() {
+        let mut tabs = Tabs::default();
+        tabs.open_or_focus(Path::new("/proj/a.nowui"), || "a".to_string());
+        tabs.switch_to(0);
+
+        let active_changed = tabs.retarget_paths(Path::new("/proj/a.nowui"), Path::new("/proj/renamed.nowui"));
+
+        assert!(active_changed);
+        assert_eq!(tabs.active().unwrap().path, PathBuf::from("/proj/renamed.nowui"));
     }
 }

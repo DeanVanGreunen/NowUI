@@ -548,7 +548,7 @@ impl Semantic {
                     })
                     .unwrap_or_default(),
                 label: arg(0),
-                collapsed: false,
+                collapsed: bindings.iter().any(|b| b.key == "collapsed" && matches!(b.value, BindValue::Bool(true))),
                 selected: bindings.iter().any(|b| b.key == "selected" && matches!(b.value, BindValue::Bool(true))),
                 checkbox: false,
                 show_folder_actions: style.show_folder_actions,

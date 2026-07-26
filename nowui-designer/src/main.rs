@@ -14,7 +14,9 @@
 mod app;
 mod chrome;
 mod editor;
+mod inspector;
 mod preview;
+mod render_thread;
 mod state;
 mod tabs;
 mod virtual_fs;

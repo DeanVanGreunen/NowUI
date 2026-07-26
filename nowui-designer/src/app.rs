@@ -9,10 +9,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nowui_core::{Edges, NodeId, NodeKind, Painter, Point, Size};
+use nowui_core::{NodeId, NodeKind, Point, Size};
 use nowui_render_gpu::{GpuFontCache, GpuPainter, GpuSurfaceState};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -22,36 +23,32 @@ use winit::window::{Window, WindowId};
 
 use crate::chrome::Chrome;
 use crate::preview::PreviewDoc;
-use crate::state::{DesignerState, LayoutOption, TabInfo, VfsNode};
+use crate::state::{DesignerState, InspectorFieldRow, LayoutOption, TabInfo, VfsNode};
 use crate::tabs::Tabs;
 use crate::watcher::FileWatcher;
 
 /// Same fixed-60fps-loop convention `nowui-runtime`'s own `App` uses (see
 /// its module doc / CLAUDE.md's "Runtime gotchas") — not on-demand redraw.
 const FRAME_INTERVAL: Duration = Duration::from_nanos(1_000_000_000 / 60);
-const CLEAR: nowui_core::Color = nowui_core::Color { r: 0x1e, g: 0x1e, b: 0x1e, a: 255 };
 
-/// The position of `id` among every *live* (reachable from a layer root)
-/// node in `ui`, walked depth-first in the same order `designer.nowui`'s
-/// own recursive expansion produces, whose `kind` matches `pred` — `None`
-/// if `id` itself doesn't match `pred` (or isn't reachable at all). Shared
-/// by `handle_tree_click`/`handle_button_click` to map a hit-tested node
-/// back to "the Nth thing of this kind", since neither `TreeViewItem`/
-/// `Button` carries any other identifying data a loop-variable-rooted
-/// binding could thread through yet (see `VfsNode::path`'s own doc comment
-/// on the underlying engine gap).
+/// Every live (reachable from a layer root) node whose `kind` matches
+/// `pred`, depth-first in the same order `designer.nowui`'s own recursive
+/// expansion produces — the shared walk `DesignerApp::tree_item_index_cache`
+/// (id -> position) and `apply_active_row_highlight` (position -> id, the
+/// inverse) both build on.
 ///
 /// Deliberately walks the *live tree* rather than scanning `ui.nodes` in
-/// raw `NodeId` order — a `for`/`if` region rebuild (e.g. `state.tree`'s own
-/// `bg_color`/`text_color` changing on every tab switch, or `state.tabs`
-/// changing on every keystroke) never frees its old arena nodes (see
-/// CLAUDE.md's own "no node-removal/GC" limitation), so orphaned duplicates
-/// from earlier rebuilds pile up interleaved with the current generation.
-/// Counting raw `NodeId` order would count those dead duplicates too,
-/// inflating a live node's own index past what `flatten_tree_paths`/
-/// `state.tabs.len()` actually expect. A depth-first walk from each layer's
-/// own root only ever visits what's actually still referenced.
-fn node_index_among(ui: &nowui_core::Ui, id: NodeId, pred: impl Fn(&NodeKind) -> bool) -> Option<usize> {
+/// raw `NodeId` order — a `for`/`if` region rebuild (e.g. `state.tabs`
+/// changing on every keystroke) leaves its old arena nodes behind until the
+/// next `Ui::gc()` sweeps them (and even then, their own `NodeId`s stay
+/// permanently allocated — see `Ui::gc`'s own doc comment), so stale
+/// duplicates from earlier rebuilds can sit interleaved with the current
+/// generation between one `gc()` pass and the next. Counting raw `NodeId`
+/// order would count those too, inflating a live node's own index past what
+/// `flatten_tree_paths`/`state.tabs.len()` actually expect. A depth-first
+/// walk from each layer's own root only ever visits what's actually still
+/// referenced.
+fn live_nodes_matching(ui: &nowui_core::Ui, pred: impl Fn(&NodeKind) -> bool) -> Vec<NodeId> {
     fn walk(ui: &nowui_core::Ui, id: NodeId, pred: &impl Fn(&NodeKind) -> bool, out: &mut Vec<NodeId>) {
         let node = ui.get(id);
         if pred(&node.kind) {
@@ -65,7 +62,79 @@ fn node_index_among(ui: &nowui_core::Ui, id: NodeId, pred: impl Fn(&NodeKind) ->
     for layer in &ui.layers {
         walk(ui, layer.root, &pred, &mut live);
     }
-    live.iter().position(|&n| n == id)
+    live
+}
+
+/// A cheaper alternative to `ui.clone()` for publishing a render snapshot
+/// to the background render thread. `paint::paint` still *visits* a
+/// collapsed `TreeViewItem`'s own descendants every frame (their own
+/// `computed` rect is just whatever `layout::arrange`'s own collapse-skip
+/// last left it at — usually zero, since an always-collapsed folder's
+/// children never get arranged at all — see CLAUDE.md's TreeView section
+/// and `layout.rs`'s own "excluded entirely... occupies zero space" doc
+/// comment), so they already paint nothing visible — but *deep-cloning*
+/// their real label/icon/style data into a snapshot that will only ever
+/// paint an empty rect is pure waste. For a real project tree (thousands
+/// of files, mostly collapsed) that waste — repeated 60 times a second —
+/// is the dominant cost of a redraw, not the GPU work it was split off to
+/// avoid blocking.
+///
+/// Every node beneath a `collapsed` `TreeViewItem` is replaced with a
+/// cheap empty-`Container` placeholder in the *clone* only — the same
+/// tombstone shape `Ui::gc` already uses for swept nodes, and just as
+/// harmless to paint (an empty container with a zero `computed` rect draws
+/// nothing). `ui` itself, and its real children, are untouched, so
+/// re-expanding a folder later still reads the live data.
+fn clone_for_render(ui: &nowui_core::Ui) -> nowui_core::Ui {
+    let mut hidden = vec![false; ui.nodes.len()];
+
+    fn mark_hidden(ui: &nowui_core::Ui, id: NodeId, hidden: &mut [bool]) {
+        hidden[id.0 as usize] = true;
+        for &child in &ui.get(id).children {
+            mark_hidden(ui, child, hidden);
+        }
+    }
+    fn walk(ui: &nowui_core::Ui, id: NodeId, hidden: &mut [bool]) {
+        let node = ui.get(id);
+        let collapsed_with_children = matches!(&node.kind, NodeKind::TreeViewItem { collapsed: true, .. }) && !node.children.is_empty();
+        if collapsed_with_children {
+            for &child in &node.children {
+                mark_hidden(ui, child, hidden);
+            }
+        } else {
+            for &child in &node.children {
+                walk(ui, child, hidden);
+            }
+        }
+    }
+    for layer in &ui.layers {
+        walk(ui, layer.root, &mut hidden);
+    }
+
+    let nodes = ui
+        .nodes
+        .iter()
+        .enumerate()
+        .map(|(i, node)| if hidden[i] { nowui_core::Node::new(NodeKind::Container, nowui_core::Style::default()) } else { node.clone() })
+        .collect();
+
+    nowui_core::Ui {
+        nodes,
+        layers: ui.layers.clone(),
+        focus: ui.focus,
+        dirty: ui.dirty,
+        viewport: ui.viewport,
+        cursor: ui.cursor,
+        mouse_down: ui.mouse_down,
+        auto_scroll: ui.auto_scroll,
+        page_scroll_min: ui.page_scroll_min,
+        page_scroll_max: ui.page_scroll_max,
+        chevron_up: ui.chevron_up.clone(),
+        chevron_down: ui.chevron_down.clone(),
+        chevron_right: ui.chevron_right.clone(),
+        icon_add_file: ui.icon_add_file.clone(),
+        icon_add_folder: ui.icon_add_folder.clone(),
+    }
 }
 
 /// Every `VfsNode` in `nodes`, flattened via the exact same pre-order
@@ -109,14 +178,14 @@ pub const IDLE_HINT: &str = "Right-click a folder (or the explorer) to create a 
 /// popup_left`'s own doc comment for why off-screen rather than
 /// `opacity-0`).
 const POPUP_HIDDEN: &str = "-9999px";
-/// A fixed, reasonable center-ish placement for the new-item popup while a
-/// creation is in progress — not measured against the real window size (the
-/// window is resizable and this crate doesn't track its current size), same
-/// "good enough, not pixel-perfect" scope this build stage already accepts
-/// elsewhere (see `Chrome::preview_slot_rect`'s own structural-recognition
-/// comment).
-const POPUP_LEFT: &str = "430px";
-const POPUP_TOP: &str = "280px";
+/// The new-item/rename popup's own outer overlay, while open, is aligned to
+/// the window's own top-left origin (`0px`/`0px`) and sized `w-[fill] h-
+/// [fill]` (see `designer.nowui`'s own comment on this container) — real
+/// centering happens via that overlay's own `items-center justify-center`,
+/// not a guessed fixed pixel offset, so it stays centered at any window
+/// size.
+const POPUP_LEFT: &str = "0px";
+const POPUP_TOP: &str = "0px";
 
 /// Re-scans `vfs`'s own project root into the `Vec<VfsNode>` shape
 /// `designer.nowui`'s explorer renders — shared by `main.rs` (the initial
@@ -152,6 +221,40 @@ impl NewItemKind {
     }
 }
 
+/// What the right-click context menu is currently targeting — determines
+/// which of its own four rows are shown (see `sync_reactive_state`'s own
+/// context-menu block) and what "Add Folder"/"Add File"/"Rename"/"Delete"
+/// each act on.
+#[derive(Clone, Debug, PartialEq)]
+enum ContextMenuTarget {
+    /// A right-clicked directory row — all four rows show.
+    Folder(PathBuf),
+    /// A right-clicked file row — only Rename/Delete show (`Style::
+    /// context_menu_add_h`-driven rows collapse to zero height).
+    File(PathBuf),
+    /// Empty explorer/preview space — the project root; only Add
+    /// Folder/Add File show (nothing sensible to rename/delete).
+    Root(PathBuf),
+}
+
+impl ContextMenuTarget {
+    /// The real filesystem path this target refers to.
+    fn path(&self) -> &Path {
+        match self {
+            ContextMenuTarget::Folder(p) | ContextMenuTarget::File(p) | ContextMenuTarget::Root(p) => p,
+        }
+    }
+
+    /// Where "Add Folder"/"Add File" should create something — the
+    /// directory itself for `Folder`/`Root`, or its own parent for `File`.
+    fn dir_for_create(&self) -> PathBuf {
+        match self {
+            ContextMenuTarget::Folder(p) | ContextMenuTarget::Root(p) => p.clone(),
+            ContextMenuTarget::File(p) => p.parent().map(Path::to_path_buf).unwrap_or_else(|| p.clone()),
+        }
+    }
+}
+
 pub struct DesignerApp {
     pub chrome: Chrome,
     pub doc: PreviewDoc,
@@ -167,7 +270,12 @@ pub struct DesignerApp {
     /// still runs, just without reload-on-external-edit.
     watcher: Option<FileWatcher>,
     window: Option<Arc<Window>>,
-    gpu: Option<GpuSurfaceState>,
+    /// Owns the dedicated GPU render thread for the *main* window — see
+    /// `render_thread`'s own module doc. `redraw` still runs `layout::
+    /// solve` right here on the main thread every frame (this-frame-correct
+    /// hit-testing/selection with zero lag), then publishes the solved
+    /// `Ui`(s) to this thread, which only ever paints + presents them.
+    render_thread: Option<crate::render_thread::RenderThread>,
     /// The preview's own second OS window, only while detached (`Ctrl+D`
     /// toggles) — `None` while docked, when the preview instead composites
     /// into the main window's own scene (`redraw`). Same `PreviewDoc`/`Ui`
@@ -190,26 +298,99 @@ pub struct DesignerApp {
     /// is just this crate's own last `scan_tree` snapshot, rebuilt after
     /// every create.
     vfs: crate::virtual_fs::VirtualFs,
-    /// Which directory a new file/folder from the "+ File"/"+ Folder"
-    /// buttons is created inside — the project root until a directory row
-    /// in the tree is clicked (`handle_tree_click`), which selects it.
+    /// Which directory the context menu's own "Add Folder"/"Add File" rows
+    /// create inside — set from `ContextMenuTarget::dir_for_create` when
+    /// one of them is clicked (`context_menu_add`), or the project root
+    /// until then.
     selected_dir: PathBuf,
     /// `Some` exactly while the new-item prompt (`Chrome::new_item_node`)
-    /// is actively accepting a name — set from the context menu's own "New
-    /// File.../New Folder..." items, cleared on Enter (confirm) or Escape
-    /// (cancel). Gates whether keyboard input routes to the prompt instead
-    /// of the main editor (see `window_event`'s own `KeyboardInput` arm).
+    /// is actively accepting a name — set from the context menu's own "Add
+    /// Folder"/"Add File" items, cleared on Enter (confirm) or Escape
+    /// (cancel). Mutually exclusive with `renaming` (starting one clears
+    /// the other — see `start_creating`/`start_renaming`). Gates whether
+    /// keyboard input routes to the prompt instead of the main editor (see
+    /// `window_event`'s own `KeyboardInput` arm).
     creating: Option<NewItemKind>,
-    /// `Some((dir, anchor))` exactly while the right-click context menu is
-    /// open — `dir` is where "New File.../New Folder..." would create
-    /// something, and what "Reveal in File Explorer" reveals (the
-    /// right-clicked folder itself, or its parent for a right-clicked
-    /// file, or the project root for a right-click on empty space — see
-    /// `open_context_menu`); `anchor` is the screen position it opened at,
-    /// re-applied to `DesignerState::context_menu_left`/`top` every
-    /// `sync_reactive_state` (so it doesn't drift if the mouse moves while
-    /// the menu is still open). `None` while closed.
-    context_menu: Option<(PathBuf, Point)>,
+    /// `Some(old_path)` exactly while the same prompt (reused rather than
+    /// duplicated — see `start_renaming`) is instead renaming an existing
+    /// file/folder, pre-filled with its current name. `None` while idle.
+    renaming: Option<PathBuf>,
+    /// `Some(field)` exactly while the same shared prompt (see `renaming`'s
+    /// own doc comment on why one prompt, not a third one) is instead
+    /// editing one inspector field's own value — set from `start_editing_
+    /// field`, pre-filled with that field's own current source text.
+    /// Mutually exclusive with `creating`/`renaming` (starting one clears
+    /// the others).
+    editing_field: Option<crate::inspector::InspectorField>,
+    /// The currently-selected preview node's own style/binding fields, in
+    /// the exact `Vec<InspectorField>` shape `inspector::inspect` returns
+    /// (spans included) — `state.inspector_fields` is the display-only
+    /// projection of this (`InspectorFieldRow`, no span); this is the
+    /// Rust-side copy `start_editing_field` reads by index (matching
+    /// `Chrome::inspector_field_buttons`'s own index order) to know which
+    /// span to patch on confirm.
+    inspector_fields: Vec<crate::inspector::InspectorField>,
+    /// `(self.selected_node, editor buffer text)` as of the last time
+    /// `refresh_inspector` actually recomputed `state.inspector_kind`/
+    /// `inspector_fields` — lets it skip `inspector::inspect`'s own full
+    /// `nowui_syntax::parse` of the active file on every call when neither
+    /// has changed. `refresh_inspector` runs on nearly every click
+    /// (directly, plus again via `sync_reactive_state`, which almost every
+    /// click path also calls) — without this, a click that changes nothing
+    /// about the selection (a tab switch, a context-menu row, an inspector
+    /// field click) still paid for a full reparse, often twice, entirely
+    /// inside the click's own synchronous event handler.
+    last_inspector_key: Option<(NodeId, String)>,
+    /// `Some((target, anchor))` exactly while the right-click context menu
+    /// is open — `anchor` is the screen position it opened at, re-applied
+    /// to `DesignerState::context_menu_left`/`top` every `sync_reactive_
+    /// state` (so it doesn't drift if the mouse moves while the menu is
+    /// still open). `None` while closed.
+    context_menu: Option<(ContextMenuTarget, Point)>,
+    /// The active tab's own path the last time `apply_active_row_
+    /// highlight` actually ran its (tree-sized) search for the matching
+    /// live `TreeViewItem` — compared against the *current* active path
+    /// every redraw so that search only re-runs when it could have
+    /// changed, not unconditionally every frame. See that method's own
+    /// doc comment for why this exists at all (a real, not merely
+    /// theoretical, performance/memory problem the previous, reactive-
+    /// data-driven highlight approach had).
+    last_highlighted_path: Option<PathBuf>,
+    /// The live `TreeViewItem` `apply_active_row_highlight` last painted
+    /// with the active-file highlight, if any — clearing it on the next
+    /// call is then an O(1) direct reset instead of a second tree-wide
+    /// search just to find what to un-highlight.
+    highlighted_tree_item: Option<NodeId>,
+    /// `Some` exactly while a background `VirtualFs::scan_async` triggered
+    /// by `rescan_tree` hasn't yielded yet — polled once per frame
+    /// (`poll_pending_scan`, called from `about_to_wait` the same place the
+    /// file watcher is polled) rather than blocked on, so a real filesystem
+    /// walk never stalls the redraw loop. Until it resolves, the explorer
+    /// just keeps showing the previous tree — a create/rename/delete's own
+    /// other, immediate effects (the new/renamed/removed tab, etc.) are
+    /// already visible through their own dedicated state, so the tree
+    /// itself catching up a frame or two later is eventual consistency for
+    /// one panel, not a correctness gap.
+    pending_scan: Option<Receiver<std::io::Result<crate::virtual_fs::VfsEntry>>>,
+    /// `flatten_tree_paths(&state.tree)`'s own output, kept up to date
+    /// eagerly whenever `state.tree` is reassigned (`poll_pending_scan`)
+    /// rather than recomputed by `tree_click_path` on every single tree
+    /// click — a real project tree's own VfsNode count, not just its
+    /// visible/expanded portion (see `flatten_tree_paths`'s own doc
+    /// comment: collapsed subtrees are still walked, they're only excluded
+    /// from *layout*), so redoing this walk on every click was a real,
+    /// click-specific cost on top of the fixed per-frame reactive-
+    /// resolution cost every click already pays.
+    flat_tree_paths_cache: Vec<Option<(PathBuf, bool)>>,
+    /// `NodeId -> position among live TreeViewItems`, the inverse of
+    /// `live_nodes_matching`'s own output — built lazily by `tree_click_
+    /// path` (`None` means "stale, rebuild before use") and invalidated
+    /// whenever `redraw` observes `Chrome::refresh` actually rebuilt a
+    /// dynamic region (the only thing that can change which `NodeId` is at
+    /// which position — see `Ui::gc`'s own "never reuses a NodeId slot" doc
+    /// comment). On the (typical) frame where nothing rebuilt, a tree click
+    /// reuses this instead of re-walking the whole arena.
+    tree_item_index_cache: Option<std::collections::HashMap<NodeId, usize>>,
 }
 
 impl DesignerApp {
@@ -228,6 +409,8 @@ impl DesignerApp {
             tab.selected_layout = Some(doc.entry_layout().to_string());
         }
         let selected_dir = vfs.root.clone();
+        let mut flat_tree_paths_cache = Vec::new();
+        flatten_tree_paths(&state.tree, &mut flat_tree_paths_cache);
         let mut app = DesignerApp {
             chrome,
             doc,
@@ -235,11 +418,17 @@ impl DesignerApp {
             vfs,
             selected_dir,
             creating: None,
+            renaming: None,
+            editing_field: None,
+            inspector_fields: Vec::new(),
+            last_inspector_key: None,
             context_menu: None,
+            last_highlighted_path: None,
+            highlighted_tree_item: None,
             tabs,
             watcher,
             window: None,
-            gpu: None,
+            render_thread: None,
             preview_window: None,
             preview_gpu: None,
             text: nowui_text::TextContext::new(),
@@ -248,6 +437,9 @@ impl DesignerApp {
             cursor: Point::default(),
             modifiers: ModifiersState::empty(),
             selected_node: None,
+            pending_scan: None,
+            flat_tree_paths_cache,
+            tree_item_index_cache: None,
         };
         app.sync_reactive_state();
         app
@@ -283,18 +475,48 @@ impl DesignerApp {
             Ok(rel) if !rel.as_os_str().is_empty() => rel.display().to_string(),
             _ => "project root".to_string(),
         };
-        self.state.creating_hint = match self.creating {
-            Some(kind) => format!("New {} in {dir_label}", kind.noun()),
-            None => IDLE_HINT.to_string(),
-        };
-        self.state.popup_title = match self.creating {
-            Some(NewItemKind::File) => "New File".to_string(),
-            Some(NewItemKind::Folder) => "New Folder".to_string(),
-            None => String::new(),
-        };
-        let (left, top) = if self.creating.is_some() { (POPUP_LEFT, POPUP_TOP) } else { (POPUP_HIDDEN, POPUP_HIDDEN) };
+        if let Some(field) = &self.editing_field {
+            let kind_word = if field.is_binding { "binding" } else { "style" };
+            self.state.creating_hint = format!("Editing the `{}` {kind_word} — Enter to apply, Esc to cancel", field.label);
+            self.state.popup_title = "Edit Value".to_string();
+        } else if let Some(old_path) = &self.renaming {
+            let old_name = old_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+            self.state.creating_hint = format!("Renaming {old_name}");
+            self.state.popup_title = "Rename".to_string();
+        } else {
+            self.state.creating_hint = match self.creating {
+                Some(kind) => format!("New {} in {dir_label}", kind.noun()),
+                None => IDLE_HINT.to_string(),
+            };
+            self.state.popup_title = match self.creating {
+                Some(NewItemKind::File) => "New File".to_string(),
+                Some(NewItemKind::Folder) => "New Folder".to_string(),
+                None => String::new(),
+            };
+        }
+        let popup_open = self.creating.is_some() || self.renaming.is_some() || self.editing_field.is_some();
+        let (left, top) = if popup_open { (POPUP_LEFT, POPUP_TOP) } else { (POPUP_HIDDEN, POPUP_HIDDEN) };
         self.state.popup_left = left.to_string();
         self.state.popup_top = top.to_string();
+
+        // Which of the context menu's own four rows show — see
+        // `ContextMenuTarget`'s own doc comment. Rows the current target
+        // doesn't support collapse to `0px` tall (see `Style::tree_icon`'s
+        // own "no true display:none" sibling problem — same fixed-slot,
+        // dynamic-height answer designer.nowui already uses for the
+        // popup itself, just per-row instead of per-popup).
+        const ROW_H: &str = "32px";
+        const ROW_HIDDEN: &str = "0px";
+        let (add_h, edit_h, rename_label, delete_label) = match &self.context_menu {
+            Some((ContextMenuTarget::Folder(_), _)) => (ROW_H, ROW_H, "Rename Folder".to_string(), "Delete Folder".to_string()),
+            Some((ContextMenuTarget::File(_), _)) => (ROW_HIDDEN, ROW_H, "Rename File".to_string(), "Delete File".to_string()),
+            Some((ContextMenuTarget::Root(_), _)) => (ROW_H, ROW_HIDDEN, String::new(), String::new()),
+            None => (ROW_HIDDEN, ROW_HIDDEN, String::new(), String::new()),
+        };
+        self.state.context_menu_add_h = add_h.to_string();
+        self.state.context_menu_edit_h = edit_h.to_string();
+        self.state.context_menu_rename_label = rename_label;
+        self.state.context_menu_delete_label = delete_label;
 
         match &self.context_menu {
             Some((_, anchor)) => {
@@ -307,8 +529,99 @@ impl DesignerApp {
             }
         }
 
-        let active_path = self.tabs.active().map(|t| t.path.as_path());
-        crate::state::apply_active_highlight(&mut self.state.tree, active_path);
+        self.refresh_inspector();
+    }
+
+    /// Re-scans `self.vfs` into `self.state.tree` — every call site that
+    /// changes what's actually on disk (create/rename/delete) goes through
+    /// this rather than assigning `state.tree` directly, so `apply_active_
+    /// row_highlight`'s own cached `last_highlighted_path`/`highlighted_
+    /// tree_item` always get invalidated alongside it. Without this, a
+    /// rescan that doesn't happen to change the *active tab's own path
+    /// string* (creating an unrelated file, say) would leave that cache
+    /// looking still-valid even though the tree's own arena nodes just got
+    /// rebuilt out from under it — `highlighted_tree_item` would then be a
+    /// stale id, and the skip-check would wrongly skip re-finding the
+    /// active row's new one.
+    fn rescan_tree(&mut self) {
+        self.pending_scan = Some(self.vfs.scan_async(crate::virtual_fs::DEFAULT_MAX_DEPTH));
+        self.last_highlighted_path = None;
+    }
+
+    /// Applies a background `rescan_tree` scan's result once it's ready —
+    /// see `pending_scan`'s own doc comment. Non-blocking (`try_recv`); a
+    /// no-op most frames, since a scan only takes more than a frame or two
+    /// on a genuinely large/slow (e.g. network-mounted) project.
+    fn poll_pending_scan(&mut self) {
+        let Some(rx) = &self.pending_scan else { return };
+        match rx.try_recv() {
+            Ok(Ok(entry)) => {
+                self.state.tree = vec![VfsNode::from_entry(&entry)];
+                self.flat_tree_paths_cache.clear();
+                flatten_tree_paths(&self.state.tree, &mut self.flat_tree_paths_cache);
+                self.last_highlighted_path = None;
+                self.pending_scan = None;
+            }
+            Ok(Err(e)) => {
+                eprintln!("nowui-designer: failed to scan the project folder: {e}");
+                self.pending_scan = None;
+            }
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => self.pending_scan = None,
+        }
+    }
+
+    /// Highlights whichever live `TreeViewItem` corresponds to the active
+    /// tab's own path (VS Code's own `#094771` selected-row blue / white
+    /// text) by mutating that one arena node's `base_style` (and, so it's
+    /// correct for *this* frame too, not just future ones, its `style`)
+    /// directly — see `VfsNode`'s own doc comment for why this bypasses
+    /// the reactive `state.tree` data model entirely rather than driving it
+    /// through a per-entry data field. Called from `redraw`, right after
+    /// `Chrome::refresh` (so a just-rebuilt tree's current `TreeViewItem`
+    /// ids are the ones read/written, never stale ones about to be
+    /// replaced).
+    ///
+    /// The tree-sized search for the newly-active row only actually runs
+    /// when the active path changed since the last call (`self.last_
+    /// highlighted_path`) — otherwise this is an O(1) no-op — so it's cheap
+    /// enough to call unconditionally every redraw despite `designer.nowui`
+    /// running at a fixed 60fps regardless of whether anything changed.
+    fn apply_active_row_highlight(&mut self) {
+        const ACTIVE_BG: nowui_core::Color = nowui_core::Color { r: 0x09, g: 0x47, b: 0x71, a: 255 };
+        const ACTIVE_TEXT: nowui_core::Color = nowui_core::Color::WHITE;
+        const INACTIVE_TEXT: nowui_core::Color = nowui_core::Color { r: 0xcc, g: 0xcc, b: 0xcc, a: 255 };
+
+        let active_path = self.tabs.active().map(|t| t.path.clone());
+        if active_path == self.last_highlighted_path {
+            return;
+        }
+        self.last_highlighted_path = active_path.clone();
+
+        if let Some(old) = self.highlighted_tree_item.take() {
+            if (old.0 as usize) < self.chrome.ui.nodes.len() {
+                let node = self.chrome.ui.get_mut(old);
+                node.base_style.bg = None;
+                node.base_style.text_color = INACTIVE_TEXT;
+                node.style.bg = None;
+                node.style.text_color = INACTIVE_TEXT;
+            }
+        }
+
+        let Some(active_path) = active_path else { return };
+        let mut paths = Vec::new();
+        flatten_tree_paths(&self.state.tree, &mut paths);
+        let Some(index) = paths.iter().position(|p| p.as_ref().is_some_and(|(p, _)| *p == active_path)) else { return };
+
+        let live = live_nodes_matching(&self.chrome.ui, |k| matches!(k, NodeKind::TreeViewItem { .. }));
+        if let Some(&id) = live.get(index) {
+            let node = self.chrome.ui.get_mut(id);
+            node.base_style.bg = Some(ACTIVE_BG);
+            node.base_style.text_color = ACTIVE_TEXT;
+            node.style.bg = Some(ACTIVE_BG);
+            node.style.text_color = ACTIVE_TEXT;
+            self.highlighted_tree_item = Some(id);
+        }
     }
 
     /// Save the currently-active tab's buffer/cursor/selection out of the
@@ -461,47 +774,82 @@ impl DesignerApp {
 
     /// Maps a clicked `TreeViewItem`'s `NodeId` back to the entry it
     /// represents — see `handle_tree_click`'s own doc comment on why this
-    /// is positional (`node_index_among`/`flatten_tree_paths`) rather than
-    /// reading a real `id` binding. `None` for a `truncated` placeholder row
-    /// or an id with no arena match.
-    fn tree_click_path(&self, id: NodeId) -> Option<(PathBuf, bool)> {
-        let index = node_index_among(&self.chrome.ui, id, |k| matches!(k, NodeKind::TreeViewItem { .. }))?;
-        let mut paths = Vec::new();
-        flatten_tree_paths(&self.state.tree, &mut paths);
-        paths.get(index).cloned().flatten()
+    /// is positional (`tree_item_index_cache`/`flat_tree_paths_cache`)
+    /// rather than reading a real `id` binding. `None` for a `truncated`
+    /// placeholder row or an id with no arena match.
+    ///
+    /// `tree_item_index_cache` is rebuilt here (a `live_nodes_matching`
+    /// walk) only when it's `None` — i.e. only the first tree click after
+    /// `redraw` observed an actual region rebuild (see that field's own
+    /// doc comment) — otherwise this is an `O(1)` map lookup plus an
+    /// `O(1)` `flat_tree_paths_cache` index, not a walk of either tree.
+    fn tree_click_path(&mut self, id: NodeId) -> Option<(PathBuf, bool)> {
+        let index_map = self.tree_item_index_cache.get_or_insert_with(|| {
+            live_nodes_matching(&self.chrome.ui, |k| matches!(k, NodeKind::TreeViewItem { .. }))
+                .into_iter()
+                .enumerate()
+                .map(|(i, id)| (id, i))
+                .collect()
+        });
+        let index = *index_map.get(&id)?;
+        self.flat_tree_paths_cache.get(index).cloned().flatten()
     }
 
-    /// Maps a clicked `Button`'s `NodeId` to the new-item popup's Cancel/
-    /// Create buttons, the context menu's own three items, or a tab-strip
-    /// switch (the layout picker is a `Dropdown` now — see `select_
-    /// dropdown_option` — not a `Button` list). `designer.nowui` renders
-    /// the new-item popup's own two buttons first (always present, see
-    /// `DesignerState::popup_left`'s own doc comment), then the context
-    /// menu's own three (also always present, see `DesignerState::
-    /// context_menu_left`'s own doc comment), then every tab-strip button,
-    /// strictly in that source order, so "the Nth `Button` in arena order"
-    /// splits cleanly into those fixed-then-variable-length groups with no
-    /// separate marker needed.
+    /// Maps a clicked `Button`'s `NodeId` to whichever structural region it
+    /// lives in (the new-item popup's Cancel/Create, one of the context
+    /// menu's own four rows, a tab-strip switch, or an inspector field row
+    /// — the layout picker is a `Dropdown`, not a `Button` list, see
+    /// `select_dropdown_option`) via `Chrome`'s own `*_buttons` accessors,
+    /// each scoped to just that region's own container. Region-scoped
+    /// rather than one flat whole-app positional index — see `Chrome::
+    /// popup_buttons`'s own doc comment for why: a variable-length list in
+    /// one region (the tab strip, the inspector's own per-field rows) used
+    /// to silently shift what every *later* button index meant.
     fn handle_button_click(&mut self, id: NodeId) {
-        let Some(index) = node_index_among(&self.chrome.ui, id, |k| matches!(k, NodeKind::Button { .. })) else { return };
-        match index {
-            0 => self.cancel_creating(),
-            1 => self.confirm_new_item(),
-            2 => self.start_creating_from_context_menu(NewItemKind::File),
-            3 => self.start_creating_from_context_menu(NewItemKind::Folder),
-            4 => self.reveal_in_file_explorer(),
-            _ => self.switch_tab(index - 5),
+        if let Some(index) = self.chrome.popup_buttons().iter().position(|&b| b == id) {
+            match index {
+                0 => self.cancel_creating(),
+                1 => self.confirm_new_item(),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(index) = self.chrome.context_menu_buttons().iter().position(|&b| b == id) {
+            match index {
+                0 => self.context_menu_add(NewItemKind::Folder),
+                1 => self.context_menu_add(NewItemKind::File),
+                2 => self.start_renaming(),
+                3 => self.context_menu_delete(),
+                _ => {}
+            }
+            return;
+        }
+        if let Some(index) = self.chrome.tab_strip_buttons().iter().position(|&b| b == id) {
+            self.switch_tab(index);
+            return;
+        }
+        if let Some(index) = self.chrome.inspector_field_buttons().iter().position(|&b| b == id) {
+            self.start_editing_field(index);
         }
     }
 
-    /// Right-click on a `TreeViewItem` (targets that row) or on empty
-    /// explorer/preview space (targets the project root) opens the context
-    /// menu at the cursor's current position. Re-opening while already open
-    /// just retargets/repositions it — same "starting a new one abandons
-    /// the previous, unconfirmed one" convention `start_creating` already
-    /// has for the new-item popup.
-    fn open_context_menu(&mut self, target_dir: PathBuf) {
-        self.context_menu = Some((target_dir, self.cursor));
+    /// `true` when `id` is one of the context menu's own four buttons — the
+    /// one case a left click must *not* close the menu for, since
+    /// `handle_button_click` itself needs `self.context_menu` still set to
+    /// read the row's own target.
+    fn is_context_menu_button(&self, hit: Option<NodeId>) -> bool {
+        let Some(id) = hit else { return false };
+        self.chrome.context_menu_buttons().contains(&id)
+    }
+
+    /// Right-click on a `TreeViewItem` targets that row (a directory
+    /// itself, or a file); anywhere else in the chrome targets the project
+    /// root. Opens the context menu at the cursor, same as a real file
+    /// explorer. Re-opening while already open just retargets/repositions
+    /// it — same "starting a new one abandons the previous, unconfirmed
+    /// one" convention `start_creating` already has for the new-item popup.
+    fn open_context_menu(&mut self, target: ContextMenuTarget) {
+        self.context_menu = Some((target, self.cursor));
         self.selected_node = None;
         self.chrome.ui.focus = None;
         self.sync_reactive_state();
@@ -514,66 +862,131 @@ impl DesignerApp {
         self.sync_reactive_state();
     }
 
-    /// "New File.../New Folder..." in the context menu — targets whichever
-    /// directory it was opened against, same downstream flow (`start_
-    /// creating`/the new-item popup) a tree-row click used to drive
-    /// directly before this menu existed.
-    fn start_creating_from_context_menu(&mut self, kind: NewItemKind) {
-        if let Some((dir, _)) = self.context_menu.take() {
-            self.selected_dir = dir;
+    /// "Add Folder"/"Add File" in the context menu — targets whichever
+    /// directory it was opened against (`ContextMenuTarget::dir_for_
+    /// create`), same downstream flow (`start_creating`/the new-item
+    /// popup) a tree-row click used to drive directly before this menu
+    /// existed.
+    fn context_menu_add(&mut self, kind: NewItemKind) {
+        if let Some((target, _)) = self.context_menu.take() {
+            self.selected_dir = target.dir_for_create();
         }
         self.start_creating(kind);
     }
 
-    /// "Reveal in File Explorer" — opens the host OS's own file manager
-    /// with the context menu's own target pre-selected. Best-effort: a
-    /// failure (no target, OS command not found, ...) is logged and
-    /// otherwise silently ignored, same as this crate's other
-    /// filesystem-adjacent operations (`VirtualFs::flush`'s own callers).
-    fn reveal_in_file_explorer(&mut self) {
-        let Some((dir, _)) = self.context_menu.take() else { return };
+    /// "Rename Folder"/"Rename File" — reuses the same new-item popup/
+    /// prompt (see `start_creating`'s own doc comment for why one shared
+    /// prompt rather than a second one), pre-filled with the target's
+    /// current name so the user edits it in place rather than retyping it
+    /// from scratch. `confirm_new_item` branches on `self.renaming` to
+    /// call `VirtualFs::rename` instead of `new_file`/`new_folder`.
+    fn start_renaming(&mut self) {
+        let Some((target, _)) = self.context_menu.take() else { return };
+        self.creating = None;
+        let path = target.path().to_path_buf();
+        let current_name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+        self.chrome.set_new_item_text(&current_name);
+        self.chrome.ui.focus = Some(self.chrome.new_item_node);
+        self.selected_node = None;
+        self.renaming = Some(path);
         self.sync_reactive_state();
-        if let Err(e) = crate::virtual_fs::reveal_in_file_explorer(&dir) {
-            eprintln!("nowui-designer: couldn't reveal `{}`: {e}", dir.display());
+    }
+
+    /// "Delete Folder"/"Delete File" — removes the target from disk
+    /// (`VirtualFs::delete`, recursive for a folder), closes any open tab
+    /// pointing at it or nested under it, and re-scans the tree. A failure
+    /// (permissions, the path no longer exists, ...) is logged and
+    /// otherwise left alone rather than partially applying — `VirtualFs::
+    /// delete` itself either fully succeeds or touches nothing.
+    fn context_menu_delete(&mut self) {
+        let Some((target, _)) = self.context_menu.take() else { return };
+        self.sync_reactive_state();
+        let path = target.path().to_path_buf();
+        if let Err(e) = self.vfs.delete(&path) {
+            eprintln!("nowui-designer: failed to delete `{}`: {e}", path.display());
+            return;
+        }
+        self.close_tabs_under(&path);
+        if self.selected_dir.starts_with(&path) {
+            self.selected_dir = self.vfs.root.clone();
+        }
+        self.rescan_tree();
+        self.sync_reactive_state();
+    }
+
+    /// Closes every open tab whose own path equals `path` or sits nested
+    /// under it (a deleted or renamed-away folder taking its files' tabs
+    /// with it). If the *active* tab was among them, loads whichever tab
+    /// is now active (or just refreshes reactive state if none remain).
+    fn close_tabs_under(&mut self, path: &Path) {
+        let mut to_close: Vec<usize> = self.tabs.iter().enumerate().filter(|(_, t)| t.path.starts_with(path)).map(|(i, _)| i).collect();
+        if to_close.is_empty() {
+            return;
+        }
+        let active_affected = self.tabs.active_index().is_some_and(|a| to_close.contains(&a));
+        to_close.sort_unstable_by(|a, b| b.cmp(a)); // close from the end so earlier indices stay valid.
+        for i in to_close {
+            self.tabs.close(i);
+        }
+        if active_affected {
+            if self.tabs.active_index().is_some() {
+                self.load_active_tab_into_editor_and_preview();
+            } else {
+                self.sync_reactive_state();
+            }
         }
     }
+
 
     /// Opens the new-item popup (see `DesignerState::popup_left`'s own doc
     /// comment), focusing its name prompt with an empty buffer, targeting
     /// `self.selected_dir` — set by the caller just before this, either from
-    /// clicking a folder row's own `folder-actions` icon (`handle_tree_
-    /// click`) or, in tests, directly. Starting a *new* creation while one
-    /// was already in progress just retargets/relabels it — the previous
+    /// the context menu's own "Add Folder"/"Add File" (`context_menu_add`)
+    /// or, in tests, directly. Starting a *new* creation while one was
+    /// already in progress just retargets/relabels it — the previous
     /// (unconfirmed, so nothing was ever created) attempt is simply
-    /// abandoned.
+    /// abandoned. Clears `renaming` too — the two share one prompt and are
+    /// mutually exclusive.
     fn start_creating(&mut self, kind: NewItemKind) {
         self.creating = Some(kind);
+        self.renaming = None;
         self.chrome.set_new_item_text("");
         self.chrome.ui.focus = Some(self.chrome.new_item_node);
         self.selected_node = None;
         self.sync_reactive_state();
     }
 
-    /// Discards the in-progress creation (Escape, or nothing to confirm)
-    /// without touching the filesystem.
+    /// Discards the in-progress creation, rename, or field edit (Escape, or
+    /// nothing to confirm) without touching the filesystem/editor buffer.
     fn cancel_creating(&mut self) {
         self.creating = None;
+        self.renaming = None;
+        self.editing_field = None;
         self.chrome.set_new_item_text("");
         self.chrome.ui.focus = None;
         self.sync_reactive_state();
     }
 
-    /// Enter, while the new-item prompt is focused — creates the file/
-    /// folder the prompt is currently naming under `self.selected_dir`
-    /// (queued via `VirtualFs::new_file`/`new_folder`, then `flush`ed to
-    /// disk immediately — simpler than also modeling an "unsaved new file"
+    /// Enter, while the new-item prompt is focused — either renames
+    /// (`self.renaming` set — see `start_renaming`) or creates a new file/
+    /// folder (`self.creating` set) under `self.selected_dir` (queued via
+    /// `VirtualFs::new_file`/`new_folder`, then `flush`ed to disk
+    /// immediately — simpler than also modeling an "unsaved new file"
     /// state on top of everything `OpenTab::dirty` already tracks, and
     /// matches a real file explorer's own "it exists the moment you name
     /// it" behavior), re-scans the tree, and — for a new *file* — opens it
     /// as a tab right away, same as VS Code's own explorer does. An empty
-    /// name, or a `VirtualFs`/disk error, cancels without creating
-    /// anything rather than silently doing nothing.
+    /// name, or a `VirtualFs`/disk error, cancels without doing anything
+    /// rather than silently no-op-ing.
     fn confirm_new_item(&mut self) {
+        if self.editing_field.is_some() {
+            self.confirm_field_edit();
+            return;
+        }
+        if self.renaming.is_some() {
+            self.confirm_rename();
+            return;
+        }
         let Some(kind) = self.creating else { return };
         let name = self.chrome.new_item_text().trim().to_string();
         self.cancel_creating();
@@ -590,12 +1003,100 @@ impl DesignerApp {
             return;
         }
 
-        self.state.tree = scan_tree(&self.vfs);
+        self.rescan_tree();
         if kind == NewItemKind::File {
             self.open_file(created_path);
         } else {
             self.sync_reactive_state();
         }
+    }
+
+    /// Enter, while the prompt is renaming (`self.renaming` set) rather
+    /// than creating — `VirtualFs::rename` on disk, then retargets any open
+    /// tab pointing at the old path (or nested under it, for a renamed
+    /// folder — see `tabs::Tabs::retarget_paths`) so it keeps editing the
+    /// same file/folder under its new name/location instead of going stale.
+    /// An empty name, or a `VirtualFs`/disk error, cancels without renaming
+    /// anything.
+    fn confirm_rename(&mut self) {
+        let Some(old_path) = self.renaming.clone() else { return };
+        let new_name = self.chrome.new_item_text().trim().to_string();
+        self.cancel_creating();
+        if new_name.is_empty() {
+            return;
+        }
+
+        let new_path = match self.vfs.rename(&old_path, &new_name) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("nowui-designer: failed to rename `{}`: {e}", old_path.display());
+                return;
+            }
+        };
+
+        let active_affected = self.tabs.retarget_paths(&old_path, &new_path);
+        if self.selected_dir.starts_with(&old_path) {
+            self.selected_dir = new_path.join(self.selected_dir.strip_prefix(&old_path).unwrap_or(std::path::Path::new("")));
+        }
+        self.rescan_tree();
+        if active_affected {
+            self.load_active_tab_into_editor_and_preview();
+        } else {
+            self.sync_reactive_state();
+        }
+    }
+
+    /// Clicking one of the inspector's own field rows (see `Chrome::
+    /// inspector_field_buttons`) — opens the same shared prompt `start_
+    /// creating`/`start_renaming` use, pre-filled with `field`'s own
+    /// *current source text* verbatim: for a style token that's `key` (a
+    /// bare flag or a compact Tailwind class, which has no separate bracket
+    /// value — see `inspector::apply_style_edit`'s own doc comment) or
+    /// `key-[value]`; for a binding, just `field.value` (the raw text that
+    /// already sits after its own `:`). `confirm_field_edit` treats
+    /// whatever's in the prompt on Enter as that same shape, verbatim.
+    fn start_editing_field(&mut self, index: usize) {
+        let Some(field) = self.inspector_fields.get(index).cloned() else { return };
+        self.creating = None;
+        self.renaming = None;
+        let prefill = if field.is_binding {
+            field.value.clone()
+        } else if field.value.is_empty() {
+            field.label.clone()
+        } else {
+            format!("{}-[{}]", field.label, field.value)
+        };
+        self.chrome.set_new_item_text(&prefill);
+        self.chrome.ui.focus = Some(self.chrome.new_item_node);
+        self.editing_field = Some(field);
+        self.sync_reactive_state();
+    }
+
+    /// Enter, while `self.editing_field` is set — patches that one field's
+    /// own span in the active tab's current buffer (`inspector::
+    /// apply_style_edit`/`apply_binding_edit`) with the prompt's own text
+    /// verbatim, then reloads the preview from that patched buffer the same
+    /// way any other editor keystroke does (`reload_from_editor_buffer`,
+    /// which also clears `selected_node`/the inspector — the edited node's
+    /// own `NodeId` doesn't survive a reparse anyway). An empty prompt
+    /// cancels without patching anything, same as an empty new-item name.
+    fn confirm_field_edit(&mut self) {
+        let Some(field) = self.editing_field.take() else { return };
+        let new_text = self.chrome.new_item_text().trim().to_string();
+        self.chrome.set_new_item_text("");
+        self.chrome.ui.focus = None;
+        if new_text.is_empty() {
+            self.sync_reactive_state();
+            return;
+        }
+        let source = self.chrome.editor_text().to_string();
+        let patched = if field.is_binding {
+            crate::inspector::apply_binding_edit(&source, &field, &new_text)
+        } else {
+            crate::inspector::apply_style_edit(&source, &field, &new_text)
+        };
+        self.chrome.set_editor_text(&patched);
+        self.reload_from_editor_buffer();
     }
 
     /// Looks up `id`'s own source span (`PreviewDoc::node_span`) and, if
@@ -617,6 +1118,48 @@ impl DesignerApp {
         if let NodeKind::TextInput { cursor, selection_anchor, .. } = &mut self.chrome.ui.get_mut(self.chrome.editor_node).kind {
             *selection_anchor = Some(start_char);
             *cursor = end_char;
+        }
+    }
+
+    /// Recomputes `state.inspector_kind`/`inspector_fields` from
+    /// `self.selected_node` — the inspector panel's own reactive source of
+    /// truth (see `state::InspectorFieldRow`'s own doc comment). Empties
+    /// both while nothing is selected, the lookup fails (a stale span
+    /// against an already-edited buffer), or the span belongs to a
+    /// different file than the active tab's own buffer (`inspector::
+    /// inspect`'s documented limitation, shared with `select_in_source`).
+    /// Called from `sync_reactive_state` (covering every far-away call site
+    /// that resets `selected_node`) and directly after the preview-click
+    /// handler's own three `selected_node` assignments, since that handler
+    /// doesn't otherwise call `sync_reactive_state`.
+    ///
+    /// A no-op (skips `inspector::inspect`'s own full-file reparse
+    /// entirely) when neither `self.selected_node` nor the editor buffer
+    /// has changed since the last time this actually ran — see
+    /// `last_inspector_key`'s own doc comment for why that matters: this
+    /// runs on nearly every click, often twice.
+    fn refresh_inspector(&mut self) {
+        let key = self.selected_node.map(|id| (id, self.chrome.editor_text().to_string()));
+        if key == self.last_inspector_key {
+            return;
+        }
+        self.last_inspector_key = key.clone();
+        let selection = key.and_then(|(id, text)| self.doc.node_span(id).and_then(|span| crate::inspector::inspect(&text, span)));
+        match selection {
+            Some(sel) => {
+                self.state.inspector_kind = sel.kind;
+                self.state.inspector_fields = sel
+                    .fields
+                    .iter()
+                    .map(|f| InspectorFieldRow { label: if f.is_binding { format!("{{{}}}", f.label) } else { f.label.clone() }, value: f.value.clone() })
+                    .collect();
+                self.inspector_fields = sel.fields;
+            }
+            None => {
+                self.state.inspector_kind = String::new();
+                self.state.inspector_fields = Vec::new();
+                self.inspector_fields = Vec::new();
+            }
         }
     }
 
@@ -691,43 +1234,67 @@ impl DesignerApp {
     /// into the same `Scene`/present call, so they composite as one frame;
     /// `push_clip`/`pop_clip` around the preview keeps overflowing content
     /// from spilling outside its slot, same as any other clipped container.
+    /// Split across two threads — see `render_thread`'s own module doc for
+    /// the full picture. This method still runs `layout::solve`/`solve_into`
+    /// right here, on the main/input thread, every frame:
+    /// `Node::computed`/scroll state must be correct for *this* frame's own
+    /// hit-testing (including a preview click's own `self.doc.ui.hit_test`)
+    /// with zero lag, and only this thread (which owns both `Ui`s) can
+    /// update that before the next input event needs it. Solving needs a
+    /// real `Painter` only for text measurement — a throwaway 1x1 CPU
+    /// `SkiaPainter` serves that with no GPU surface involved at all. Once
+    /// solved, both `Ui`s are cloned and handed to the render thread, which
+    /// only ever paints + presents them.
     fn redraw(&mut self) {
         let Some(window) = self.window.clone() else { return };
-        let Some(gpu) = self.gpu.as_mut() else { return };
+        if self.render_thread.is_none() {
+            return;
+        }
 
         let size = window.inner_size();
         let (w, h) = (size.width.max(1), size.height.max(1));
-        let mut scene = vello::Scene::new();
 
-        self.chrome.refresh(&self.state);
+        if self.chrome.refresh(&self.state) {
+            // A `NodeId` from before this rebuild may now be stale/
+            // repurposed within the region that rebuilt — see
+            // `tree_item_index_cache`'s own doc comment.
+            self.tree_item_index_cache = None;
+        }
+        self.apply_active_row_highlight();
+
+        // A throwaway `Scene`, never rendered — `layout::solve` only ever
+        // needs a `Painter` for text measurement (see CLAUDE.md's solver
+        // gotchas), so reusing `GpuPainter` here (rather than pulling in
+        // `nowui-render`/`tiny-skia` just for a CPU measurement painter,
+        // matching `nowui_runtime::render_thread`'s own approach) costs
+        // nothing beyond the geometry this scene never ends up drawing.
+        let mut throwaway_scene = vello::Scene::new();
         {
-            let mut painter = GpuPainter::new(&mut scene, &mut self.text, &mut self.font_cache);
+            let mut painter = GpuPainter::new(&mut throwaway_scene, &mut self.text, &mut self.font_cache);
             nowui_core::layout::solve(&mut self.chrome.ui, Size::new(w as f32, h as f32), &mut painter);
-            nowui_core::paint::paint(&self.chrome.ui, &mut painter);
         }
 
         // While detached, the preview composites into its own window
         // instead (`redraw_preview_window`) — the slot in chrome just sits
         // empty (its own background shows through), same principle as any
         // other panel with nothing in it yet.
-        if self.preview_window.is_none() {
+        let preview_snapshot = if self.preview_window.is_none() {
             let slot_rect = self.chrome.preview_slot_rect();
-            let mut painter = GpuPainter::new(&mut scene, &mut self.text, &mut self.font_cache);
-            self.doc.render_into(slot_rect, &mut painter);
-            // The inspector's own selection outline — drawn directly, not
-            // through `paint::paint`'s tree walk, since it's chrome-level
-            // UI *about* the preview, not part of the previewed document
-            // itself. A stale id from before the last reload can't land
-            // here: `reload_from_editor_buffer`/`reload_from_disk` both
-            // clear `selected_node` first.
-            if let Some(id) = self.selected_node {
-                let rect = self.doc.ui.get(id).computed;
-                painter.stroke_rect(rect, nowui_core::Color::rgb(0x60, 0xa5, 0xfa), 2.0, Edges::default());
+            {
+                let mut painter = GpuPainter::new(&mut throwaway_scene, &mut self.text, &mut self.font_cache);
+                nowui_core::layout::solve_into(&mut self.doc.ui, slot_rect, &mut painter);
             }
-        }
+            // A stale id from before the last reload can't land here:
+            // `reload_from_editor_buffer`/`reload_from_disk` both clear
+            // `selected_node` first.
+            Some((clone_for_render(&self.doc.ui), slot_rect, self.selected_node))
+        } else {
+            None
+        };
 
-        gpu.resize(w, h);
-        gpu.render_and_present(&scene, CLEAR);
+        if let Some(render_thread) = &self.render_thread {
+            render_thread.publish(clone_for_render(&self.chrome.ui), Size::new(w as f32, h as f32), preview_snapshot);
+        }
     }
 
     /// The detached preview's own redraw — same `PreviewDoc::render_into`
@@ -855,7 +1422,13 @@ impl ApplicationHandler for DesignerApp {
             .with_inner_size(winit::dpi::LogicalSize::new(1200.0, 800.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let size = window.inner_size();
-        self.gpu = Some(GpuSurfaceState::new(window.clone(), size.width.max(1), size.height.max(1)));
+        // Must be built here, on the main thread — see `render_thread`'s
+        // own module doc on why constructing it (which queries the
+        // window's raw handle) from a different thread fails outright on
+        // this platform. Handed off afterward; nothing on this thread
+        // touches it again.
+        let gpu = GpuSurfaceState::new(window.clone(), size.width.max(1), size.height.max(1));
+        self.render_thread = Some(crate::render_thread::RenderThread::spawn(gpu));
         self.window = Some(window);
         self.next_frame = Instant::now();
         if let Some(w) = &self.window {
@@ -870,6 +1443,7 @@ impl ApplicationHandler for DesignerApp {
             if self.watcher.as_ref().is_some_and(FileWatcher::poll_changed) {
                 self.reload_from_disk();
             }
+            self.poll_pending_scan();
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
@@ -900,7 +1474,14 @@ impl ApplicationHandler for DesignerApp {
         }
 
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Stop + join the render thread before exiting — otherwise
+                // the window (and the GPU surface tied to it) could be torn
+                // down while an in-flight `render_and_present` on that
+                // thread is still using it.
+                self.render_thread = None;
+                event_loop.exit();
+            }
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::ModifiersChanged(m) => self.modifiers = m.state(),
             WindowEvent::CursorMoved { position, .. } => {
@@ -933,12 +1514,14 @@ impl ApplicationHandler for DesignerApp {
                 }
                 self.close_open_dropdowns();
                 // Any left click closes the context menu — *except* one
-                // landing on one of its own three buttons, which
-                // `handle_button_click` (via the generic Button branch
-                // below) already closes itself, correctly, only after
-                // reading `self.context_menu`'s own target first.
-                let is_button = hit.is_some_and(|id| matches!(self.chrome.ui.get(id).kind, NodeKind::Button { .. }));
-                if !is_button {
+                // landing on one of its own four buttons specifically
+                // (`is_context_menu_button`, not just "any button
+                // anywhere" — a click on, say, a tab-strip button must
+                // still close it), which `handle_button_click` (via the
+                // generic Button branch below) already closes itself,
+                // correctly, only after reading `self.context_menu`'s own
+                // target first.
+                if !self.is_context_menu_button(hit) {
                     self.close_context_menu();
                 }
                 if hit == Some(self.chrome.editor_node) {
@@ -949,11 +1532,12 @@ impl ApplicationHandler for DesignerApp {
                         *selection_anchor = None;
                     }
                 } else if hit == Some(self.chrome.new_item_node) {
-                    // Clicking the prompt directly (rather than "+ File"/
-                    // "+ Folder" first) just focuses it — typing only does
-                    // anything once `self.creating` is actually `Some`
-                    // (`confirm_new_item` no-ops otherwise), same as
-                    // clicking into any other inert field.
+                    // Clicking the prompt directly (rather than one of the
+                    // context menu's own rows first) just focuses it —
+                    // typing only does anything once `self.creating`/
+                    // `self.renaming` is actually `Some` (`confirm_new_item`
+                    // no-ops otherwise), same as clicking into any other
+                    // inert field.
                     self.selected_node = None;
                     self.chrome.ui.focus = Some(self.chrome.new_item_node);
                     let text = self.chrome.new_item_text().to_string();
@@ -972,6 +1556,7 @@ impl ApplicationHandler for DesignerApp {
                     self.selected_node = None;
                     self.chrome.ui.focus = None;
                 }
+                self.refresh_inspector();
             }
             // Right-click on a `TreeViewItem` targets that entry (a
             // directory itself, or a file's own parent directory); anywhere
@@ -983,9 +1568,22 @@ impl ApplicationHandler for DesignerApp {
                 let target = hit
                     .filter(|&id| matches!(self.chrome.ui.get(id).kind, NodeKind::TreeViewItem { .. }))
                     .and_then(|id| self.tree_click_path(id))
-                    .map(|(path, is_dir)| if is_dir { path } else { path.parent().map(Path::to_path_buf).unwrap_or_else(|| self.vfs.root.clone()) })
-                    .unwrap_or_else(|| self.vfs.root.clone());
+                    .map(|(path, is_dir)| if is_dir { ContextMenuTarget::Folder(path) } else { ContextMenuTarget::File(path) })
+                    .unwrap_or_else(|| ContextMenuTarget::Root(self.vfs.root.clone()));
                 self.open_context_menu(target);
+            }
+            // Any other mouse button (middle-click, the back/forward side
+            // buttons, ...) has no action of its own in this app, but a
+            // press anywhere outside the context menu should still close it
+            // — same "any click outside closes it, except on the menu's own
+            // buttons" rule the Left-click arm above already applies, just
+            // generalized to every button so the menu can't get stuck open
+            // behind a middle-click or side-button press.
+            WindowEvent::MouseInput { state: ElementState::Pressed, .. } => {
+                let hit = self.chrome.ui.hit_test(self.cursor);
+                if !self.is_context_menu_button(hit) {
+                    self.close_context_menu();
+                }
             }
             // Scrolls the nearest `scroll-x`/`scroll-y` ancestor of the
             // cursor within the *chrome* (the file-tree sidebar, the
@@ -1117,10 +1715,9 @@ mod tests {
     /// Finds a `TreeViewItem` with the given `label` among `ui`'s own *live*
     /// nodes (reachable from a layer root) — a plain `ui.nodes.iter().
     /// position(...)` scan can return a stale orphan left behind by an
-    /// earlier region rebuild (see `node_index_among`'s own doc comment on
-    /// why `state.tree`'s dynamic `bg_color`/`text_color` brackets mean this
-    /// now happens on every `chrome.refresh()`), which would have a
-    /// meaningless `computed` rect and never actually receive a real click.
+    /// earlier region rebuild (see `live_nodes_matching`'s own doc
+    /// comment), which would have a meaningless `computed` rect and never
+    /// actually receive a real click.
     fn find_live_tree_item(ui: &nowui_core::Ui, label: &str) -> NodeId {
         fn walk(ui: &nowui_core::Ui, id: NodeId, label: &str, out: &mut Option<NodeId>) {
             if matches!(&ui.get(id).kind, NodeKind::TreeViewItem { label: l, .. } if l == label) {
@@ -1174,6 +1771,24 @@ mod tests {
         chrome.set_editor_text(&fs::read_to_string(entry_path).unwrap());
         let vfs = crate::virtual_fs::VirtualFs::new(entry_path.parent().unwrap().to_path_buf());
         DesignerApp::new(chrome, doc, state, vfs)
+    }
+
+    /// Blocks (with a generous timeout — this is a local disk scan, not a
+    /// network call) until a `rescan_tree`-triggered background scan
+    /// resolves and is applied to `app.state.tree`. Production code never
+    /// does this (`poll_pending_scan` is always non-blocking, polled once
+    /// per redraw) — only tests, which need a deterministic point to assert
+    /// against after an action that rescans the tree asynchronously.
+    fn wait_for_pending_scan(app: &mut DesignerApp) {
+        let rx = app.pending_scan.take().expect("expected a pending scan to wait for");
+        let result = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("background scan never replied");
+        match result {
+            Ok(entry) => {
+                app.state.tree = vec![VfsNode::from_entry(&entry)];
+                app.last_highlighted_path = None;
+            }
+            Err(e) => panic!("background scan failed: {e}"),
+        }
     }
 
     #[test]
@@ -1257,14 +1872,154 @@ mod tests {
         let mut app = build_app(&a, tree);
         app.chrome.refresh(&app.state.clone());
         // Find the second TreeViewItem (b.nowui) the same live-tree way
-        // `node_index_among` itself does — proves the *whole* click -> path
-        // -> open_file pipeline, not just `flatten_tree_paths` in isolation.
+        // `tree_click_path` itself does — proves the *whole* click -> path
+        // -> open_file pipeline, not just `flat_tree_paths_cache` in
+        // isolation.
         let b_item = find_live_tree_item(&app.chrome.ui, "b.nowui");
 
         app.handle_tree_click(b_item);
 
         assert_eq!(app.tabs.active().unwrap().path, b);
         assert_eq!(app.chrome.editor_text(), "layout: App { Text `b` }");
+    }
+
+    #[test]
+    fn clone_for_render_replaces_a_collapsed_subtrees_content_with_a_cheap_placeholder() {
+        let dir = scratch_dir("clone_for_render");
+        fs::create_dir_all(dir.join("src/widgets")).unwrap();
+        fs::write(dir.join("src/widgets/Card.nowui"), "layout: Card {}").unwrap();
+        let a = dir.join("a.nowui");
+        fs::write(&a, "layout: App { Text `a` }").unwrap();
+
+        // `src` sits at `state.tree`'s own top level, so `RenderRootVfsNode`
+        // renders it `{collapsed: false}` — but `widgets`, nested *inside*
+        // it, goes through the plain (non-root) `RenderVfsNode`, which
+        // always starts a folder `{collapsed: true}` (see designer.nowui's
+        // own comment) regardless of how deep it sits.
+        let tree = vec![VfsNode {
+            name: "src".to_string(),
+            path: dir.join("src").display().to_string(),
+            is_dir: true,
+            children: vec![VfsNode {
+                name: "widgets".to_string(),
+                path: dir.join("src/widgets").display().to_string(),
+                is_dir: true,
+                children: vec![VfsNode {
+                    name: "Card.nowui".to_string(),
+                    path: dir.join("src/widgets/Card.nowui").display().to_string(),
+                    is_dir: false,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }];
+        let mut app = build_app(&a, tree);
+        app.chrome.refresh(&app.state.clone());
+
+        // `widgets` is collapsed, so its own child `Card.nowui` row is a
+        // real, reachable arena node (paint still visits it every frame,
+        // just with a zero rect) whose real content shouldn't survive into
+        // a render clone.
+        let card_item = find_live_tree_item(&app.chrome.ui, "Card.nowui");
+        assert!(
+            matches!(&app.chrome.ui.get(card_item).kind, NodeKind::TreeViewItem { label, .. } if label == "Card.nowui"),
+            "sanity check: the live node still has its real label"
+        );
+
+        let cloned = clone_for_render(&app.chrome.ui);
+
+        assert!(
+            matches!(&cloned.get(card_item).kind, NodeKind::Container),
+            "a collapsed folder's own child is replaced with an empty-Container placeholder in the render clone"
+        );
+        // The live tree is untouched — expanding the folder later still
+        // reads the real data, not whatever the last render clone saw.
+        assert!(matches!(&app.chrome.ui.get(card_item).kind, NodeKind::TreeViewItem { label, .. } if label == "Card.nowui"));
+    }
+
+    #[test]
+    fn tree_click_path_stays_correct_after_a_rescan_invalidates_its_own_cache() {
+        // `tree_click_path` caches `NodeId -> position` (`tree_item_index_
+        // cache`) and `flatten_tree_paths`'s own output (`flat_tree_paths_
+        // cache`) so a click doesn't re-walk either tree when nothing
+        // changed. This guards the actual invalidation contract: after a
+        // rescan adds a new file (a real region rebuild, which `Chrome::
+        // refresh`'s own return value signals), a click on a live
+        // `TreeViewItem` for that *new* file must resolve to the right
+        // path, not a stale index computed before it existed.
+        let dir = scratch_dir("tree_click_cache_invalidation");
+        let a = dir.join("a.nowui");
+        fs::write(&a, "layout: App { Text `a` }").unwrap();
+        let tree = vec![VfsNode { name: "a.nowui".to_string(), path: a.display().to_string(), is_dir: false, ..Default::default() }];
+        let mut app = build_app(&a, tree);
+        app.chrome.refresh(&app.state.clone());
+
+        // Prime the cache with a click before anything changes.
+        let a_item = find_live_tree_item(&app.chrome.ui, "a.nowui");
+        app.handle_tree_click(a_item);
+        assert!(app.tree_item_index_cache.is_some(), "primed by the click above");
+
+        // A rescan (simulated directly, same as `poll_pending_scan`'s own
+        // apply branch) adds a new file — a real change to `state.tree`.
+        let c = dir.join("c.nowui");
+        fs::write(&c, "layout: App { Text `c` }").unwrap();
+        app.state.tree = vec![
+            VfsNode { name: "a.nowui".to_string(), path: a.display().to_string(), is_dir: false, ..Default::default() },
+            VfsNode { name: "c.nowui".to_string(), path: c.display().to_string(), is_dir: false, ..Default::default() },
+        ];
+        app.flat_tree_paths_cache.clear();
+        flatten_tree_paths(&app.state.tree, &mut app.flat_tree_paths_cache);
+
+        // `redraw`'s own real path: `Chrome::refresh` rebuilds the `for`
+        // region (the tree data changed) and reports it, which must
+        // invalidate `tree_item_index_cache` before the next click.
+        let rebuilt = app.chrome.refresh(&app.state.clone());
+        assert!(rebuilt, "state.tree changed, so the explorer's own `for` region should have rebuilt");
+        app.tree_item_index_cache = None; // mirrors `redraw`'s own invalidation on `rebuilt`
+
+        let c_item = find_live_tree_item(&app.chrome.ui, "c.nowui");
+        app.handle_tree_click(c_item);
+
+        assert_eq!(app.tabs.active().unwrap().path, c, "the new file's own TreeViewItem must resolve to its own path, not a stale cached index");
+    }
+
+    #[test]
+    fn apply_active_row_highlight_moves_between_rows_and_does_not_touch_state_tree() {
+        let dir = scratch_dir("active_highlight");
+        let a = dir.join("a.nowui");
+        let b = dir.join("b.nowui");
+        fs::write(&a, "layout: App { Text `a` }").unwrap();
+        fs::write(&b, "layout: App { Text `b` }").unwrap();
+
+        let tree = vec![
+            VfsNode { name: "a.nowui".to_string(), path: a.display().to_string(), is_dir: false, ..Default::default() },
+            VfsNode { name: "b.nowui".to_string(), path: b.display().to_string(), is_dir: false, ..Default::default() },
+        ];
+        let mut app = build_app(&a, tree);
+        app.chrome.refresh(&app.state.clone());
+        app.apply_active_row_highlight();
+
+        let a_item = find_live_tree_item(&app.chrome.ui, "a.nowui");
+        let b_item = find_live_tree_item(&app.chrome.ui, "b.nowui");
+        assert!(app.chrome.ui.get(a_item).style.bg.is_some(), "a.nowui is the initially-active tab");
+        assert!(app.chrome.ui.get(b_item).style.bg.is_none());
+
+        app.open_file(b.clone());
+        app.apply_active_row_highlight();
+
+        // The same live nodes (the tree never rebuilt — no `${entry.
+        // bg_color}`-style reactive field exists on `VfsNode` to force
+        // that) now reflect the new active tab instead.
+        assert!(app.chrome.ui.get(a_item).style.bg.is_none(), "a.nowui is no longer active");
+        assert!(app.chrome.ui.get(b_item).style.bg.is_some(), "b.nowui is now active");
+
+        // Calling it again with nothing changed is a cheap no-op, not a
+        // second search — a real load-bearing behavior for a 60fps redraw
+        // loop, but only indirectly observable here via `last_highlighted_
+        // path` already matching (see the function's own doc comment).
+        app.apply_active_row_highlight();
+        assert!(app.chrome.ui.get(b_item).style.bg.is_some());
     }
 
     struct NullPainter;
@@ -1422,6 +2177,87 @@ mod tests {
     }
 
     #[test]
+    fn selecting_a_preview_node_populates_the_inspector_and_deselecting_clears_it() {
+        let dir = scratch_dir("inspector_select");
+        let a = dir.join("a.nowui");
+        fs::write(&a, "layout: App { Button `Save` bg-[blue-500] {onClick: state.save} }").unwrap();
+        let mut app = build_app(&a, Vec::new());
+
+        let root = app.doc.ui.get(app.doc.ui.layers[0].root);
+        let button_id = root.children[0];
+        app.selected_node = Some(button_id);
+        app.refresh_inspector();
+
+        assert_eq!(app.state.inspector_kind, "Button");
+        assert!(app.state.inspector_fields.iter().any(|f| f.label == "bg" && f.value == "blue-500"));
+        assert!(app.state.inspector_fields.iter().any(|f| f.label == "{onClick}" && f.value == "state.save"));
+
+        app.selected_node = None;
+        app.refresh_inspector();
+
+        assert_eq!(app.state.inspector_kind, "");
+        assert!(app.state.inspector_fields.is_empty());
+    }
+
+    #[test]
+    fn clicking_an_inspector_field_then_confirming_patches_the_editor_buffer_and_reloads_the_preview() {
+        let dir = scratch_dir("inspector_edit");
+        let a = dir.join("a.nowui");
+        fs::write(&a, "layout: App { Button `Save` bg-blue-500 {onClick: state.save} }").unwrap();
+        let mut app = build_app(&a, Vec::new());
+
+        let root = app.doc.ui.get(app.doc.ui.layers[0].root);
+        let button_id = root.children[0];
+        app.selected_node = Some(button_id);
+        app.refresh_inspector();
+        app.chrome.refresh(&app.state.clone());
+
+        let field_buttons = app.chrome.inspector_field_buttons();
+        let bg_index = app.inspector_fields.iter().position(|f| f.label == "bg-blue-500").expect("bg field");
+        app.handle_button_click(field_buttons[bg_index]);
+
+        assert_eq!(app.editing_field.as_ref().unwrap().label, "bg-blue-500");
+        assert_eq!(app.chrome.new_item_text(), "bg-blue-500", "prefilled with the current token verbatim");
+
+        app.chrome.set_new_item_text("bg-blue-700");
+        app.confirm_new_item();
+
+        assert!(app.editing_field.is_none());
+        assert_eq!(app.chrome.editor_text(), "layout: App { Button `Save` bg-blue-700 {onClick: state.save} }");
+        assert!(app.selected_node.is_none(), "the edited node's own id doesn't survive the reparse");
+    }
+
+    #[test]
+    fn button_click_routing_stays_correct_regardless_of_inspector_field_count() {
+        // The whole point of scoping button lookups per-region (`Chrome::
+        // popup_buttons`/`context_menu_buttons`/`tab_strip_buttons`/
+        // `inspector_field_buttons`) instead of one flat whole-app index:
+        // a selected node with several inspector fields must not shift
+        // what clicking a tab-strip button does.
+        let dir = scratch_dir("routing_stability");
+        let a = dir.join("a.nowui");
+        let b = dir.join("b.nowui");
+        fs::write(&a, "layout: App { Button `Save` bg-blue-500 text-white p-4 rounded {onClick: state.save} }").unwrap();
+        fs::write(&b, "layout: App { Text `b` }").unwrap();
+        let mut app = build_app(&a, Vec::new());
+        app.open_file(b.clone());
+        app.switch_tab(0); // back to `a.nowui`
+
+        let root = app.doc.ui.get(app.doc.ui.layers[0].root);
+        let button_id = root.children[0];
+        app.selected_node = Some(button_id);
+        app.refresh_inspector();
+        assert!(app.inspector_fields.len() >= 3, "several fields, to actually exercise a longer variable-length region");
+        app.chrome.refresh(&app.state.clone());
+
+        let tab_buttons = app.chrome.tab_strip_buttons();
+        assert_eq!(tab_buttons.len(), 2);
+        app.handle_button_click(tab_buttons[1]);
+
+        assert_eq!(app.tabs.active().unwrap().path, b, "clicking the second tab button still switches to the second tab");
+    }
+
+    #[test]
     fn confirm_new_item_creates_a_file_at_the_project_root_and_opens_it() {
         let dir = scratch_dir("new_file_root");
         let a = dir.join("a.nowui");
@@ -1437,6 +2273,7 @@ mod tests {
         let created = dir.join("new.nowui");
         assert!(created.exists(), "the file should be written to disk");
         assert_eq!(app.tabs.active().unwrap().path, created, "a new file opens as a tab, same as VS Code's own explorer");
+        wait_for_pending_scan(&mut app);
         assert!(tree_contains(&app.state.tree, |n| n.name == "new.nowui"), "the tree should reflect the new file");
     }
 
@@ -1454,6 +2291,7 @@ mod tests {
 
         assert!(dir.join("widgets").is_dir());
         assert_eq!(app.tabs.len(), tab_count_before, "creating a folder doesn't open any tab");
+        wait_for_pending_scan(&mut app);
         assert!(tree_contains(&app.state.tree, |n| n.name == "widgets" && n.is_dir));
     }
 
@@ -1519,8 +2357,8 @@ mod tests {
         let mut app = build_app(&a, Vec::new());
         app.cursor = Point::new(123.0, 456.0);
 
-        app.open_context_menu(dir.clone());
-        assert_eq!(app.context_menu, Some((dir.clone(), Point::new(123.0, 456.0))));
+        app.open_context_menu(ContextMenuTarget::Folder(dir.clone()));
+        assert_eq!(app.context_menu, Some((ContextMenuTarget::Folder(dir.clone()), Point::new(123.0, 456.0))));
         assert_eq!(app.state.context_menu_left, "123px");
         assert_eq!(app.state.context_menu_top, "456px");
 
@@ -1531,15 +2369,45 @@ mod tests {
     }
 
     #[test]
-    fn start_creating_from_context_menu_targets_the_menus_own_directory_and_closes_it() {
+    fn context_menu_target_kind_drives_which_rows_are_shown() {
+        let dir = scratch_dir("context_menu_rows");
+        let a = dir.join("a.nowui");
+        fs::write(&a, "layout: App { Text `a` }").unwrap();
+        let mut app = build_app(&a, Vec::new());
+
+        app.open_context_menu(ContextMenuTarget::Folder(dir.join("widgets")));
+        assert_eq!(app.state.context_menu_add_h, "32px");
+        assert_eq!(app.state.context_menu_edit_h, "32px");
+        assert_eq!(app.state.context_menu_rename_label, "Rename Folder");
+        assert_eq!(app.state.context_menu_delete_label, "Delete Folder");
+
+        app.open_context_menu(ContextMenuTarget::File(dir.join("a.nowui")));
+        assert_eq!(app.state.context_menu_add_h, "0px", "a file target hides Add Folder/Add File");
+        assert_eq!(app.state.context_menu_edit_h, "32px");
+        assert_eq!(app.state.context_menu_rename_label, "Rename File");
+        assert_eq!(app.state.context_menu_delete_label, "Delete File");
+
+        app.open_context_menu(ContextMenuTarget::Root(dir.clone()));
+        assert_eq!(app.state.context_menu_add_h, "32px");
+        assert_eq!(app.state.context_menu_edit_h, "0px", "empty-space target hides Rename/Delete");
+        assert_eq!(app.state.context_menu_rename_label, "");
+        assert_eq!(app.state.context_menu_delete_label, "");
+
+        app.close_context_menu();
+        assert_eq!(app.state.context_menu_add_h, "0px");
+        assert_eq!(app.state.context_menu_edit_h, "0px");
+    }
+
+    #[test]
+    fn context_menu_add_targets_the_menus_own_directory_and_closes_it() {
         let dir = scratch_dir("context_menu_new_file");
         let a = dir.join("a.nowui");
         fs::create_dir_all(dir.join("widgets")).unwrap();
         fs::write(&a, "layout: App { Text `a` }").unwrap();
         let mut app = build_app(&a, Vec::new());
 
-        app.open_context_menu(dir.join("widgets"));
-        app.start_creating_from_context_menu(NewItemKind::File);
+        app.open_context_menu(ContextMenuTarget::Folder(dir.join("widgets")));
+        app.context_menu_add(NewItemKind::File);
 
         assert!(app.context_menu.is_none(), "starting a creation closes the context menu");
         assert_eq!(app.selected_dir, dir.join("widgets"));
@@ -1551,22 +2419,98 @@ mod tests {
     }
 
     #[test]
-    fn handle_button_click_routes_context_menu_buttons_to_new_file_and_new_folder() {
-        let dir = scratch_dir("context_menu_buttons");
+    fn context_menu_add_for_a_file_target_creates_alongside_it_not_inside_it() {
+        let dir = scratch_dir("context_menu_new_file_sibling");
         let a = dir.join("a.nowui");
         fs::write(&a, "layout: App { Text `a` }").unwrap();
         let mut app = build_app(&a, Vec::new());
-        app.open_context_menu(dir.clone());
+
+        app.open_context_menu(ContextMenuTarget::File(a.clone()));
+        app.context_menu_add(NewItemKind::Folder);
+
+        assert_eq!(app.selected_dir, dir, "a file target's own parent directory, not the file itself");
+    }
+
+    #[test]
+    fn start_renaming_prefills_the_prompt_with_the_current_name_and_confirm_renames_on_disk() {
+        let dir = scratch_dir("context_menu_rename");
+        let a = dir.join("a.nowui");
+        fs::create_dir_all(dir.join("widgets")).unwrap();
+        fs::write(dir.join("widgets/Card.nowui"), "layout: Card {}").unwrap();
+        fs::write(&a, "layout: App { Text `a` }").unwrap();
+        let mut app = build_app(&a, Vec::new());
+
+        app.open_context_menu(ContextMenuTarget::File(dir.join("widgets/Card.nowui")));
+        app.start_renaming();
+
+        assert!(app.context_menu.is_none());
+        assert_eq!(app.chrome.new_item_text(), "Card.nowui", "prefilled with the current name");
+        assert_eq!(app.renaming, Some(dir.join("widgets/Card.nowui")));
+
+        app.chrome.set_new_item_text("Renamed.nowui");
+        app.confirm_new_item();
+
+        assert!(app.renaming.is_none());
+        assert!(!dir.join("widgets/Card.nowui").exists());
+        assert!(dir.join("widgets/Renamed.nowui").exists());
+    }
+
+    #[test]
+    fn renaming_an_open_files_own_folder_retargets_its_tab_and_reloads_it() {
+        let dir = scratch_dir("context_menu_rename_open_tab");
+        let a = dir.join("a.nowui");
+        fs::create_dir_all(dir.join("widgets")).unwrap();
+        fs::write(dir.join("widgets/Card.nowui"), "layout: Card { Text `card` }").unwrap();
+        fs::write(&a, "layout: App { Text `a` }").unwrap();
+        let mut app = build_app(&a, Vec::new());
+        app.open_file(dir.join("widgets/Card.nowui"));
+
+        app.open_context_menu(ContextMenuTarget::Folder(dir.join("widgets")));
+        app.start_renaming();
+        app.chrome.set_new_item_text("controls");
+        app.confirm_new_item();
+
+        assert_eq!(app.tabs.active().unwrap().path, dir.join("controls/Card.nowui"), "the open tab follows its file's renamed parent folder");
+        assert_eq!(app.chrome.editor_text(), "layout: Card { Text `card` }", "and the editor reloads it from its new location");
+    }
+
+    #[test]
+    fn context_menu_delete_removes_the_target_and_closes_any_open_tab_under_it() {
+        let dir = scratch_dir("context_menu_delete");
+        let a = dir.join("a.nowui");
+        fs::write(&a, "layout: App { Text `a` }").unwrap();
+        let doomed = dir.join("doomed.nowui");
+        fs::write(&doomed, "layout: Doomed { Text `d` }").unwrap();
+        let mut app = build_app(&a, Vec::new());
+        app.open_file(doomed.clone());
+        assert_eq!(app.tabs.len(), 2);
+
+        app.open_context_menu(ContextMenuTarget::File(doomed.clone()));
+        app.context_menu_delete();
+
+        assert!(!doomed.exists());
+        assert_eq!(app.tabs.len(), 1, "the tab for the deleted file closed");
+        assert!(app.tabs.iter().all(|t| t.path != doomed));
+    }
+
+    #[test]
+    fn handle_button_click_routes_context_menu_buttons_to_add_rename_and_delete() {
+        let dir = scratch_dir("context_menu_buttons");
+        let a = dir.join("a.nowui");
+        fs::create_dir_all(dir.join("widgets")).unwrap();
+        fs::write(&a, "layout: App { Text `a` }").unwrap();
+        let mut app = build_app(&a, Vec::new());
+        app.open_context_menu(ContextMenuTarget::Folder(dir.join("widgets")));
         app.chrome.refresh(&app.state.clone());
 
         let buttons = live_buttons(&app.chrome.ui);
-        // index 0,1 = new-item popup Cancel/Create; 2,3,4 = context menu's
-        // New File.../New Folder.../Reveal in File Explorer.
+        // index 0,1 = new-item popup Cancel/Create; 2,3,4,5 = context
+        // menu's own Add Folder/Add File/Rename/Delete.
         app.handle_button_click(buttons[3]);
 
         assert!(app.context_menu.is_none());
-        assert_eq!(app.creating, Some(NewItemKind::Folder));
-        assert_eq!(app.selected_dir, dir);
+        assert_eq!(app.creating, Some(NewItemKind::File));
+        assert_eq!(app.selected_dir, dir.join("widgets"));
     }
 
     #[test]
@@ -1581,11 +2525,12 @@ mod tests {
 
         let buttons = live_buttons(&app.chrome.ui);
         // The new-item popup's own Cancel/Create, the context menu's own
-        // three (New File.../New Folder.../Reveal in File Explorer), plus
-        // one tab-strip button for `a.nowui` (`build_app`/`DesignerApp::new`
+        // four (Add Folder/Add File/Rename/Delete — always present, see
+        // `DesignerState::context_menu_add_h`'s own doc comment), plus one
+        // tab-strip button for `a.nowui` (`build_app`/`DesignerApp::new`
         // always seed one open tab from the initially-opened file) — no
         // `layout:` picker buttons since `a.nowui` only defines one layout.
-        assert_eq!(buttons.len(), 6);
+        assert_eq!(buttons.len(), 7);
 
         // Cancel (index 0) discards without creating anything.
         app.handle_button_click(buttons[0]);

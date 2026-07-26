@@ -1,6 +1,19 @@
-//! The winit application harness: window + softbuffer surface, event-driven
-//! redraw (ControlFlow::Wait), and the solve -> paint -> present cycle guarded
-//! by a dirty flag.
+//! The winit application harness: window + softbuffer surface (`Backend::
+//! Cpu`) or GPU render thread (`Backend::Gpu`), on a fixed 60fps loop (see
+//! `FRAME_INTERVAL`/`about_to_wait`).
+//!
+//! `Backend::Gpu`'s own redraw is split across two threads (see
+//! `render_thread`'s own module doc for the full picture): `App::redraw`/
+//! `redraw_gpu`, here, still run on the main/winit-event thread every
+//! frame — reactivity resolution (below) plus `layout::solve` (needed for
+//! this-frame-correct hit-testing/scroll-follow-caret, with no lag) — then
+//! hand the already-solved `Ui` off to a dedicated render thread, which
+//! only ever builds the paint scene and submits/presents it to the GPU.
+//! That split means a slow GPU frame no longer blocks input handling, and
+//! input handling no longer blocks the GPU from presenting. `Backend::Cpu`
+//! is unaffected — its solve/paint/present all still run synchronously on
+//! the main thread, in `redraw_cpu` (see `crate::render_thread`'s own
+//! module doc for why the CPU backend isn't threaded the same way).
 //!
 //! Reactivity lives here too: each redraw, every node's `value_path`
 //! (`resolve_values`), backtick `${state.path}` templates (`resolve_templates`),
@@ -27,7 +40,7 @@ use nowui_core::{
     EventKind, NodeId, NodeKind, NowUiState, Point, Rect, Size, StateValue, Ui,
 };
 use nowui_render::{present_to_softbuffer, SkiaPainter, TextContext};
-use nowui_render_gpu::{GpuFontCache, GpuPainter, GpuSurfaceState};
+use nowui_render_gpu::GpuSurfaceState;
 use tiny_skia::Pixmap;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -66,12 +79,15 @@ pub struct App<S: NowUiState + 'static> {
     window: Option<Arc<Window>>,
     /// Only populated when `backend == Backend::Cpu`.
     surface: Option<softbuffer::Surface<Arc<Window>, Arc<Window>>>,
-    /// Only populated when `backend == Backend::Gpu`.
-    gpu: Option<GpuSurfaceState>,
-    /// Resolved font *data* cache for the GPU text path — see
-    /// `GpuFontCache`'s own doc comment. Unused (but harmless to keep
-    /// around) on `Backend::Cpu`.
-    gpu_font_cache: GpuFontCache,
+    /// Only populated when `backend == Backend::Gpu` — owns the dedicated
+    /// GPU render thread (`GpuSurfaceState`/`GpuFontCache` live *there*, not
+    /// here — see `render_thread`'s own module doc). `redraw` still runs
+    /// `layout::solve` right here on the main thread every frame (needed
+    /// for this-frame-correct hit-testing/scroll-follow-caret — see
+    /// `redraw_gpu`'s own doc comment) using a throwaway CPU `SkiaPainter`
+    /// purely for text measurement, then publishes the solved `Ui` to this
+    /// thread, which only ever paints + presents it.
+    render_thread: Option<crate::render_thread::RenderThread>,
     backend: Backend,
     cursor: Point,
     /// Font database + glyph cache. Built once (loading system fonts is slow)
@@ -154,8 +170,7 @@ impl<S: NowUiState + 'static> App<S> {
             state,
             window: None,
             surface: None,
-            gpu: None,
-            gpu_font_cache: GpuFontCache::new(),
+            render_thread: None,
             backend,
             cursor: Point::default(),
             text: TextContext::new(),
@@ -391,7 +406,7 @@ impl<S: NowUiState + 'static> App<S> {
         let Some(window) = self.window.clone() else { return };
         let ready = match self.backend {
             Backend::Cpu => self.surface.is_some(),
-            Backend::Gpu => self.gpu.is_some(),
+            Backend::Gpu => self.render_thread.is_some(),
         };
         if !ready {
             return;
@@ -511,28 +526,34 @@ impl<S: NowUiState + 'static> App<S> {
         buffer.present().expect("present");
     }
 
+    /// The GPU backend's own redraw half — split across two threads (see
+    /// `render_thread`'s own module doc for the full picture). This method
+    /// still runs `layout::solve` right here, on the main/input thread,
+    /// every frame: `Node::computed`/`scroll_offset`/`Ui::auto_scroll` must
+    /// be correct for *this* frame's own hit-testing and scroll-follow-
+    /// caret behavior with zero lag, and only the thread that owns `self.ui`
+    /// (this one) can update those before the next input event needs them.
+    /// Solving needs a real `Painter` only for text measurement (see
+    /// CLAUDE.md's solver gotchas) — a throwaway 1x1 CPU `SkiaPainter`
+    /// serves that with no GPU surface involved at all (`measure_text`
+    /// doesn't rasterize anything; only `paint::paint`, which never runs
+    /// here, would). Once solved, the whole `Ui` is cloned and handed to
+    /// the render thread, which only ever paints + presents it — never
+    /// re-solves, never touches `self.state`.
     fn redraw_gpu(&mut self, window: &Window, w: u32, h: u32) {
-        let mut scene = vello::Scene::new();
-
+        let mut throwaway = Pixmap::new(1, 1).expect("1x1 measurement-only pixmap");
         {
-            let mut painter = GpuPainter::new(&mut scene, &mut self.text, &mut self.gpu_font_cache);
+            let mut painter = SkiaPainter::new(&mut throwaway, &mut self.text);
             nowui_core::layout::solve(&mut self.ui, Size::new(w as f32, h as f32), &mut painter);
         }
 
-        // See `redraw_cpu`'s matching comment — same borrow-conflict reason.
         self.update_text_input_scroll();
         self.update_auto_scroll();
-
-        {
-            let mut painter = GpuPainter::new(&mut scene, &mut self.text, &mut self.gpu_font_cache);
-            nowui_core::paint::paint(&self.ui, &mut painter);
-        }
-
         self.update_ime_cursor_area(window);
 
-        let gpu = self.gpu.as_mut().expect("checked in redraw");
-        gpu.resize(w, h);
-        gpu.render_and_present(&scene, CLEAR);
+        if let Some(render_thread) = &self.render_thread {
+            render_thread.publish(self.ui.clone(), Size::new(w as f32, h as f32));
+        }
     }
 
     fn request_redraw(&self) {
@@ -1620,7 +1641,13 @@ impl<S: NowUiState + 'static> ApplicationHandler for App<S> {
                 self.surface = Some(surface);
             }
             Backend::Gpu => {
-                self.gpu = Some(GpuSurfaceState::new(window.clone(), size.width.max(1), size.height.max(1)));
+                // Must be built here, on the main thread — see
+                // `render_thread`'s own module doc on why constructing it
+                // (which queries the window's raw handle) from a different
+                // thread fails outright on this platform. Handed off
+                // afterward; nothing on this thread touches it again.
+                let gpu = GpuSurfaceState::new(window.clone(), size.width.max(1), size.height.max(1));
+                self.render_thread = Some(crate::render_thread::RenderThread::spawn(gpu));
             }
         }
 
@@ -1655,7 +1682,15 @@ impl<S: NowUiState + 'static> ApplicationHandler for App<S> {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => {
+                // Stop + join the render thread (a no-op `Drop` on
+                // `Backend::Cpu`, where this is already `None`) *before*
+                // exiting — otherwise the window (and the GPU surface tied
+                // to it) could be torn down while an in-flight
+                // `render_and_present` on that thread is still using it.
+                self.render_thread = None;
+                event_loop.exit();
+            }
 
             WindowEvent::Resized(_) => {
                 self.dispatch_event_broadcast("onResize", EventKind::Resize);

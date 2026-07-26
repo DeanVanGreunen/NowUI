@@ -9,20 +9,7 @@
 //! level fix that makes it actually resolve live state instead of a bare
 //! loop-variable name).
 
-use std::path::Path;
-
 use crate::virtual_fs::VfsEntry;
-
-/// The active-node highlight the user asked for: `#e1e1e1` background,
-/// white text, applied via `bg-[${entry.bg_color}]`/`text-[${entry.
-/// text_color}]` dynamic style brackets (resolved through `RenderVfsNode`'s
-/// own `entry` layout param — see `apply_active_highlight`'s own doc
-/// comment for why a loop-variable-scoped bracket wouldn't work here but a
-/// layout param does).
-const ACTIVE_BG: &str = "#e1e1e1";
-const ACTIVE_TEXT: &str = "#ffffff";
-const INACTIVE_BG: &str = "transparent";
-const INACTIVE_TEXT: &str = "#374151"; // Tailwind gray-700 — matches the tree's old static `text-gray-700`.
 
 #[derive(Default, Clone, nowui_core::NowUiState)]
 pub struct VfsNode {
@@ -44,71 +31,40 @@ pub struct VfsNode {
     /// real file/folder.
     pub truncated: bool,
     pub children: Vec<VfsNode>,
-    /// `bg-[${entry.bg_color}]`/`text-[${entry.text_color}]` in `designer.
-    /// nowui`'s `RenderVfsNode` — `ACTIVE_BG`/`ACTIVE_TEXT` for whichever
-    /// entry's own `path` matches the currently open/active tab,
-    /// `INACTIVE_BG`/`INACTIVE_TEXT` for every other entry. Set by
-    /// `apply_active_highlight`, not by `from_entry` (which has no notion
-    /// of "active" — a plain disk scan).
-    pub bg_color: String,
-    pub text_color: String,
+    // Deliberately *no* per-entry `bg_color`/`text_color` fields — an
+    // earlier revision drove the active-row highlight through exactly
+    // that (a `bg-[${entry.bg_color}]` bracket resolved via `RenderVfsNode`'s
+    // own layout param), but changing even one entry's color anywhere in
+    // the tree flips the *whole* `for entry in state.tree` region's own
+    // rebuild signature (`nowui-runtime`'s `signature_string` hashes every
+    // field of every item), forcing the entire explorer subtree to
+    // rebuild from scratch on every single tab switch. Fine for a handful
+    // of files; for a real project tree it meant `Ui::gc`'s own orphan
+    // count — and so per-redraw work — grew without bound over a session,
+    // to the point of visibly hanging. `app::DesignerApp::
+    // apply_active_row_highlight` now does this by mutating the *live*
+    // `TreeViewItem` arena node's own `base_style` directly instead —
+    // bypassing the reactive/region-rebuild system entirely for a purely
+    // cosmetic, non-structural change.
 }
 
 impl VfsNode {
     pub fn from_entry(entry: &VfsEntry) -> Self {
         match entry {
-            VfsEntry::File { name, path } => VfsNode {
-                name: name.clone(),
-                path: path.display().to_string(),
-                is_dir: false,
-                truncated: false,
-                children: Vec::new(),
-                bg_color: INACTIVE_BG.to_string(),
-                text_color: INACTIVE_TEXT.to_string(),
-            },
+            VfsEntry::File { name, path } => {
+                VfsNode { name: name.clone(), path: path.display().to_string(), is_dir: false, truncated: false, children: Vec::new() }
+            }
             VfsEntry::Dir { name, path, children } => VfsNode {
                 name: name.clone(),
                 path: path.display().to_string(),
                 is_dir: true,
                 truncated: false,
                 children: children.iter().map(VfsNode::from_entry).collect(),
-                bg_color: INACTIVE_BG.to_string(),
-                text_color: INACTIVE_TEXT.to_string(),
             },
-            VfsEntry::Truncated { path } => VfsNode {
-                name: "… more".to_string(),
-                path: path.display().to_string(),
-                is_dir: false,
-                truncated: true,
-                children: Vec::new(),
-                bg_color: INACTIVE_BG.to_string(),
-                text_color: INACTIVE_TEXT.to_string(),
-            },
+            VfsEntry::Truncated { path } => {
+                VfsNode { name: "… more".to_string(), path: path.display().to_string(), is_dir: false, truncated: true, children: Vec::new() }
+            }
         }
-    }
-}
-
-/// Recursively marks whichever entry's own `path` equals `active_path` with
-/// the `#e1e1e1`-bg/white-text active highlight, and every other entry with
-/// the plain inactive colors — called from `DesignerApp::sync_reactive_state`
-/// every time the active tab could have changed (open/switch/close), so the
-/// highlight always tracks whichever file is actually open in the editor.
-///
-/// A dynamic style bracket (`bg-[${entry.bg_color}]`) only resolves for a
-/// name the semantic pass's `scope` actually knows about (`apply_style`'s
-/// `resolve_scoped_path`) — true for a `layout:`'s own bound *parameter*
-/// (`RenderVfsNode(entry)`, resolved once at build time via `bind_scope`,
-/// same as this crate's `Variable`), but explicitly **not** true for a bare
-/// `for x in ...` loop variable (`nowui-runtime`'s `substitute_loop_var`
-/// never rewrites style brackets — see CLAUDE.md's own `for` section). Since
-/// `entry` here is `RenderVfsNode`'s own parameter, not a raw loop variable,
-/// this works.
-pub fn apply_active_highlight(nodes: &mut [VfsNode], active_path: Option<&Path>) {
-    for node in nodes {
-        let is_active = active_path.is_some_and(|p| p == Path::new(&node.path));
-        node.bg_color = if is_active { ACTIVE_BG } else { INACTIVE_BG }.to_string();
-        node.text_color = if is_active { ACTIVE_TEXT } else { INACTIVE_TEXT }.to_string();
-        apply_active_highlight(&mut node.children, active_path);
     }
 }
 
@@ -138,6 +94,18 @@ pub struct TabInfo {
 pub struct LayoutOption {
     pub label: String,
     pub id: String,
+}
+
+/// One row in the inspector panel — a selected preview node's own style
+/// token (`label` bare, e.g. `"bg"`) or binding (`label` wrapped in braces,
+/// e.g. `"{onClick}"`, so the two read distinctly at a glance without a
+/// second reactive field). See `app::DesignerApp::refresh_inspector` (the
+/// only writer) and `inspector::InspectorField` (the Rust-side source of
+/// truth this is copied from).
+#[derive(Default, Clone, nowui_core::NowUiState)]
+pub struct InspectorFieldRow {
+    pub label: String,
+    pub value: String,
 }
 
 #[derive(Default, Clone, nowui_core::NowUiState)]
@@ -175,6 +143,27 @@ pub struct DesignerState {
     /// instead of a fixed center-ish spot.
     pub context_menu_left: String,
     pub context_menu_top: String,
+    /// The context menu always has four `Button` rows — Add Folder, Add
+    /// File, Rename, Delete — structurally present in `designer.nowui` (no
+    /// true `display: none` exists, so a row this frame's target doesn't
+    /// support collapses to `0px` tall instead of being absent, same "fixed
+    /// slot count, dynamic visibility" shape `popup_left`/`popup_top`
+    /// already use for the whole popup). `context_menu_add_h` gates the
+    /// Add Folder/Add File rows together (hidden for a file target);
+    /// `context_menu_edit_h` gates Rename/Delete together (hidden for
+    /// empty-space/project-root target). See `app::ContextMenuTarget`.
+    pub context_menu_add_h: String,
+    pub context_menu_edit_h: String,
+    /// `"Rename Folder"`/`"Rename File"` and `"Delete Folder"`/`"Delete
+    /// File"` — empty while the context menu is closed or its own row is
+    /// hidden (`context_menu_edit_h == "0px"`), meaningless then anyway.
+    pub context_menu_rename_label: String,
+    pub context_menu_delete_label: String,
+    /// The currently-selected preview node's own widget kind (`"Button"`,
+    /// `"Text"`, ...), or `""` while nothing is selected — see
+    /// `app::DesignerApp::refresh_inspector`.
+    pub inspector_kind: String,
+    pub inspector_fields: Vec<InspectorFieldRow>,
 }
 
 #[cfg(test)]

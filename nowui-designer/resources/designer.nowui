@@ -15,27 +15,42 @@
 //
 // Explorer rows show real `.nowui`-authored TreeViewItem widgets: a folder
 // icon (`tree-icon-[FaFolder]`) or file icon (`tree-icon-[FaFile]`) at the
-// row's own left edge, and a `bg-[${entry.bg_color}]`/`text-[${entry.
-// text_color}]` dynamic pair highlighting whichever row is the currently
-// active tab's own file (`#094771` bg / white text, VS Code's own selected-
-// row color — see `state::apply_active_highlight`). Creating a new file/
-// folder is no longer an always-visible inline icon (see the previous
-// revision's own `folder-actions` flag) — it's now the right-click context
-// menu below, matching a real file explorer's own convention.
+// row's own left edge, a `hover:bg-[#2a2d2e]` highlight (VS Code's own
+// lighter-grey row-hover color), and `rounded-[4px]` corners. The currently
+// active tab's own row is highlighted separately — `app.rs`'s
+// `apply_active_row_highlight` mutates that one live `TreeViewItem` arena
+// node's own `base_style` *directly* rather than through a reactive
+// `${entry.bg_color}`-style data field (an earlier revision did exactly
+// that, and paid for it: changing *any* entry's color anywhere in the tree
+// flips the whole `for entry in state.tree` region's own rebuild signature,
+// forcing the entire explorer subtree to rebuild from scratch on every
+// single tab switch — fine for a handful of files, a real slowdown-into-
+// hang for a real project tree over a session). Creating a new file/folder
+// is no longer an always-visible inline icon (see the previous revision's
+// own `folder-actions` flag) — it's now the right-click context menu
+// below, matching a real file explorer's own convention.
 //
 // Two popups are always structurally present (see `DesignerState::
 // popup_left`'s own doc comment), parked off-screen while idle: the
-// new-item name prompt (Confirm/Cancel), and the right-click context menu
-// (New File.../New Folder.../Reveal in File Explorer). Both sit as `App`'s
-// own first two children, in that order — `app.rs`'s `handle_button_click`
-// matches their buttons positionally (new-item popup's 2, then context
-// menu's 3), ahead of the tab strip's own `Button`s; this file's own source
-// order must keep matching that assumption. The preview slot and the two
-// special `TextInput`s (the new-item prompt, and the editor) are recognized
-// *structurally* right now (the root's own LAST child's own LAST child; the
-// first and second `TextInput` found anywhere in the tree) rather than via
-// a dedicated marker — a documented simplification for this stage, not a
-// permanent design; see `chrome.rs`'s `preview_slot_rect`/`editor_node`/
+// new-item/rename/field-edit prompt (Confirm/Cancel, shared between all
+// three — see `app.rs`'s `start_renaming`/`start_editing_field`), and the
+// right-click context menu (Add Folder/Add File/Rename/Delete — always four
+// `Button` rows regardless of target, since a row the target doesn't
+// support just collapses to `h-[0px]` rather than being absent — see
+// `DesignerState::context_menu_add_h`'s own doc comment). Both sit as
+// `App`'s own first two children, in that order. A clicked `Button` is
+// identified by *which structural region it lives in* (`chrome.rs`'s
+// `popup_buttons`/`context_menu_buttons`/`tab_strip_buttons`/
+// `inspector_field_buttons`, each scoped to just that region's own
+// container) rather than one flat whole-app positional index — a
+// variable-length region (the tab strip, the inspector's own per-field
+// rows) can't shift what a *different* region's button click means. The
+// preview slot and the two special `TextInput`s (the new-item/rename/
+// field-edit prompt, and the editor) are recognized *structurally* right
+// now (the root's own LAST child's own LAST child; the first and second
+// `TextInput` found anywhere in the tree) rather than via a dedicated
+// marker — a documented simplification for this stage, not a permanent
+// design; see `chrome.rs`'s `preview_slot_rect`/`editor_node`/
 // `new_item_node`.
 //
 // Visual language: VS Code's own dark theme — `#252526` sidebar/chrome
@@ -43,39 +58,74 @@
 // selected-row blue, `#2a2d2e` hover. The live preview slot itself stays
 // whatever the previewed app's own styling says — it's content, not chrome.
 
+// Nested folders start collapsed — matching every real file explorer's own
+// convention (VS Code doesn't auto-expand a project's whole tree either),
+// and critically bounding how much of a real (large) project tree is
+// actually reachable/laid-out/painted at once, since a collapsed
+// TreeViewItem's own children are excluded entirely from layout while
+// collapsed. `RenderRootVfsNode` below is the one exception — the root
+// explorer entry itself starts expanded, so its own immediate contents are
+// visible without an extra click.
 layout: RenderVfsNode(entry) {
   if entry.is_dir {
-    TreeViewItem `${entry.name}` tree-icon-[FaFolder] bg-[${entry.bg_color}] text-[${entry.text_color}] rounded-[4px] {
+    TreeViewItem `${entry.name}` tree-icon-[FaFolder] text-[#cccccc] text-xs rounded-[4px] hover:bg-[#2a2d2e] {collapsed: true} {
       for child in entry.children { RenderVfsNode entry=child }
     }
   } else {
-    TreeViewItem `${entry.name}` tree-icon-[FaFile] bg-[${entry.bg_color}] text-[${entry.text_color}] rounded-[4px]
+    TreeViewItem `${entry.name}` tree-icon-[FaFile] text-[#cccccc] text-xs rounded-[4px] hover:bg-[#2a2d2e]
+  }
+}
+
+layout: RenderRootVfsNode(entry) {
+  if entry.is_dir {
+    TreeViewItem `${entry.name}` tree-icon-[FaFolder] text-[#cccccc] text-xs rounded-[4px] hover:bg-[#2a2d2e] {collapsed: false} {
+      for child in entry.children { RenderVfsNode entry=child }
+    }
+  } else {
+    TreeViewItem `${entry.name}` tree-icon-[FaFile] text-[#cccccc] text-xs rounded-[4px] hover:bg-[#2a2d2e]
   }
 }
 
 layout: App w-[fill] h-[fill] row bg-[#1e1e1e] {
-  // New-item popup — see this file's own top comment.
-  Container position-absolute left-[${state.popup_left}] top-[${state.popup_top}] w-[320px] bg-[#252526] border border-[#454545] rounded-lg p-5 gap-3 z-index-100 {
-    Text `${state.popup_title}` text-[#cccccc] font-semibold text-lg
-    Text `${state.creating_hint}` text-[#969696] text-sm
-    TextInput `` `Name` w-[fill] p-2 border border-[#3c3c3c] rounded bg-[#3c3c3c] text-[#cccccc] text-sm
-    Container row gap-2 justify-end {
-      Button `Cancel` bg-[#3c3c3c] text-[#cccccc] p-2 rounded border border-[#454545] text-sm hover:bg-[#454545]
-      Button `Create` bg-[#0e639c] text-white p-2 rounded text-sm hover:bg-[#1177bb]
+  // New-item/rename popup — see this file's own top comment. The outer
+  // container spans the whole window (`w-[fill] h-[fill]`) and centers its
+  // one real child both ways (`items-center justify-center`) — real,
+  // any-window-size centering, not a fixed pixel guess at the popup card's
+  // own size. Parked off-screen (`left-[${state.popup_left}]`/`top-[...]`)
+  // while idle, same "no true display:none" trick every other popup here
+  // uses — while parked there, its own full-viewport size just sits far
+  // off in negative space instead of over the visible window, so it can't
+  // intercept a click meant for whatever's underneath (see `DesignerState::
+  // popup_left`'s own doc comment).
+  Container position-absolute left-[${state.popup_left}] top-[${state.popup_top}] w-[fill] h-[fill] items-center justify-center z-index-100 {
+    Container w-[320px] bg-[#252526] border border-[#454545] rounded-lg p-5 gap-3 {
+      Text `${state.popup_title}` text-[#cccccc] font-semibold text-lg
+      Text `${state.creating_hint}` text-[#969696] text-sm
+      TextInput `` `Name` w-[fill] p-2 border border-[#3c3c3c] rounded bg-[#3c3c3c] text-[#cccccc] text-sm
+      Container row gap-2 justify-end {
+        Button `Cancel` bg-[#3c3c3c] text-[#cccccc] p-2 rounded border border-[#454545] text-sm hover:bg-[#454545]
+        Button `Create` bg-[#0e639c] text-white p-2 rounded text-sm hover:bg-[#1177bb]
+      }
     }
   }
 
-  // Right-click context menu — see this file's own top comment.
-  Container position-absolute left-[${state.context_menu_left}] top-[${state.context_menu_top}] w-[220px] bg-[#3c3c3c] border border-[#454545] rounded p-[4px] gap-[2px] z-index-100 {
-    Button `New File...` w-[fill] bg-[#3c3c3c] text-[#cccccc] p-2 rounded text-sm hover:bg-[#04395e]
-    Button `New Folder...` w-[fill] bg-[#3c3c3c] text-[#cccccc] p-2 rounded text-sm hover:bg-[#04395e]
-    Button `Reveal in File Explorer` w-[fill] bg-[#3c3c3c] text-[#cccccc] p-2 rounded text-sm hover:bg-[#04395e]
+  // Right-click context menu — see this file's own top comment. Always
+  // four fixed `Button` rows (Add Folder, Add File, Rename, Delete); a row
+  // the current target doesn't support collapses to `h-[0px]` instead of
+  // being absent, so the menu's own button *count* never changes (there's
+  // no true `display: none` — see `DesignerState::context_menu_add_h`'s
+  // own doc comment).
+  Container position-absolute left-[${state.context_menu_left}] top-[${state.context_menu_top}] w-[220px] bg-[#3c3c3c] border border-[#6b6b6b] rounded p-[4px] gap-[2px] z-index-100 {
+    Button `Add Folder` w-[fill] h-[${state.context_menu_add_h}] bg-[#3c3c3c] text-[#cccccc] p-2 rounded text-xs hover:bg-[#04395e]
+    Button `Add File` w-[fill] h-[${state.context_menu_add_h}] bg-[#3c3c3c] text-[#cccccc] p-2 rounded text-xs hover:bg-[#04395e]
+    Button `${state.context_menu_rename_label}` w-[fill] h-[${state.context_menu_edit_h}] bg-[#3c3c3c] text-[#cccccc] p-2 rounded text-xs hover:bg-[#04395e]
+    Button `${state.context_menu_delete_label}` w-[fill] h-[${state.context_menu_edit_h}] bg-[#3c3c3c] text-[#cccccc] p-2 rounded text-xs hover:bg-[#04395e]
   }
 
   Container w-[260px] h-[fill] bg-[#252526] p-5 gap-3 scroll-v {
     Text `NOWUI` text-[#cccccc] font-semibold text-lg
     TreeView text-[#cccccc] {
-      for entry in state.tree { RenderVfsNode entry=entry }
+      for entry in state.tree { RenderRootVfsNode entry=entry }
     }
   }
   Container w-[fill] h-[fill] bg-[#1e1e1e] col {
@@ -91,9 +141,26 @@ layout: App w-[fill] h-[fill] row bg-[#1e1e1e] {
     TextInput `` `Open a .nowui file to start editing` multi w-[fill] h-[fill] p-[20px] text-[#d4d4d4] bg-[#1e1e1e]
   }
   Container w-[fill] h-[fill] bg-gray-100 col {
-    Container row p-2 bg-[#252526] h-[hug] {
+    Container row p-2 bg-[#252526] w-[full] align-center {
       Dropdown `Select a layout` w-[320px] border border-[#454545] rounded bg-[#3c3c3c] text-[#cccccc] {
         values: state.layout_options
+      }
+    }
+    // Inspector — the selected preview node's own kind plus its style/
+    // binding fields (`app.rs`'s `refresh_inspector`, backed by
+    // `inspector.rs`'s span-based reparse of the active tab's own current
+    // buffer). Inserted here, immediately *before* the preview slot below
+    // rather than appended after it, specifically so the slot stays this
+    // container's own last child — `chrome.rs`'s structural "App's last
+    // child's own last child" preview-slot recognition (see this file's
+    // own top comment) depends on that position not shifting. Empty
+    // (`state.inspector_kind == ""`) while nothing is selected, so this
+    // row just collapses to its own padding instead of showing a blank
+    // card.
+    Container w-[fill] h-[hug] bg-[#252526] p-3 gap-1 scroll-v {
+      Text `${state.inspector_kind}` text-[#cccccc] font-semibold text-sm
+      for field in state.inspector_fields {
+        Button `${field.label}: ${field.value}` w-[fill] bg-[#252526] text-[#cccccc] text-xs hover:bg-[#2a2d2e] p-1 rounded
       }
     }
     Container w-[fill] h-[fill] p-6 {

@@ -5,6 +5,8 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver};
+use std::thread;
 use std::{fs, io};
 
 /// A depth cap on `scan` (see its own doc comment) — a *defensive* limit,
@@ -14,6 +16,20 @@ use std::{fs, io};
 /// either hanging or just dropping content with no indication anything was
 /// cut.
 pub const DEFAULT_MAX_DEPTH: usize = 32;
+
+/// Directory *names* `scan` never descends into — build output and
+/// dependency caches (`target`, `node_modules`, ...) that real file
+/// explorers hide too, just without a `.gitignore` parser to derive it from
+/// (a real gitignore implementation is out of scope here — see CLAUDE.md's
+/// "don't half-implement" convention; this is a small, honest, hardcoded
+/// list instead). Skipping these at scan time, not just at render time,
+/// matters: opening the designer on a real Rust/Node project root without
+/// this produced a tree with hundreds of thousands of nodes (every
+/// dependency's own build artifacts), which every per-redraw tree walk
+/// (`apply_active_row_highlight`, context-menu target resolution, ...) then
+/// paid for on every single click — the direct cause of multi-second UI
+/// input delays on such a project.
+const SKIP_DIR_NAMES: &[&str] = &["target", "node_modules", ".git", "dist", "build", ".venv", "venv", "__pycache__", ".cache", ".next"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum VfsEntry {
@@ -131,9 +147,29 @@ impl VirtualFs {
     }
 
     /// Build the merged (real + pending) tree rooted at `self.root`, capped
-    /// at `max_depth` levels (see `DEFAULT_MAX_DEPTH`).
+    /// at `max_depth` levels (see `DEFAULT_MAX_DEPTH`). Blocking — prefer
+    /// `scan_async` from anywhere already running a redraw loop (a real
+    /// filesystem walk, e.g. over a network drive, has no business blocking
+    /// a 60fps UI thread); this synchronous form stays around for the
+    /// one-time startup scan before any window/event loop exists yet, and
+    /// for tests that want a deterministic, immediate result.
     pub fn scan(&self, max_depth: usize) -> io::Result<VfsEntry> {
         scan_merged(&self.root, &self.pending, max_depth)
+    }
+
+    /// Same walk as `scan`, run on a background `std::thread` instead of
+    /// blocking the caller — mirrors `nowui_runtime::network_image::fetch`'s
+    /// own "spawn a thread, hand back a `Receiver`, poll once per redraw via
+    /// non-blocking `try_recv`" shape (see that module's doc comment). The
+    /// receiver yields exactly one result once the walk completes.
+    pub fn scan_async(&self, max_depth: usize) -> Receiver<io::Result<VfsEntry>> {
+        let root = self.root.clone();
+        let pending = self.pending.clone();
+        let (tx, rx) = channel();
+        thread::spawn(move || {
+            let _ = tx.send(scan_merged(&root, &pending, max_depth));
+        });
+        rx
     }
 }
 
@@ -158,6 +194,9 @@ fn scan_dir_node(dir: &Path, name: &str, pending: &[PendingEntry], depth_left: u
         for entry in real {
             let path = entry.path();
             let entry_name = entry.file_name().to_string_lossy().to_string();
+            if path.is_dir() && SKIP_DIR_NAMES.contains(&entry_name.as_str()) {
+                continue;
+            }
             seen.insert(path.clone());
             if path.is_dir() {
                 children.push(scan_dir_node(&path, &entry_name, pending, depth_left - 1)?);
@@ -187,33 +226,6 @@ fn entry_path(e: &PendingEntry) -> PathBuf {
     match e {
         PendingEntry::File { path, .. } | PendingEntry::Dir { path } => path.clone(),
     }
-}
-
-/// Opens the host OS's own file manager with `path` pre-selected — the
-/// context menu's own "Reveal in File Explorer" (`app.rs`'s
-/// `reveal_in_file_explorer`). One of the very few points this crate
-/// legitimately steps outside `.nowui`/pure-Rust territory into a raw OS
-/// command, same category `main.rs`'s own native open-file dialog already
-/// is. `path` must exist on disk — a still-pending (unflushed) virtual
-/// entry has nothing real to reveal yet.
-pub fn reveal_in_file_explorer(path: &Path) -> io::Result<()> {
-    #[cfg(target_os = "windows")]
-    {
-        std::process::Command::new("explorer").arg(format!("/select,{}", path.display())).spawn()?;
-    }
-    #[cfg(target_os = "macos")]
-    {
-        std::process::Command::new("open").arg("-R").arg(path).spawn()?;
-    }
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        // No universal "select this file" convention on Linux file
-        // managers — opening the containing folder is the reasonable,
-        // widely-supported fallback.
-        let dir = if path.is_dir() { path } else { path.parent().unwrap_or(path) };
-        std::process::Command::new("xdg-open").arg(dir).spawn()?;
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -302,6 +314,22 @@ mod tests {
         let VfsEntry::Dir { children, .. } = level0 else { panic!() };
         let level1 = &children[0];
         assert!(matches!(level1, VfsEntry::Truncated { .. }), "depth cap reached with real content beneath it");
+    }
+
+    #[test]
+    fn scan_skips_heavy_build_and_dependency_directories() {
+        let dir = scratch_dir("skip_heavy");
+        fs::write(dir.join("main.nowui"), "layout: App {}").unwrap();
+        fs::create_dir_all(dir.join("target/debug")).unwrap();
+        fs::write(dir.join("target/debug/build_artifact.bin"), "x").unwrap();
+        fs::create_dir_all(dir.join("node_modules/some-pkg")).unwrap();
+        fs::write(dir.join("node_modules/some-pkg/index.js"), "x").unwrap();
+
+        let vfs = VirtualFs::new(dir.clone());
+        let tree = vfs.scan(DEFAULT_MAX_DEPTH).unwrap();
+        let VfsEntry::Dir { children, .. } = &tree else { panic!() };
+        assert_eq!(children.len(), 1, "only main.nowui — target/ and node_modules/ never descended into");
+        assert_eq!(children[0].name(), "main.nowui");
     }
 
     #[test]

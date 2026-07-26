@@ -21,6 +21,7 @@ pub mod bundled_assets;
 pub mod dynamic;
 pub mod loader;
 pub mod network_image;
+mod render_thread;
 pub mod resolve;
 pub mod semantic;
 pub mod transitions;
