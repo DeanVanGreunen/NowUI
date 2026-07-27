@@ -36,8 +36,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use nowui_core::{
-    compute_effective, display_string, dropdown_metrics, AnimatableStyle, Color, CursorIcon, Event,
-    EventKind, NodeId, NodeKind, NowUiState, Point, Rect, Size, StateValue, Ui,
+    compute_effective, dropdown_metrics, AnimatableStyle, Color, CursorIcon, Event, EventKind, NodeId, NodeKind, NowUiState, Point, Rect, Size,
+    StateValue, Ui,
 };
 use nowui_render::{present_to_softbuffer, SkiaPainter, TextContext};
 use nowui_render_gpu::GpuSurfaceState;
@@ -3110,11 +3110,11 @@ mod tests {
         // it lands on a whole number (`3.0`, not `3`) — Int/Float are kept
         // as separate StateValue variants specifically so this doesn't have
         // to guess an int-looking float apart from a real int.
-        assert_eq!(display_string(&StateValue::Int(3)), "3");
-        assert_eq!(display_string(&StateValue::Int(-7)), "-7");
-        assert_eq!(display_string(&StateValue::Float(3.0)), "3.0");
-        assert_eq!(display_string(&StateValue::Float(3.5)), "3.5");
-        assert_eq!(display_string(&StateValue::Bool(true)), "true");
-        assert_eq!(display_string(&StateValue::Str("hi".to_string())), "hi");
+        assert_eq!(nowui_core::display_string(&StateValue::Int(3)), "3");
+        assert_eq!(nowui_core::display_string(&StateValue::Int(-7)), "-7");
+        assert_eq!(nowui_core::display_string(&StateValue::Float(3.0)), "3.0");
+        assert_eq!(nowui_core::display_string(&StateValue::Float(3.5)), "3.5");
+        assert_eq!(nowui_core::display_string(&StateValue::Bool(true)), "true");
+        assert_eq!(nowui_core::display_string(&StateValue::Str("hi".to_string())), "hi");
     }
 }

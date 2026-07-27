@@ -19,4 +19,7 @@ layout: App w-[fill] h-[fill] bg-gray-100 col gap-6 p-6 scroll-v {
 
   Text `Animated GIF, looping — 3-frame red/green/blue cycle, 200ms per frame` text-gray-600 text-sm
   Image `assets/test-image.gif` w-[80px] h-[80px] loop border
+
+  Text `Network image (https://) — fetched live on a background thread, never bundled` text-gray-600 text-sm
+  Image `https://picsum.photos/seed/picsum/200/300` w-[120px] h-[auto] border
 }

@@ -591,7 +591,7 @@ the hood, no `nowui-core` dependency, same "shared preprocessing, no renderer co
 ```nowui
 Image `assets/logo.png` w-[200px] h-[auto]                       // relative to this .nowui file
 Image `../shared/banner.jpg` w-[auto] h-[150px]
-Image `https://example.com/avatar.png` w-[64px] h-[64px]         // never bundled, always live
+Image `https://picsum.photos/seed/picsum/200/300` w-[64px] h-[64px]  // never bundled, always live
 Image `assets/spinner.gif` w-[80px] h-[80px] loop                // loops playback; omit `loop`
                                                                    // to hold on the last frame
 ```
